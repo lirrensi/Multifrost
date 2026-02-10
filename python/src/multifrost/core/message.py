@@ -21,7 +21,7 @@ class MessageType(Enum):
     SHUTDOWN = "shutdown"
 
 
-APP_NAME = "comlink_ipc_v2"
+APP_NAME = "comlink_ipc_v3"
 
 
 class ComlinkMessage:

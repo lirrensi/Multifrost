@@ -1,14 +1,10 @@
 [project]
 name = "multifrost"
-version = "1.0.0"
-description = "Simple IPC library for Python and Node.js inspired by comlink.js"
-authors = [{ name = "lirrensi", email = "you@example.com" }]
-license = {text = "MIT"}
-dependencies = ["pyzmq", "msgpack"]
-
-[build-system]
-requires = ["setuptools", "wheel"]
-build-backend = "setuptools.build_meta"
-
-[tool.setuptools.packages.find]
-where = ["src"]
+version = "3.0.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "msgpack>=1.1.2",
+    "zmq>=0.0.0",
+]

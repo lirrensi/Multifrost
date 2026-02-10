@@ -4,7 +4,7 @@ import { randomUUID } from "crypto";
 import * as net from "net";
 import * as msgpack from "msgpackr";
 
-const APP_NAME = "comlink_ipc_v2";
+const APP_NAME = "comlink_ipc_v3";
 
 export enum MessageType {
     CALL = "call",
