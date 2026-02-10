@@ -1,5 +1,5 @@
 """
-Async-first ParentWorker implementation.
+Async-first ParentWorker implementation with ROUTER/DEALER architecture.
 """
 
 import asyncio
@@ -8,7 +8,6 @@ import signal
 import socket
 import subprocess
 import sys
-import threading
 import time
 import uuid
 import zmq
@@ -16,6 +15,7 @@ from typing import Optional, Dict, Any
 
 from .message import ComlinkMessage, MessageType, APP_NAME
 from .sync_wrapper import SyncProxy, AsyncProxy
+from .service_registry import ServiceRegistry
 
 
 class RemoteCallError(Exception):
@@ -23,32 +23,42 @@ class RemoteCallError(Exception):
 
 
 class ParentWorker:
-    """Async-first parent worker for managing child processes."""
+    """
+    Async-first parent worker for managing child processes.
+
+    Supports two modes:
+    - Spawn mode: Parent spawns child process (owns the child)
+    - Connect mode: Parent connects to existing service via ServiceRegistry
+    """
 
     def __init__(
         self,
-        script_path: str,
+        script_path: Optional[str] = None,
         executable: Optional[str] = None,
         port: Optional[int] = None,
+        service_id: Optional[str] = None,
         auto_restart: bool = False,
         max_restart_attempts: int = 5,
     ):
-        self.script_path = script_path
-        self.script_name = script_path.split("/")[-1]
-        self.executable = executable or sys.executable
+        # Internal config - use factory methods instead
+        self._script_path = script_path
+        self._executable = executable or sys.executable
+        self._service_id = service_id
+        self._port = port or self._find_free_port()
+        self._is_spawn_mode = script_path is not None
+
         self.auto_restart = auto_restart
         self.max_restart_attempts = max_restart_attempts
         self.restart_count = 0
-        self.port = port or self._find_free_port()
 
         # Async state
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self.running = False
         self._closed = False
 
-        # ZeroMQ setup
+        # ZeroMQ setup - DEALER socket
         self.context: Optional[zmq.Context] = None
-        self.socket: Optional[zmq.Socket] = None
+        self.socket: Optional[zmq.Socket] = None  # DEALER socket
         self.process: Optional[subprocess.Popen] = None
 
         # Pending requests: request_id -> asyncio.Future
@@ -65,6 +75,35 @@ class ParentWorker:
         # Signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+
+    @staticmethod
+    def spawn(script_path: str, executable: Optional[str] = None) -> "ParentWorker":
+        """
+        Create a ParentWorker in spawn mode (owns the child process).
+
+        Args:
+            script_path: Path to the child worker script
+            executable: Optional executable to run (default: sys.executable)
+
+        Returns:
+            ParentWorker instance configured for spawn mode
+        """
+        return ParentWorker(script_path=script_path, executable=executable)
+
+    @staticmethod
+    async def connect(service_id: str, timeout: float = 5.0) -> "ParentWorker":
+        """
+        Create a ParentWorker in connect mode (connects to existing service).
+
+        Args:
+            service_id: The service identifier to connect to
+            timeout: Timeout in seconds for service discovery
+
+        Returns:
+            ParentWorker instance configured for connect mode
+        """
+        port = await ServiceRegistry.discover(service_id, timeout)
+        return ParentWorker(service_id=service_id, port=port)
 
     @property
     def call(self) -> SyncProxy:
@@ -103,30 +142,37 @@ class ParentWorker:
         return port
 
     async def start(self):
-        """Start the parent worker and child process."""
+        """Start the parent worker and child process (if spawn mode)."""
         self._loop = asyncio.get_running_loop()
         self.running = True
 
-        # Setup ZeroMQ socket
+        # Setup ZeroMQ DEALER socket
         await self._setup_socket()
 
-        # Start child process
-        await self._start_child_process()
+        # Start child process if in spawn mode
+        if self._is_spawn_mode:
+            await self._start_child_process()
 
         # Start ZMQ event loop
         self._zmq_task = asyncio.create_task(self._zmq_event_loop())
 
-        # Wait for child to connect
+        # Wait for connection
         await asyncio.sleep(1)
 
     async def _setup_socket(self):
-        """Setup ZeroMQ PAIR socket."""
+        """Setup ZeroMQ DEALER socket."""
         try:
             self.context = zmq.Context()
-            self.socket = self.context.socket(zmq.PAIR)
+            self.socket = self.context.socket(zmq.DEALER)
 
-            endpoint = f"tcp://*:{self.port}"
-            self.socket.bind(endpoint)
+            if self._is_spawn_mode:
+                # Spawn mode: bind to port, child connects
+                endpoint = f"tcp://*:{self._port}"
+                self.socket.bind(endpoint)
+            else:
+                # Connect mode: connect to service
+                endpoint = f"tcp://localhost:{self._port}"
+                self.socket.connect(endpoint)
 
             # Set timeouts
             self.socket.setsockopt(zmq.RCVTIMEO, 100)
@@ -134,16 +180,16 @@ class ParentWorker:
 
         except zmq.ZMQError as e:
             if e.errno == zmq.EADDRINUSE:
-                raise Exception(f"Port {self.port} is already in use")
+                raise Exception(f"Port {self._port} is already in use")
             raise Exception(f"Failed to setup ZMQ socket: {e}")
 
     async def _start_child_process(self):
         """Start the child process with environment."""
         env = os.environ.copy()
-        env["COMLINK_ZMQ_PORT"] = str(self.port)
+        env["COMLINK_ZMQ_PORT"] = str(self._port)
 
         self.process = subprocess.Popen(
-            [self.executable, self.script_path],
+            [self._executable, self._script_path],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -162,21 +208,28 @@ class ParentWorker:
         *args,
         timeout: Optional[float] = None,
         namespace: str = "default",
+        client_name: Optional[str] = None,
     ) -> Any:
         """
-        Internal unified async call method - no more separate sync/async paths!
+        Internal unified async call method.
 
         Args:
             func_name: Name of the function to call
             *args: Positional arguments
             timeout: Optional timeout in seconds
             namespace: Namespace for routing (default: 'default')
+            client_name: Optional client identifier for service targeting
 
         Returns:
             Result from the remote function
         """
-        if not self.running or not self.process or self.process.poll() is not None:
-            raise Exception("Child process is not running")
+        # Check if we can make a call
+        if self._is_spawn_mode:
+            if not self.running or not self.process or self.process.poll() is not None:
+                raise Exception("Child process is not running")
+        else:
+            if not self.running:
+                raise Exception("Worker is not running")
 
         request_id = str(uuid.uuid4())
         future = asyncio.Future()
@@ -187,7 +240,11 @@ class ParentWorker:
 
         # Create and send message
         message = ComlinkMessage.create_call(
-            function=func_name, args=args, namespace=namespace, msg_id=request_id
+            function=func_name,
+            args=args,
+            namespace=namespace,
+            msg_id=request_id,
+            client_name=client_name,
         )
 
         await self._send_message(message)
@@ -203,11 +260,12 @@ class ParentWorker:
             )
 
     async def _send_message(self, message: ComlinkMessage):
-        """Send a message to the child process."""
+        """Send a message to the child process via DEALER socket."""
         try:
-            # Run blocking ZMQ send in executor
+            # DEALER socket sends with empty delimiter frame
             await self._loop.run_in_executor(
-                None, lambda: self.socket.send(message.pack(), zmq.NOBLOCK)
+                None,
+                lambda: self.socket.send_multipart([b"", message.pack()], zmq.NOBLOCK),
             )
         except zmq.Again:
             raise Exception("Failed to send request: socket busy")
@@ -223,17 +281,25 @@ class ParentWorker:
         while self.running:
             try:
                 # Try to receive message (non-blocking via executor)
+                # DEALER socket receives: [empty_frame, message_data]
                 try:
-                    message_data = await self._loop.run_in_executor(
-                        None, lambda: self.socket.recv(zmq.NOBLOCK)
+                    frames = await self._loop.run_in_executor(
+                        None, lambda: self.socket.recv_multipart(zmq.NOBLOCK)
                     )
-                    await self._handle_message(message_data)
+                    if len(frames) >= 2:
+                        empty = frames[0]  # Should be empty
+                        message_data = frames[1]
+                        await self._handle_message(message_data)
                 except zmq.Again:
                     # No message available
                     pass
 
-                # Check child process health
-                if self.process and self.process.poll() is not None:
+                # Check child process health (spawn mode only)
+                if (
+                    self._is_spawn_mode
+                    and self.process
+                    and self.process.poll() is not None
+                ):
                     await self._handle_child_exit()
                     break
 
@@ -262,11 +328,21 @@ class ParentWorker:
             elif message.type == MessageType.STDOUT.value:
                 output = getattr(message, "output", "")
                 if output:
-                    print(f"[{self.script_name} STDOUT]: {output}")
+                    script_name = (
+                        self._script_path.split("/")[-1]
+                        if self._script_path
+                        else "worker"
+                    )
+                    print(f"[{script_name} STDOUT]: {output}")
             elif message.type == MessageType.STDERR.value:
                 output = getattr(message, "output", "")
                 if output:
-                    print(f"[{self.script_name} STDERR]: {output}", file=sys.stderr)
+                    script_name = (
+                        self._script_path.split("/")[-1]
+                        if self._script_path
+                        else "worker"
+                    )
+                    print(f"[{script_name} STDERR]: {output}", file=sys.stderr)
 
         except Exception as e:
             print(f"ERROR: Failed to process message: {e}")
@@ -320,10 +396,10 @@ class ParentWorker:
 
             # Start new process
             env = os.environ.copy()
-            env["COMLINK_ZMQ_PORT"] = str(self.port)
+            env["COMLINK_ZMQ_PORT"] = str(self._port)
 
             self.process = subprocess.Popen(
-                [self.executable, self.script_path],
+                [self._executable, self._script_path],
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -375,8 +451,8 @@ class ParentWorker:
             if self.socket:
                 self.socket.close()
 
-            # Terminate process
-            if self.process:
+            # Terminate process (spawn mode only)
+            if self._is_spawn_mode and self.process:
                 self.process.terminate()
                 try:
                     await self._loop.run_in_executor(

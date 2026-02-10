@@ -38,6 +38,7 @@ class ComlinkMessage:
     - function: str = function name to call
     - args: List = positional arguments
     - namespace: str = namespace (default: 'default')
+    - client_name: str = optional client identifier for service targeting
 
     Response message fields:
     - result: Any = return value from function
@@ -55,6 +56,7 @@ class ComlinkMessage:
         self.id = str(uuid.uuid4())
         self.type = None
         self.timestamp = time.time()
+        self.client_name = None
 
         # Override with any provided values
         for key, value in kwargs.items():
@@ -67,6 +69,7 @@ class ComlinkMessage:
         args: tuple = (),
         namespace: str = "default",
         msg_id: str = None,
+        client_name: str = None,
     ):
         """Create a function call message."""
         return cls(
@@ -75,6 +78,7 @@ class ComlinkMessage:
             function=function,
             args=args,
             namespace=namespace,
+            client_name=client_name,
         )
 
     @classmethod

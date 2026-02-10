@@ -3,6 +3,7 @@ import { spawn, ChildProcess } from "child_process";
 import { randomUUID } from "crypto";
 import * as net from "net";
 import * as msgpack from "msgpackr";
+import { ServiceRegistry } from "./service_registry.js";
 
 const APP_NAME = "comlink_ipc_v3";
 
@@ -27,6 +28,7 @@ export interface ComlinkMessageData {
     result?: any;
     error?: string;
     output?: string;
+    client_name?: string;
 }
 
 export class ComlinkMessage {
@@ -40,6 +42,7 @@ export class ComlinkMessage {
     public result?: any;
     public error?: string;
     public output?: string;
+    public client_name?: string;
 
     constructor(data: Partial<ComlinkMessageData> = {}) {
         this.id = data.id || randomUUID();
@@ -54,6 +57,7 @@ export class ComlinkMessage {
         args: any[] = [],
         namespace: string = "default",
         msgId?: string,
+        clientName?: string,
     ): ComlinkMessage {
         return new ComlinkMessage({
             type: MessageType.CALL,
@@ -61,6 +65,7 @@ export class ComlinkMessage {
             function: functionName,
             args,
             namespace,
+            client_name: clientName,
         });
     }
 
@@ -101,6 +106,7 @@ export class ComlinkMessage {
         if (this.result !== undefined) result.result = this.result;
         if (this.error !== undefined) result.error = this.error;
         if (this.output !== undefined) result.output = this.output;
+        if (this.client_name !== undefined) result.client_name = this.client_name;
 
         return result;
     }
@@ -132,25 +138,53 @@ interface PendingRequest {
     timeout?: NodeJS.Timeout;
 }
 
+interface ParentWorkerConfig {
+    scriptPath?: string;
+    executable?: string;
+    serviceId?: string;
+    port: number;
+}
+
 export class ParentWorker {
-    private readonly scriptPath: string;
+    private readonly scriptPath?: string;
     private readonly executable: string;
+    private readonly serviceId?: string;
     private readonly port: number;
-    private socket?: zmq.Pair;
+    private readonly isSpawnMode: boolean;
+
+    private socket?: zmq.Dealer;
     private process?: ChildProcess;
     private running: boolean = false;
     private readonly pendingRequests: Map<string, PendingRequest> = new Map();
 
     public readonly call: AsyncRemoteProxy;
 
-    constructor(scriptPath: string, executable: string = "node", port?: number) {
-        this.scriptPath = scriptPath;
-        this.executable = executable;
-        this.port = port || this.findFreePort();
+    private constructor(config: ParentWorkerConfig) {
+        this.scriptPath = config.scriptPath;
+        this.executable = config.executable || "node";
+        this.serviceId = config.serviceId;
+        this.port = config.port;
+        this.isSpawnMode = !!config.scriptPath;
         this.call = new AsyncRemoteProxy(this);
     }
 
-    private findFreePort(): number {
+    /**
+     * Create a ParentWorker in spawn mode (owns the child process).
+     */
+    static spawn(scriptPath: string, executable: string = "node"): ParentWorker {
+        const port = ParentWorker.findFreePort();
+        return new ParentWorker({ scriptPath, executable, port });
+    }
+
+    /**
+     * Create a ParentWorker in connect mode (connects to existing service).
+     */
+    static async connect(serviceId: string, timeout: number = 5000): Promise<ParentWorker> {
+        const port = await ServiceRegistry.discover(serviceId, timeout);
+        return new ParentWorker({ serviceId, port });
+    }
+
+    private static findFreePort(): number {
         const server = net.createServer();
         server.listen(0);
         const address = server.address();
@@ -160,15 +194,24 @@ export class ParentWorker {
     }
 
     async start(): Promise<void> {
-        // Setup ZeroMQ socket
-        this.socket = new zmq.Pair();
-        await this.socket.bind(`tcp://*:${this.port}`);
+        // Setup ZeroMQ DEALER socket
+        this.socket = new zmq.Dealer();
 
-        // Start child process
+        if (this.isSpawnMode) {
+            await this.socket.bind(`tcp://*:${this.port}`);
+            await this.startChildProcess();
+        } else {
+            await this.socket.connect(`tcp://localhost:${this.port}`);
+        }
+
+        this.running = true;
+        this.startMessageLoop();
+    }
+
+    private async startChildProcess(): Promise<void> {
         const env = { ...process.env, COMLINK_ZMQ_PORT: this.port.toString() };
-        this.process = spawn(this.executable, [this.scriptPath], { env, shell: true });
+        this.process = spawn(this.executable, [this.scriptPath!], { env, shell: true });
 
-        // Check if process started successfully
         await new Promise<void>((resolve, reject) => {
             const timeout = setTimeout(() => {
                 if (this.process?.exitCode !== null) {
@@ -185,25 +228,22 @@ export class ParentWorker {
                 }
             });
 
-            // If we reach here after timeout, process is running
             setTimeout(() => {
                 clearTimeout(timeout);
                 resolve();
             }, 500);
         });
-
-        this.running = true;
-        this.startMessageLoop();
     }
 
     private async startMessageLoop(): Promise<void> {
         if (!this.socket) return;
 
-        for await (const [message] of this.socket) {
+        // DEALER socket receives: [empty_frame, message_data]
+        for await (const [empty, message] of this.socket) {
             if (!this.running) break;
 
             try {
-                const comlinkMessage = ComlinkMessage.unpack(message);
+                const comlinkMessage = ComlinkMessage.unpack(message as Buffer);
                 await this.handleMessage(comlinkMessage);
             } catch (error) {
                 console.error("Failed to process message:", error);
@@ -212,7 +252,6 @@ export class ParentWorker {
     }
 
     private async handleMessage(message: ComlinkMessage): Promise<void> {
-        // Validate message
         if (message.app !== APP_NAME || !message.id) {
             console.warn("Ignoring invalid message");
             return;
@@ -232,11 +271,13 @@ export class ParentWorker {
             }
         } else if (message.type === MessageType.STDOUT) {
             if (message.output) {
-                console.log(`[${this.scriptPath} STDOUT]:`, message.output);
+                const name = this.scriptPath || this.serviceId || "worker";
+                console.log(`[${name} STDOUT]:`, message.output);
             }
         } else if (message.type === MessageType.STDERR) {
             if (message.output) {
-                console.error(`[${this.scriptPath} STDERR]:`, message.output);
+                const name = this.scriptPath || this.serviceId || "worker";
+                console.error(`[${name} STDERR]:`, message.output);
             }
         }
     }
@@ -246,13 +287,14 @@ export class ParentWorker {
         args: any[] = [],
         timeout?: number,
         namespace: string = "default",
+        clientName?: string,
     ): Promise<any> {
         if (!this.running || !this.socket) {
-            throw new Error("Child process is not running");
+            throw new Error("Worker is not running");
         }
 
         const requestId = randomUUID();
-        const message = ComlinkMessage.createCall(functionName, args, namespace, requestId);
+        const message = ComlinkMessage.createCall(functionName, args, namespace, requestId, clientName);
 
         return new Promise((resolve, reject) => {
             let timeoutHandle: NodeJS.Timeout | undefined;
@@ -270,8 +312,8 @@ export class ParentWorker {
                 timeout: timeoutHandle,
             });
 
-            // Send message
-            this.socket!.send(message.pack()).catch(error => {
+            // Send message with DEALER envelope: [empty_frame, message_data]
+            this.socket!.send([Buffer.alloc(0), message.pack()]).catch(error => {
                 this.pendingRequests.delete(requestId);
                 if (timeoutHandle) clearTimeout(timeoutHandle);
                 reject(new Error(`Failed to send request: ${error}`));
@@ -292,15 +334,13 @@ export class ParentWorker {
         // Close socket
         if (this.socket) {
             this.socket.close();
-            // Add a small delay to let zmq clean up
             await new Promise(resolve => setTimeout(resolve, 100));
         }
 
-        // Terminate child process
-        if (this.process) {
+        // Terminate child process (spawn mode only)
+        if (this.isSpawnMode && this.process) {
             this.process.kill("SIGTERM");
 
-            // Give it a moment to exit gracefully
             await new Promise<void>(resolve => {
                 const timeout = setTimeout(() => {
                     this.process?.kill("SIGKILL");
@@ -349,71 +389,87 @@ class AsyncRemoteProxy {
 
 export abstract class ChildWorker {
     protected namespace: string = "default";
+    protected serviceId?: string;
     private running: boolean = true;
-    private socket?: zmq.Pair;
+    private socket?: zmq.Router;
     private port?: number;
 
-    constructor() {
-        // Setup ZMQ connection
-        this.setupZmq();
+    constructor(serviceId?: string) {
+        this.serviceId = serviceId;
+        // ZMQ setup is deferred to start()
     }
 
-    private setupZmq(): void {
-        const portStr = process.env.COMLINK_ZMQ_PORT || "5555";
-        this.port = parseInt(portStr);
+    private async setupZmq(): Promise<void> {
+        const portEnv = process.env.COMLINK_ZMQ_PORT;
 
-        if (isNaN(this.port) || this.port < 1024 || this.port > 65535) {
-            console.error(`FATAL: Invalid port '${portStr}'`);
+        if (portEnv) {
+            // SPAWN MODE: Parent gave us port (connect)
+            this.port = parseInt(portEnv);
+            if (isNaN(this.port) || this.port < 1024 || this.port > 65535) {
+                console.error(`FATAL: Invalid port '${portEnv}'`);
+                process.exit(1);
+            }
+
+            this.socket = new zmq.Router();
+            await this.socket.connect(`tcp://localhost:${this.port}`);
+            console.error(`DEBUG: Connected to tcp://localhost:${this.port}`);
+
+        } else if (this.serviceId) {
+            // CONNECT MODE: Register service, bind to port
+            try {
+                this.port = await ServiceRegistry.register(this.serviceId);
+                console.error(`Service '${this.serviceId}' ready on port ${this.port}`);
+            } catch (error: any) {
+                console.error(`FATAL: ${error.message}`);
+                process.exit(1);
+            }
+
+            this.socket = new zmq.Router();
+            await this.socket.bind(`tcp://*:${this.port}`);
+
+        } else {
+            console.error("FATAL: Need COMLINK_ZMQ_PORT env or serviceId parameter");
             process.exit(1);
         }
 
-        console.error(`DEBUG: Child connecting to parent on port ${this.port}...`);
+        // Redirect stdout/stderr (simplified - just log to parent)
+        this.redirectOutput();
+    }
+
+    private redirectOutput(): void {
+        const originalConsoleLog = console.log;
+        const originalConsoleError = console.error;
+
+        console.log = (...args: any[]) => {
+            // Can't send output without sender_id in ROUTER mode
+            // For now, just log locally
+            originalConsoleLog(...args);
+        };
+
+        console.error = (...args: any[]) => {
+            originalConsoleError(...args);
+        };
     }
 
     async start(): Promise<void> {
         try {
-            this.socket = new zmq.Pair();
-            await this.socket.connect(`tcp://localhost:${this.port}`);
-            console.error(`DEBUG: Connected to tcp://localhost:${this.port}`);
-
-            // Redirect stdout/stderr (simplified - just log to parent)
-            const originalConsoleLog = console.log;
-            const originalConsoleError = console.error;
-
-            console.log = (...args) => {
-                this.sendOutput(MessageType.STDOUT, args.join(" "));
-            };
-
-            console.error = (...args) => {
-                originalConsoleError(...args); // Still log locally
-                this.sendOutput(MessageType.STDERR, args.join(" "));
-            };
-
+            await this.setupZmq();
             await this.messageLoop();
         } catch (error) {
-            console.error(`FATAL: ZMQ connection failed: ${error}`);
+            console.error(`FATAL: ZMQ setup failed: ${error}`);
             process.exit(1);
-        }
-    }
-
-    private sendOutput(msgType: MessageType, output: string): void {
-        if (this.socket) {
-            const message = ComlinkMessage.createOutput(output, msgType);
-            this.socket.send(message.pack()).catch(() => {
-                // Ignore send failures for output
-            });
         }
     }
 
     private async messageLoop(): Promise<void> {
         if (!this.socket) return;
 
-        for await (const [messageData] of this.socket) {
+        // ROUTER socket receives: [sender_id, empty_frame, message_data]
+        for await (const [senderId, empty, messageData] of this.socket) {
             if (!this.running) break;
 
             try {
-                const message = ComlinkMessage.unpack(messageData);
-                // console.error(`DEBUG: Received message: ${JSON.stringify(message.toDict())}`);
+                const message = ComlinkMessage.unpack(messageData as Buffer);
 
                 // Validate message
                 if (message.app !== APP_NAME) {
@@ -427,7 +483,7 @@ export abstract class ChildWorker {
                 }
 
                 if (message.type === MessageType.CALL) {
-                    await this.handleFunctionCall(message);
+                    await this.handleFunctionCall(message, senderId as Buffer);
                 } else if (message.type === MessageType.SHUTDOWN) {
                     console.error("Received shutdown signal");
                     this.running = false;
@@ -439,7 +495,7 @@ export abstract class ChildWorker {
         }
     }
 
-    private async handleFunctionCall(message: ComlinkMessage): Promise<void> {
+    private async handleFunctionCall(message: ComlinkMessage, senderId: Buffer): Promise<void> {
         let response: ComlinkMessage;
 
         try {
@@ -448,34 +504,29 @@ export abstract class ChildWorker {
             }
 
             const args = message.args || [];
-
-            // Check if function exists and is callable
             const func = (this as any)[message.function];
+
             if (typeof func !== "function") {
                 throw new Error(`Function '${message.function}' not found or not callable`);
             }
 
-            // Check if it's a private method
             if (message.function.startsWith("_")) {
                 throw new Error(`Cannot call private method '${message.function}'`);
             }
 
-            // Call the function
             const result = await func.apply(this, args);
             response = ComlinkMessage.createResponse(result, message.id);
+
         } catch (error) {
             const errorMsg = error instanceof Error ? error.message : String(error);
             console.error(`ERROR: Function call failed: ${errorMsg}`);
-            console.error(`DEBUG: Function: ${message.function}`);
-            console.error(`DEBUG: Args: ${JSON.stringify(message.args)}`);
-
             response = ComlinkMessage.createError(errorMsg, message.id);
         }
 
-        // Send response
+        // Send response with ROUTER envelope
         try {
             if (this.socket) {
-                await this.socket.send(response.pack());
+                await this.socket.send([senderId, Buffer.alloc(0), response.pack()]);
             }
         } catch (error) {
             console.error(`CRITICAL: Failed to send response: ${error}`);
@@ -491,13 +542,20 @@ export abstract class ChildWorker {
 
     stop(): void {
         this.running = false;
+
+        // Cleanup registry entry
+        if (this.serviceId) {
+            ServiceRegistry.unregister(this.serviceId).catch(err => {
+                console.error(`Warning: Failed to unregister service: ${err}`);
+            });
+        }
+
         if (this.socket) {
             this.socket.close();
         }
     }
 
     async run(): Promise<void> {
-        // Setup signal handlers
         process.on("SIGINT", () => {
             console.error("Received SIGINT, shutting down...");
             this.stop();

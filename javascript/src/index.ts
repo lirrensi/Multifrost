@@ -1,3 +1,5 @@
-import { ParentWorker, ChildWorker } from "./comlink_v2";
+import { ParentWorker, ChildWorker, ComlinkMessage, MessageType, RemoteCallError } from "./multifrost.js";
+import { ServiceRegistry } from "./service_registry.js";
 
-export default { ParentWorker, ChildWorker };
+export default { ParentWorker, ChildWorker, ComlinkMessage, MessageType, RemoteCallError, ServiceRegistry };
+export { ParentWorker, ChildWorker, ComlinkMessage, MessageType, RemoteCallError, ServiceRegistry };

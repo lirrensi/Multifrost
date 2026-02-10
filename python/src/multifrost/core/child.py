@@ -12,6 +12,7 @@ import zmq
 from typing import Optional
 
 from .message import ComlinkMessage, MessageType, APP_NAME
+from .service_registry import ServiceRegistry
 
 
 class ChildWorker:
@@ -20,18 +21,29 @@ class ChildWorker:
 
     Workers inherit from this class and implement methods that can be
     called remotely by the parent process.
+
+    Supports two modes:
+    - Spawn mode: Parent spawns child, passes port via COMLINK_ZMQ_PORT env var
+    - Connect mode: Child registers with ServiceRegistry, binds to auto-assigned port
     """
 
     namespace = "default"
 
-    def __init__(self):
-        """Initialize the child worker."""
+    def __init__(self, service_id: Optional[str] = None):
+        """
+        Initialize the child worker.
+
+        Args:
+            service_id: Optional service ID for connect mode. If provided,
+                       the worker will register with the service registry.
+        """
+        self.service_id = service_id
         self.APP_NAME = APP_NAME
         self._running = True
 
         # ZeroMQ setup
         self.context: Optional[zmq.Context] = None
-        self.socket: Optional[zmq.Socket] = None
+        self.socket: Optional[zmq.Socket] = None  # ROUTER socket for N parents
         self.port: Optional[int] = None
 
         # IO redirection
@@ -64,40 +76,62 @@ class ChildWorker:
         sys.stderr = ZMQWriter(self, MessageType.STDERR)
 
     def _setup_zmq(self):
-        """Setup ZeroMQ connection to parent."""
+        """Setup ZeroMQ ROUTER socket (supports multiple parents)."""
         try:
             self.context = zmq.Context()
 
-            # Get and validate port from environment
-            port_str = os.environ.get("COMLINK_ZMQ_PORT", "5555")
-            try:
-                self.port = int(port_str)
-                if not (1024 <= self.port <= 65535):
-                    raise ValueError(f"Port {self.port} out of valid range")
-            except ValueError as e:
-                print(f"FATAL: Invalid port '{port_str}': {e}", file=sys.stderr)
-                sys.exit(1)
+            # Determine mode: SPAWN or CONNECT
+            if os.environ.get("COMLINK_ZMQ_PORT"):
+                # SPAWN MODE: Parent gave us port (connect)
+                port_str = os.environ["COMLINK_ZMQ_PORT"]
+                try:
+                    self.port = int(port_str)
+                    if not (1024 <= self.port <= 65535):
+                        raise ValueError(f"Port {self.port} out of valid range")
+                except ValueError as e:
+                    print(f"FATAL: Invalid port '{port_str}': {e}", file=sys.stderr)
+                    sys.exit(1)
 
-            # Create and configure socket
-            self.socket = self.context.socket(zmq.PAIR)
-            self.socket.setsockopt(zmq.LINGER, 1000)
-            self.socket.setsockopt(zmq.SNDTIMEO, 100)
+                # Create ROUTER socket and connect to parent's DEALER
+                self.socket = self.context.socket(zmq.ROUTER)
+                self.socket.setsockopt(zmq.LINGER, 1000)
+                self.socket.setsockopt(zmq.SNDTIMEO, 100)
 
-            # Connect to parent
-            endpoint = f"tcp://localhost:{self.port}"
-            self.socket.connect(endpoint)
+                endpoint = f"tcp://localhost:{self.port}"
+                self.socket.connect(endpoint)
+
+            elif self.service_id:
+                # CONNECT MODE: Register service, bind to port
+                try:
+                    # Run async registration in sync context
+                    self.port = asyncio.run(ServiceRegistry.register(self.service_id))
+                    print(f"Service '{self.service_id}' ready on port {self.port}")
+                except RuntimeError as e:
+                    print(f"FATAL: {e}", file=sys.stderr)
+                    sys.exit(1)
+
+                # Create ROUTER socket and bind
+                self.socket = self.context.socket(zmq.ROUTER)
+                self.socket.setsockopt(zmq.LINGER, 1000)
+                self.socket.setsockopt(zmq.SNDTIMEO, 100)
+
+                endpoint = f"tcp://*:{self.port}"
+                self.socket.bind(endpoint)
+
+            else:
+                raise RuntimeError("Need COMLINK_ZMQ_PORT env or service_id parameter")
 
             # Setup IO redirection AFTER ZMQ is ready
             self._setup_io_redirection()
 
         except zmq.ZMQError as e:
-            error_msg = f"FATAL: ZMQ connection to localhost:{self.port} failed: {e}"
+            error_msg = f"FATAL: ZMQ setup failed: {e}"
             if e.errno == zmq.ECONNREFUSED:
                 error_msg += " (Connection refused - is parent running?)"
             print(error_msg, file=sys.stderr)
             sys.exit(1)
         except Exception as e:
-            print(f"FATAL: Unexpected error connecting to parent: {e}", file=sys.stderr)
+            print(f"FATAL: Unexpected error: {e}", file=sys.stderr)
             sys.exit(1)
 
     def _send_output(self, msg_type: MessageType, output: str):
@@ -130,10 +164,14 @@ class ChildWorker:
 
         while self._running:
             try:
-                # Try to receive message with timeout
+                # ROUTER socket receives: [sender_id, empty_frame, message_data]
                 try:
-                    message_data = self.socket.recv(zmq.NOBLOCK)
-                    self._handle_message(message_data)
+                    frames = self.socket.recv_multipart(zmq.NOBLOCK)
+                    if len(frames) >= 3:
+                        sender_id = frames[0]
+                        empty = frames[1]  # Should be empty
+                        message_data = frames[2]
+                        self._handle_message(message_data, sender_id)
                 except zmq.Again:
                     # No message available, continue
                     pass
@@ -147,12 +185,13 @@ class ChildWorker:
                 if "Context was terminated" in str(e):
                     break
 
-    def _handle_message(self, message_data):
+    def _handle_message(self, message_data, sender_id):
         """
-        Handle incoming message from parent.
+        Handle incoming message from parent with sender_id for ROUTER response.
 
         Args:
             message_data: Raw message bytes from ZMQ
+            sender_id: Sender identity for ROUTER socket response
         """
         try:
             message = ComlinkMessage.unpack(message_data)
@@ -167,19 +206,20 @@ class ChildWorker:
 
             # Handle message types
             if message.type == MessageType.CALL.value:
-                self._handle_function_call(message)
+                self._handle_function_call(message, sender_id)
             elif message.type == MessageType.SHUTDOWN.value:
                 self._running = False
 
         except Exception as e:
             print(f"ERROR: Failed to process message: {e}", file=sys.stderr)
 
-    def _handle_function_call(self, message: ComlinkMessage):
+    def _handle_function_call(self, message: ComlinkMessage, sender_id):
         """
-        Handle a function call message from parent.
+        Handle a function call message from parent, send response back to sender.
 
         Args:
             message: The call message
+            sender_id: Sender identity for ROUTER socket response
         """
         response = None
 
@@ -227,15 +267,19 @@ class ChildWorker:
             full_error = f"{error_msg}\n{traceback.format_exc()}"
             response = ComlinkMessage.create_error(full_error, message.id)
 
-        # Send response
+        # Send response with ROUTER envelope: [sender_id, empty_frame, response_data]
         if response:
             try:
-                self.socket.send(response.pack(), zmq.NOBLOCK)
+                self.socket.send_multipart(
+                    [sender_id, b"", response.pack()], zmq.NOBLOCK
+                )
             except zmq.Again:
                 # Socket busy - try once more after brief pause
                 try:
                     time.sleep(0.001)
-                    self.socket.send(response.pack(), zmq.NOBLOCK)
+                    self.socket.send_multipart(
+                        [sender_id, b"", response.pack()], zmq.NOBLOCK
+                    )
                 except Exception:
                     print(
                         f"CRITICAL: Failed to send response for {message.id}",
@@ -247,6 +291,13 @@ class ChildWorker:
     def _stop(self):
         """Stop the worker and cleanup resources."""
         self._running = False
+
+        # Cleanup registry entry
+        if self.service_id:
+            try:
+                asyncio.run(ServiceRegistry.unregister(self.service_id))
+            except Exception as e:
+                print(f"Warning: Failed to unregister service: {e}", file=sys.stderr)
 
         # Restore stdout/stderr
         if self.original_stdout:
