@@ -332,6 +332,11 @@ class ChildWorker:
 
     def _handle_signals(self):
         """Setup signal handlers for graceful shutdown."""
+        # Only setup signals in main thread
+        import threading
+
+        if threading.current_thread() is not threading.main_thread():
+            return
 
         def signal_handler(sig, frame):
             print(f"Received signal {sig}, shutting down...")

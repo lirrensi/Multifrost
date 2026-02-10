@@ -1,8 +1,9 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
+import * as net from 'net';
 import lockfile from 'proper-lockfile';
-import { pidUsage } from 'pidusage';
+import pidUsage from 'pidusage';
 
 interface ServiceRegistration {
     port: number;
@@ -154,7 +155,7 @@ export class ServiceRegistry {
      */
     static async findFreePort(): Promise<number> {
         return new Promise((resolve, reject) => {
-            const server = require('net').createServer();
+            const server = net.createServer();
             server.listen(0);
             server.once('listening', () => {
                 const address = server.address();

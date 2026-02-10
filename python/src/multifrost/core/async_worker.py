@@ -187,9 +187,10 @@ class ParentWorker:
         """Start the child process with environment."""
         env = os.environ.copy()
         env["COMLINK_ZMQ_PORT"] = str(self._port)
+        env["COMLINK_WORKER_MODE"] = "1"
 
         self.process = subprocess.Popen(
-            [self._executable, self._script_path],
+            [self._executable, self._script_path, "--worker"],
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -259,22 +260,30 @@ class ParentWorker:
                 f"Function '{func_name}' timed out after {timeout} seconds"
             )
 
-    async def _send_message(self, message: ComlinkMessage):
+    async def _send_message(self, message: ComlinkMessage, retries: int = 5):
         """Send a message to the child process via DEALER socket."""
-        try:
-            # DEALER socket sends with empty delimiter frame
-            await self._loop.run_in_executor(
-                None,
-                lambda: self.socket.send_multipart([b"", message.pack()], zmq.NOBLOCK),
-            )
-        except zmq.Again:
-            raise Exception("Failed to send request: socket busy")
-        except Exception as e:
-            async with self._lock:
-                # Clean up pending request if we have the message ID
-                if hasattr(message, "id"):
-                    self.pending_requests.pop(message.id, None)
-            raise Exception(f"Failed to send request: {e}")
+        for attempt in range(retries):
+            try:
+                # DEALER socket sends with empty delimiter frame
+                await self._loop.run_in_executor(
+                    None,
+                    lambda: self.socket.send_multipart(
+                        [b"", message.pack()], zmq.NOBLOCK
+                    ),
+                )
+                return  # Success
+            except zmq.Again:
+                # Socket not ready, wait and retry
+                if attempt < retries - 1:
+                    await asyncio.sleep(0.1)
+                    continue
+                raise Exception("Failed to send request: socket busy after retries")
+            except Exception as e:
+                async with self._lock:
+                    # Clean up pending request if we have the message ID
+                    if hasattr(message, "id"):
+                        self.pending_requests.pop(message.id, None)
+                raise Exception(f"Failed to send request: {e}")
 
     async def _zmq_event_loop(self):
         """Pure async event loop for handling ZMQ messages."""
