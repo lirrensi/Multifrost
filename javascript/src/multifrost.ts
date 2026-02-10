@@ -141,13 +141,13 @@ export class ParentWorker {
     private running: boolean = false;
     private readonly pendingRequests: Map<string, PendingRequest> = new Map();
 
-    public readonly acall: AsyncRemoteProxy;
+    public readonly call: AsyncRemoteProxy;
 
     constructor(scriptPath: string, executable: string = "node", port?: number) {
         this.scriptPath = scriptPath;
         this.executable = executable;
         this.port = port || this.findFreePort();
-        this.acall = new AsyncRemoteProxy(this);
+        this.call = new AsyncRemoteProxy(this);
     }
 
     private findFreePort(): number {
@@ -279,7 +279,7 @@ export class ParentWorker {
         });
     }
 
-    async close(): Promise<void> {
+    async stop(): Promise<void> {
         this.running = false;
 
         // Cancel all pending requests

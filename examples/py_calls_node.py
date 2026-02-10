@@ -9,23 +9,32 @@ from concurrent.futures import ThreadPoolExecutor
 # Test child worker (save as test_worker.py)
 
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from comlink_v2 import ParentWorker
+sys.path.append(
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python", "src"
+    )
+)
+from multifrost import ParentWorker
 
 
 import os
+
 script_dir = os.path.dirname(os.path.abspath(__file__))
 ts_file = os.path.join(script_dir, "..", "examples", "math_worker.ts")
 worker = ParentWorker(ts_file, "tsx.cmd")
 
-worker.start()
 
-if __name__ == "__main__":
+async def main():
+    await worker.start()
 
     fibo = worker.call.fibonacci(11)
     print("got fibo => ", fibo)
 
     fact = worker.call.factorial(11)
     print("got fact => ", fact)
-    
-    worker.close()
+
+    await worker.stop()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

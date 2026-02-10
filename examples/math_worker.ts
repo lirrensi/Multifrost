@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { ChildWorker } from "../comlink_v2";
+import { ChildWorker } from "../javascript/src/multifrost";
 
 class MathWorker extends ChildWorker {
     add(a: number, b: number): number {

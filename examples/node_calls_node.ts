@@ -1,17 +1,17 @@
-import { ParentWorker } from "../comlink_v2";
+import { ParentWorker } from "../javascript/src/multifrost";
 
 async function main() {
     const worker = new ParentWorker(`../examples/math_worker.ts`, "tsx");
     await worker.start();
 
     // will run first | blocking
-    worker.acall.fibonacci(11).then(result => {
+    worker.call.fibonacci(11).then(result => {
         console.log("fibo number => ", result);
     });
 
-    const fact = await worker.acall.factorial(11);
+    const fact = await worker.call.factorial(11);
     console.log("factorial => ", fact);
 
-    await worker.close();
+    await worker.stop();
 }
 main().catch(console.error);
