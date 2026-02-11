@@ -162,3 +162,249 @@ fn chrono_lite_timestamp() -> String {
         .unwrap_or_default();
     format!("{}", duration.as_secs())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_find_free_port() {
+        let port1 = ServiceRegistry::find_free_port().await.unwrap();
+        let port2 = ServiceRegistry::find_free_port().await.unwrap();
+
+        // Ports should be different (most likely)
+        // and in valid range
+        assert!(port1 >= 1024 && port1 <= 65535);
+        assert!(port2 >= 1024 && port2 <= 65535);
+    }
+
+    #[tokio::test]
+    async fn test_register_service() {
+        let service_id = "test-service-1";
+        let port = ServiceRegistry::register(service_id).await.unwrap();
+
+        assert!(port >= 1024 && port <= 65535);
+
+        // Clean up
+        let _ = ServiceRegistry::unregister(service_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_register_duplicate_service() {
+        let service_id = "test-service-duplicate";
+
+        // First registration should succeed
+        let port1 = ServiceRegistry::register(service_id).await.unwrap();
+        assert!(port1 >= 1024);
+
+        // Second registration should fail
+        let result = ServiceRegistry::register(service_id).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(MultifrostError::ServiceAlreadyRunning(_))));
+
+        // Clean up
+        let _ = ServiceRegistry::unregister(service_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_discover_service() {
+        let service_id = "test-service-discover";
+
+        // Register service
+        let port = ServiceRegistry::register(service_id).await.unwrap();
+
+        // Discover service
+        let discovered_port = ServiceRegistry::discover(service_id, 1000).await.unwrap();
+        assert_eq!(discovered_port, port);
+
+        // Clean up
+        let _ = ServiceRegistry::unregister(service_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_discover_nonexistent_service() {
+        let service_id = "test-service-nonexistent";
+
+        let result = ServiceRegistry::discover(service_id, 100).await;
+        assert!(result.is_err());
+        assert!(matches!(result, Err(MultifrostError::ServiceNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_unregister_service() {
+        let service_id = "test-service-unregister";
+
+        // Register service
+        ServiceRegistry::register(service_id).await.unwrap();
+
+        // Unregister service
+        let result = ServiceRegistry::unregister(service_id).await;
+        assert!(result.is_ok());
+
+        // Service should no longer be discoverable
+        let result = ServiceRegistry::discover(service_id, 100).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_unregister_nonexistent_service() {
+        let service_id = "test-service-nonexistent-unregister";
+
+        // Unregistering a non-existent service should not fail
+        let result = ServiceRegistry::unregister(service_id).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_registry_persistence() {
+        let service_id = "test-service-persistence";
+
+        // Register service
+        let _port1 = ServiceRegistry::register(service_id).await.unwrap();
+
+        // Read registry directly
+        let registry = ServiceRegistry::read_registry().await.unwrap();
+        assert!(registry.contains_key(service_id));
+
+        // Clean up
+        let _ = ServiceRegistry::unregister(service_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_multiple_services() {
+        let services = vec![
+            "test-service-multi-1",
+            "test-service-multi-2",
+            "test-service-multi-3",
+        ];
+
+        let mut ports = Vec::new();
+        for service_id in &services {
+            let port = ServiceRegistry::register(service_id).await.unwrap();
+            ports.push(port);
+        }
+
+        // All services should be discoverable
+        for (i, service_id) in services.iter().enumerate() {
+            let discovered_port = ServiceRegistry::discover(service_id, 1000).await.unwrap();
+            assert_eq!(discovered_port, ports[i]);
+        }
+
+        // Clean up
+        for service_id in &services {
+            let _ = ServiceRegistry::unregister(service_id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_service_registration_fields() {
+        let service_id = "test-service-fields";
+
+        let port = ServiceRegistry::register(service_id).await.unwrap();
+
+        // Read registry and check fields
+        let registry = ServiceRegistry::read_registry().await.unwrap();
+        let registration = registry.get(service_id).unwrap();
+
+        assert_eq!(registration.port, port);
+        assert_eq!(registration.pid, std::process::id());
+        assert!(!registration.started.is_empty());
+
+        // Clean up
+        let _ = ServiceRegistry::unregister(service_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_discover_timeout() {
+        let service_id = "test-service-timeout";
+
+        // Try to discover a non-existent service with short timeout
+        let start = std::time::Instant::now();
+        let result = ServiceRegistry::discover(service_id, 100).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        // Should timeout after approximately 100ms
+        assert!(elapsed.as_millis() >= 90);
+        assert!(elapsed.as_millis() < 200);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_registrations() {
+        let mut handles = vec![];
+
+        for i in 0..10 {
+            let handle = tokio::spawn(async move {
+                let service_id = format!("test-service-concurrent-{}", i);
+                let result = ServiceRegistry::register(&service_id).await;
+                (service_id, result)
+            });
+            handles.push(handle);
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            results.push(handle.await.unwrap());
+        }
+
+        // All registrations should succeed
+        for (service_id, result) in results {
+            assert!(result.is_ok(), "Failed to register {}", service_id);
+            let _ = ServiceRegistry::unregister(&service_id).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_registry_file_creation() {
+        let service_id = "test-service-file-creation";
+
+        // Ensure registry doesn't exist
+        let _ = ServiceRegistry::unregister(service_id).await;
+
+        // Register a service (should create registry file)
+        let _ = ServiceRegistry::register(service_id).await.unwrap();
+
+        // Check that registry file exists
+        let registry_path = ServiceRegistry::registry_path();
+        assert!(tokio::fs::metadata(&registry_path).await.is_ok());
+
+        // Clean up
+        let _ = ServiceRegistry::unregister(service_id).await;
+    }
+
+    #[test]
+    fn test_is_process_alive_current_process() {
+        let current_pid = std::process::id();
+        assert!(ServiceRegistry::is_process_alive(current_pid));
+    }
+
+    #[test]
+    fn test_is_process_alive_nonexistent_process() {
+        // Use a PID that's unlikely to exist
+        let nonexistent_pid = 999999;
+        assert!(!ServiceRegistry::is_process_alive(nonexistent_pid));
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_dead_process_registration() {
+        let service_id = "test-service-dead-process";
+
+        // Register service
+        let port1 = ServiceRegistry::register(service_id).await.unwrap();
+
+        // Manually modify registry to have a dead PID
+        let mut registry = ServiceRegistry::read_registry().await.unwrap();
+        if let Some(ref mut reg) = registry.get_mut(service_id) {
+            reg.pid = 999999; // Non-existent PID
+        }
+        ServiceRegistry::write_registry(&registry).await.unwrap();
+
+        // Should be able to register again (dead process will be overwritten)
+        let port2 = ServiceRegistry::register(service_id).await.unwrap();
+        assert!(port2 >= 1024);
+
+        // Clean up
+        let _ = ServiceRegistry::unregister(service_id).await;
+    }
+}

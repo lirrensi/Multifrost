@@ -58,6 +58,9 @@ mod parent;
 mod metrics;
 mod logging;
 
+#[cfg(test)]
+mod test_utils;
+
 pub use error::{MultifrostError, Result};
 pub use message::{Message, MessageType};
 pub use registry::ServiceRegistry;

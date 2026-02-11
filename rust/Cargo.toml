@@ -19,6 +19,11 @@ async-trait = "0.1"
 dirs = "5"
 md5 = "0.7"
 
+[dev-dependencies]
+tokio-test = "0.4"
+serial_test = "3.0"
+tempfile = "3.8"
+
 [[example]]
 name = "math_worker"
 path = "examples/math_worker.rs"

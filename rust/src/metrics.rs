@@ -284,3 +284,290 @@ fn current_timestamp() -> f64 {
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_metrics_creation() {
+        let metrics = Metrics::new();
+        let snapshot = metrics.snapshot().await;
+
+        assert_eq!(snapshot.requests_total, 0);
+        assert_eq!(snapshot.requests_success, 0);
+        assert_eq!(snapshot.requests_failed, 0);
+        assert_eq!(snapshot.latency_avg_ms, 0.0);
+        assert_eq!(snapshot.queue_depth, 0);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_creation_with_options() {
+        let metrics = Metrics::with_options(100, 30.0);
+        let snapshot = metrics.snapshot().await;
+
+        assert_eq!(snapshot.window_seconds, 30.0);
+        assert_eq!(snapshot.requests_total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_record_request_success() {
+        let metrics = Metrics::new();
+        let start = metrics.start_request("req-1", "add", "default").await;
+
+        // Simulate some work
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let latency = metrics.end_request(start, "req-1", true, None).await;
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.requests_total, 1);
+        assert_eq!(snapshot.requests_success, 1);
+        assert_eq!(snapshot.requests_failed, 0);
+        assert!(latency >= 10.0);
+        assert!(snapshot.latency_avg_ms > 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_record_request_failure() {
+        let metrics = Metrics::new();
+        let start = metrics.start_request("req-1", "fail", "default").await;
+
+        let latency = metrics.end_request(start, "req-1", false, Some("Test error".to_string())).await;
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.requests_total, 1);
+        assert_eq!(snapshot.requests_success, 0);
+        assert_eq!(snapshot.requests_failed, 1);
+        assert!(latency >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_latency_percentiles() {
+        let metrics = Metrics::new();
+
+        // Record multiple requests with different latencies
+        for i in 0..100 {
+            let start = metrics.start_request(&format!("req-{}", i), "test", "default").await;
+            // Simulate varying latencies
+            tokio::time::sleep(std::time::Duration::from_millis(i)).await;
+            metrics.end_request(start, &format!("req-{}", i), true, None).await;
+        }
+
+        let snapshot = metrics.snapshot().await;
+
+        assert_eq!(snapshot.requests_total, 100);
+        assert!(snapshot.latency_p50_ms > 0.0);
+        assert!(snapshot.latency_p95_ms > snapshot.latency_p50_ms);
+        assert!(snapshot.latency_p99_ms >= snapshot.latency_p95_ms);
+        assert!(snapshot.latency_min_ms <= snapshot.latency_p50_ms);
+        assert!(snapshot.latency_max_ms >= snapshot.latency_p99_ms);
+    }
+
+    #[tokio::test]
+    async fn test_circuit_breaker_tracking() {
+        let metrics = Metrics::new();
+
+        metrics.record_circuit_breaker_trip().await;
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.circuit_breaker_trips, 1);
+        assert_eq!(snapshot.circuit_breaker_state, "open");
+
+        metrics.record_circuit_breaker_reset().await;
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.circuit_breaker_state, "closed");
+
+        metrics.record_circuit_breaker_half_open().await;
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.circuit_breaker_state, "half-open");
+    }
+
+    #[tokio::test]
+    async fn test_queue_depth_tracking() {
+        let metrics = Metrics::new();
+
+        // Start multiple requests without ending them
+        let _start1 = metrics.start_request("req-1", "test", "default").await;
+        let _start2 = metrics.start_request("req-2", "test", "default").await;
+        let _start3 = metrics.start_request("req-3", "test", "default").await;
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.queue_depth, 3);
+        assert_eq!(snapshot.queue_max_depth, 3);
+
+        // End one request
+        metrics.end_request(_start1, "req-1", true, None).await;
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.queue_depth, 2);
+        assert_eq!(snapshot.queue_max_depth, 3);
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_rtt_tracking() {
+        let metrics = Metrics::new();
+
+        metrics.record_heartbeat_rtt(10.5).await;
+        metrics.record_heartbeat_rtt(15.2).await;
+        metrics.record_heartbeat_rtt(12.8).await;
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.heartbeat_rtt_last_ms, 12.8);
+        assert!((snapshot.heartbeat_rtt_avg_ms - 12.83).abs() < 0.1);
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_miss_tracking() {
+        let metrics = Metrics::new();
+
+        metrics.record_heartbeat_miss().await;
+        metrics.record_heartbeat_miss().await;
+        metrics.record_heartbeat_miss().await;
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.heartbeat_misses, 3);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_snapshot() {
+        let metrics = Metrics::new();
+
+        let start = metrics.start_request("req-1", "test", "default").await;
+        metrics.end_request(start, "req-1", true, None).await;
+
+        let snapshot = metrics.snapshot().await;
+
+        assert!(snapshot.timestamp > 0.0);
+        assert_eq!(snapshot.requests_total, 1);
+        assert_eq!(snapshot.requests_success, 1);
+        assert_eq!(snapshot.requests_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_reset() {
+        let metrics = Metrics::new();
+
+        // Record some data
+        let start = metrics.start_request("req-1", "test", "default").await;
+        metrics.end_request(start, "req-1", true, None).await;
+        metrics.record_circuit_breaker_trip().await;
+        metrics.record_heartbeat_rtt(10.0).await;
+        metrics.record_heartbeat_miss().await;
+
+        // Reset
+        metrics.reset().await;
+
+        // Verify reset
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.requests_total, 0);
+        assert_eq!(snapshot.requests_success, 0);
+        assert_eq!(snapshot.requests_failed, 0);
+        assert_eq!(snapshot.circuit_breaker_trips, 0);
+        assert_eq!(snapshot.circuit_breaker_state, "closed");
+        assert_eq!(snapshot.queue_depth, 0);
+        assert_eq!(snapshot.queue_max_depth, 0);
+        assert_eq!(snapshot.heartbeat_misses, 0);
+        assert_eq!(snapshot.latency_avg_ms, 0.0);
+        assert_eq!(snapshot.heartbeat_rtt_avg_ms, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_default() {
+        let metrics = Metrics::default();
+        let snapshot = metrics.snapshot().await;
+
+        assert_eq!(snapshot.requests_total, 0);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_clone() {
+        let metrics1 = Metrics::new();
+        let metrics2 = metrics1.clone();
+
+        let start = metrics1.start_request("req-1", "test", "default").await;
+        metrics1.end_request(start, "req-1", true, None).await;
+
+        let snapshot1 = metrics1.snapshot().await;
+        let snapshot2 = metrics2.snapshot().await;
+
+        assert_eq!(snapshot1.requests_total, snapshot2.requests_total);
+    }
+
+    #[tokio::test]
+    async fn test_latency_circular_buffer() {
+        let metrics = Metrics::with_options(5, 60.0);
+
+        // Record more than max samples
+        for i in 0..10 {
+            let start = metrics.start_request(&format!("req-{}", i), "test", "default").await;
+            metrics.end_request(start, &format!("req-{}", i), true, None).await;
+        }
+
+        let snapshot = metrics.snapshot().await;
+        // Should only have 5 samples in the circular buffer
+        assert_eq!(snapshot.requests_total, 10);
+        assert!(snapshot.latency_avg_ms > 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_rtt_circular_buffer() {
+        let metrics = Metrics::new();
+
+        // Record more than 100 RTT samples
+        for i in 0..150 {
+            metrics.record_heartbeat_rtt(i as f64).await;
+        }
+
+        let snapshot = metrics.snapshot().await;
+        // Should only have last 100 samples
+        assert_eq!(snapshot.heartbeat_rtt_last_ms, 149.0);
+        assert!(snapshot.heartbeat_rtt_avg_ms > 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_empty_latency_percentiles() {
+        let metrics = Metrics::new();
+        let snapshot = metrics.snapshot().await;
+
+        assert_eq!(snapshot.latency_avg_ms, 0.0);
+        assert_eq!(snapshot.latency_p50_ms, 0.0);
+        assert_eq!(snapshot.latency_p95_ms, 0.0);
+        assert_eq!(snapshot.latency_p99_ms, 0.0);
+        assert_eq!(snapshot.latency_min_ms, 0.0);
+        assert_eq!(snapshot.latency_max_ms, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_empty_heartbeat_rtt() {
+        let metrics = Metrics::new();
+        let snapshot = metrics.snapshot().await;
+
+        assert_eq!(snapshot.heartbeat_rtt_avg_ms, 0.0);
+        assert_eq!(snapshot.heartbeat_rtt_last_ms, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_requests() {
+        let metrics = Metrics::new();
+        let mut handles = vec![];
+
+        // Start multiple concurrent requests
+        for i in 0..10 {
+            let metrics_clone = metrics.clone();
+            let handle = tokio::spawn(async move {
+                let start = metrics_clone.start_request(&format!("req-{}", i), "test", "default").await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                metrics_clone.end_request(start, &format!("req-{}", i), true, None).await;
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.requests_total, 10);
+        assert_eq!(snapshot.requests_success, 10);
+    }
+}
