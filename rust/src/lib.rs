@@ -33,19 +33,39 @@
 //! }
 //! ```
 //!
-//! ## Parent
+//! ## Parent (with ergonomic API)
 //! ```rust,no_run
-//! use multifrost::ParentWorker;
+//! use multifrost::{ParentWorker, call};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let mut worker = ParentWorker::spawn("examples/math_worker.rs", "cargo run --example math_worker")?;
+//!     let mut worker = ParentWorker::spawn("examples/math_worker.rs", "cargo run --example math_worker").await?;
 //!     worker.start().await?;
 //!
-//!     let result: i64 = worker.call("add", vec![serde_json::json!(1), serde_json::json!(2)]).await?;
-//!     println!("1 + 2 = {}", result);
+//!     // Using the ergonomic call! macro
+//!     let result: i64 = worker.call!(add(10, 20)).await?;
+//!     println!("10 + 20 = {}", result);
 //!
 //!     worker.stop().await;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Parent (with builder pattern)
+//! ```rust,no_run
+//! use multifrost::{ParentWorkerBuilder, ParentWorker};
+//! use std::time::Duration;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let worker = ParentWorkerBuilder::spawn("examples/math_worker.rs", "cargo run --example math_worker")
+//!         .auto_restart(true)
+//!         .default_timeout(Duration::from_secs(30))
+//!         .build()
+//!         .await?;
+//!
+//!     worker.start().await?;
+//!     // ...
 //!     Ok(())
 //! }
 //! ```
@@ -57,6 +77,7 @@ mod child;
 mod parent;
 mod metrics;
 mod logging;
+mod call_macro;
 
 #[cfg(test)]
 mod test_utils;
@@ -64,12 +85,13 @@ mod test_utils;
 pub use error::{MultifrostError, Result};
 pub use message::{Message, MessageType};
 pub use registry::ServiceRegistry;
-pub use child::{ChildWorker, ChildWorkerContext, run_worker};
-pub use parent::ParentWorker;
+pub use child::{ChildWorker, ChildWorkerContext, run_worker, run_worker_sync, SyncChildWorker};
+pub use parent::{ParentWorker, ParentWorkerBuilder, SpawnOptions, ConnectOptions};
 pub use metrics::{Metrics, MetricsSnapshot, RequestMetrics};
 pub use logging::{
     StructuredLogger, LogEntry, LogEvent, LogLevel, LogHandler,
     default_json_handler, default_pretty_handler, LogOptions,
 };
+pub use call_macro::{ExtractArgs, ArgsExtractor, ToJsonArg, ErgonomicCall, CallArgs};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

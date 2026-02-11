@@ -437,6 +437,148 @@ impl Default for SpawnOptions {
     }
 }
 
+/// Options for connecting to an existing service.
+#[derive(Clone)]
+pub struct ConnectOptions {
+    pub default_timeout: Option<u64>, // milliseconds
+    pub heartbeat_interval: f64, // seconds
+    pub heartbeat_timeout: f64, // seconds
+    pub heartbeat_max_misses: usize,
+    pub enable_metrics: bool,
+}
+
+impl Default for ConnectOptions {
+    fn default() -> Self {
+        Self {
+            default_timeout: None,
+            heartbeat_interval: 5.0,
+            heartbeat_timeout: 3.0,
+            heartbeat_max_misses: 3,
+            enable_metrics: true,
+        }
+    }
+}
+
+/// Builder pattern for creating ParentWorker instances.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use multifrost::{ParentWorkerBuilder, SpawnOptions};
+/// use std::time::Duration;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let worker = ParentWorkerBuilder::spawn("worker.py", "python worker.py")
+///         .auto_restart(true)
+///         .default_timeout(Duration::from_secs(30))
+///         .build()
+///         .await?;
+///
+///     worker.start().await?;
+///     // ...
+///     Ok(())
+/// }
+/// ```
+pub struct ParentWorkerBuilder {
+    script_path: Option<String>,
+    executable: String,
+    options: SpawnOptions,
+}
+
+impl ParentWorkerBuilder {
+    /// Create a new builder for spawn mode.
+    pub fn spawn(script_path: &str, executable: &str) -> Self {
+        Self {
+            script_path: Some(script_path.to_string()),
+            executable: executable.to_string(),
+            options: SpawnOptions::default(),
+        }
+    }
+
+    /// Create a new builder for connect mode.
+    pub fn connect(executable: &str) -> Self {
+        Self {
+            script_path: None,
+            executable: executable.to_string(),
+            options: SpawnOptions::default(),
+        }
+    }
+
+    /// Enable automatic restart on failure.
+    pub fn auto_restart(mut self, enable: bool) -> Self {
+        self.options.auto_restart = enable;
+        self
+    }
+
+    /// Set maximum restart attempts.
+    pub fn max_restart_attempts(mut self, attempts: usize) -> Self {
+        self.options.max_restart_attempts = attempts;
+        self
+    }
+
+    /// Set default timeout for calls (in milliseconds).
+    pub fn default_timeout(mut self, timeout: Duration) -> Self {
+        self.options.default_timeout = Some(timeout.as_millis() as u64);
+        self
+    }
+
+    /// Set heartbeat interval in seconds.
+    pub fn heartbeat_interval(mut self, interval: f64) -> Self {
+        self.options.heartbeat_interval = interval;
+        self
+    }
+
+    /// Set heartbeat timeout in seconds.
+    pub fn heartbeat_timeout(mut self, timeout: f64) -> Self {
+        self.options.heartbeat_timeout = timeout;
+        self
+    }
+
+    /// Set maximum missed heartbeats before considering worker dead.
+    pub fn heartbeat_max_misses(mut self, misses: usize) -> Self {
+        self.options.heartbeat_max_misses = misses;
+        self
+    }
+
+    /// Enable or disable metrics collection.
+    pub fn enable_metrics(mut self, enable: bool) -> Self {
+        self.options.enable_metrics = enable;
+        self
+    }
+
+    /// Build the ParentWorker in spawn mode.
+    pub async fn build_spawn(self) -> Result<ParentWorker> {
+        ParentWorker::spawn_with_options(
+            self.script_path.as_deref().unwrap_or(""),
+            &self.executable,
+            self.options,
+        )
+    }
+
+    /// Build the ParentWorker in connect mode.
+    pub async fn build_connect(self, service_id: &str, timeout_ms: u64) -> Result<ParentWorker> {
+        let config = ParentWorkerConfig {
+            script_path: self.script_path,
+            executable: self.executable,
+            service_id: Some(service_id.to_string()),
+            port: None,
+            is_spawn_mode: false,
+            auto_restart: self.options.auto_restart,
+            max_restart_attempts: self.options.max_restart_attempts,
+            default_timeout: self.options.default_timeout.map(Duration::from_millis),
+            heartbeat_interval: Duration::from_secs_f64(self.options.heartbeat_interval),
+            heartbeat_timeout: Duration::from_secs_f64(self.options.heartbeat_timeout),
+            heartbeat_max_misses: self.options.heartbeat_max_misses,
+            enable_metrics: self.options.enable_metrics,
+        };
+        let port = ServiceRegistry::discover(service_id, timeout_ms).await?;
+        let mut config = config;
+        config.port = Some(port);
+        Ok(ParentWorker::with_config(config))
+    }
+}
+
 fn find_free_port_sync() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr().map(|a| a.port()))

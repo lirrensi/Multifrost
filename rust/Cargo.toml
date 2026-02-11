@@ -35,3 +35,7 @@ path = "examples/parent.rs"
 [[example]]
 name = "spawn"
 path = "examples/spawn.rs"
+
+[[example]]
+name = "connect"
+path = "examples/connect.rs"

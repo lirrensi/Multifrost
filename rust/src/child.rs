@@ -3,6 +3,8 @@ use crate::message::{Message, MessageType};
 use crate::registry::ServiceRegistry;
 use async_trait::async_trait;
 use bytes::Bytes;
+use serde_json::Value;
+use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,9 +18,33 @@ fn current_timestamp() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Async child worker trait - for workers that need async processing
 #[async_trait]
 pub trait ChildWorker: Send + Sync + 'static {
-    async fn handle_call(&self, function: &str, args: Vec<serde_json::Value>) -> Result<serde_json::Value>;
+    async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value>;
+}
+
+/// Sync child worker trait - for simple CPU-bound workers
+/// Implement this trait if your worker doesn't need async operations
+pub trait SyncChildWorker: Send + Sync + 'static {
+    fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value>;
+
+    /// Get list of available functions for introspection
+    fn list_functions(&self) -> Vec<String> {
+        vec![]
+    }
+}
+
+/// Adapter to allow SyncChildWorker to be used where ChildWorker is expected
+struct SyncToAsyncAdapter<T: SyncChildWorker>(T);
+
+#[async_trait]
+impl<T: SyncChildWorker> ChildWorker for SyncToAsyncAdapter<T> {
+    async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value> {
+        // SyncChildWorker::handle_call is sync, so we just call it directly
+        // It's marked async to satisfy the async_trait bound, but doesn't actually await
+        self.0.handle_call(function, args)
+    }
 }
 
 pub struct ChildWorkerContext {
@@ -26,6 +52,7 @@ pub struct ChildWorkerContext {
     service_id: Option<String>,
     running: bool,
     socket: Option<RouterSocket>,
+    functions: HashMap<String, String>, // function_name -> description
 }
 
 impl ChildWorkerContext {
@@ -35,6 +62,7 @@ impl ChildWorkerContext {
             service_id: None,
             running: false,
             socket: None,
+            functions: HashMap::new(),
         }
     }
 
@@ -47,6 +75,17 @@ impl ChildWorkerContext {
         self.namespace = namespace.to_string();
         self
     }
+
+    /// Register a function for introspection
+    pub fn register_function(mut self, name: &str, description: &str) -> Self {
+        self.functions.insert(name.to_string(), description.to_string());
+        self
+    }
+
+    /// Get list of registered functions
+    pub fn list_functions(&self) -> Vec<String> {
+        self.functions.keys().cloned().collect()
+    }
 }
 
 impl Default for ChildWorkerContext {
@@ -56,13 +95,30 @@ impl Default for ChildWorkerContext {
 }
 
 pub async fn run_worker<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) {
-    if let Err(e) = run_worker_inner(worker, ctx).await {
+    if let Err(e) = run_worker_async(worker, ctx).await {
         eprintln!("Worker error: {}", e);
         std::process::exit(1);
     }
 }
 
-async fn run_worker_inner<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) -> Result<()> {
+/// Run a sync worker (CPU-bound, no async needed)
+pub fn run_worker_sync<W: SyncChildWorker>(worker: W, ctx: ChildWorkerContext) {
+    if let Err(e) = run_worker_sync_inner(worker, ctx) {
+        eprintln!("Worker error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+fn run_worker_sync_inner<W: SyncChildWorker>(worker: W, ctx: ChildWorkerContext) -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async move {
+        // Wrap sync worker in adapter to implement ChildWorker
+        let adapter = SyncToAsyncAdapter(worker);
+        run_worker_async(adapter, ctx).await
+    })
+}
+
+async fn run_worker_async<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) -> Result<()> {
     let ctx = Arc::new(RwLock::new(ctx));
     let is_spawn_mode;
 
@@ -194,7 +250,14 @@ async fn handle_message<W: ChildWorker>(
 
     let response = match message.msg_type {
         MessageType::Call => {
-            handle_function_call(worker, &message).await
+            // Check for introspection calls
+            if message.function.as_ref().map(|s| s.as_str()) == Some("listFunctions") {
+                let ctx_guard = ctx.read().await;
+                let functions = ctx_guard.list_functions();
+                Message::create_response(serde_json::json!(functions), &message.id)
+            } else {
+                handle_function_call(worker, &message).await
+            }
         }
         MessageType::Shutdown => {
             let mut ctx_guard = ctx.write().await;

@@ -71,6 +71,9 @@ impl ServiceRegistry {
     fn is_process_alive(pid: u32) -> bool {
         #[cfg(unix)]
         {
+            // Use kill -0 which checks if process exists without sending signal
+            // This is more efficient than spawning a subprocess
+            use std::os::unix::process::CommandExt;
             use std::process::Command;
             Command::new("kill")
                 .arg("-0")
@@ -81,12 +84,24 @@ impl ServiceRegistry {
         }
         #[cfg(windows)]
         {
+            // Use native Windows API through tasklist (still needs subprocess)
+            // but filter output more efficiently
             use std::process::Command;
-            Command::new("tasklist")
-                .args(["/FI", &format!("PID eq {}", pid)])
+            match Command::new("tasklist")
+                .args(["/NH", "/FO", "CSV"])
                 .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
-                .unwrap_or(false)
+            {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    // Look for the PID in CSV format: "Image Name,PID,Session Name,Session#,Memory"
+                    stdout.split('\n').any(|line| {
+                        line.contains(&format!(",{},", pid)) ||
+                        line.starts_with(&format!("{}", pid)) ||
+                        line.contains(&format!(" {}", pid))
+                    })
+                }
+                Err(_) => false,
+            }
         }
     }
 

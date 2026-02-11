@@ -5,6 +5,7 @@ use std::io::Cursor;
 use uuid::Uuid;
 
 const APP_NAME: &str = "comlink_ipc_v3";
+const PROTOCOL_VERSION: &str = "3.0.0";
 
 /// Validate that all map keys in a serde_json::Value are strings
 fn validate_string_keys(value: &serde_json::Value) -> Result<()> {
@@ -276,6 +277,18 @@ impl Message {
 
     pub fn is_valid(&self) -> bool {
         self.app == APP_NAME && !self.id.is_empty()
+    }
+
+    /// Check protocol version compatibility
+    pub fn check_protocol_version(&self) -> bool {
+        // For now, just check app name
+        // In the future, we could add version negotiation
+        self.app == APP_NAME
+    }
+
+    /// Get the protocol version
+    pub fn protocol_version() -> &'static str {
+        PROTOCOL_VERSION
     }
 }
 
