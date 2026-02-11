@@ -11,11 +11,14 @@
     },
     "dependencies": {
         "msgpackr": "^1.11.8",
-        "zeromq": "^6.5.0",
+        "pidusage": "^4.0.1",
         "proper-lockfile": "^4.1.2",
-        "pidusage": "^4.0.1"
+        "zeromq": "^6.5.0"
     },
     "devDependencies": {
-        "@types/node": "^22.19.11"
+        "@types/node": "^22.19.11",
+        "@types/pidusage": "^2.0.5",
+        "@types/proper-lockfile": "^4.1.4",
+        "typescript": "^5.9.3"
     }
 }

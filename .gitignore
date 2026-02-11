@@ -331,3 +331,4 @@ dist
 .pnp.*
 
 private/
+.tmp

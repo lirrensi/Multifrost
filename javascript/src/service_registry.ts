@@ -159,7 +159,7 @@ export class ServiceRegistry {
             server.listen(0);
             server.once('listening', () => {
                 const address = server.address();
-                const port = typeof address === 'object' ? address.port : 5555;
+                const port = address && typeof address === 'object' ? address.port : 5555;
                 server.close(() => resolve(port));
             });
             server.once('error', reject);

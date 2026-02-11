@@ -1,5 +1,58 @@
-import { ParentWorker, ChildWorker, ComlinkMessage, MessageType, RemoteCallError } from "./multifrost.js";
+import {
+    ParentWorker,
+    ChildWorker,
+    ComlinkMessage,
+    MessageType,
+    RemoteCallError,
+    CircuitOpenError,
+} from "./multifrost.js";
 import { ServiceRegistry } from "./service_registry.js";
+import { Metrics, MetricsSnapshot, MetricsDict, RequestMetrics } from "./metrics.js";
+import {
+    StructuredLogger,
+    LogLevel,
+    LogEvent,
+    LogEntry,
+    LogHandler,
+    defaultJsonHandler,
+    defaultPrettyHandler,
+} from "./logging.js";
 
-export default { ParentWorker, ChildWorker, ComlinkMessage, MessageType, RemoteCallError, ServiceRegistry };
-export { ParentWorker, ChildWorker, ComlinkMessage, MessageType, RemoteCallError, ServiceRegistry };
+export default {
+    ParentWorker,
+    ChildWorker,
+    ComlinkMessage,
+    MessageType,
+    RemoteCallError,
+    CircuitOpenError,
+    ServiceRegistry,
+    Metrics,
+    StructuredLogger,
+    LogLevel,
+    LogEvent,
+    defaultJsonHandler,
+    defaultPrettyHandler,
+};
+
+export {
+    ParentWorker,
+    ChildWorker,
+    ComlinkMessage,
+    MessageType,
+    RemoteCallError,
+    CircuitOpenError,
+    ServiceRegistry,
+    // Metrics
+    Metrics,
+    MetricsSnapshot,
+    MetricsDict,
+    RequestMetrics,
+    // Logging
+    StructuredLogger,
+    LogLevel,
+    LogEvent,
+    LogEntry,
+    LogHandler,
+    defaultJsonHandler,
+    defaultPrettyHandler,
+};

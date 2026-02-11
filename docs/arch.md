@@ -185,8 +185,18 @@ Location: `~/.multifrost/services.json`
 
 ```
 // Factory methods
-ParentWorker.spawn(scriptPath, executable?) -> ParentWorker
+ParentWorker.spawn(scriptPath, executable?, options?) -> ParentWorker
 ParentWorker.connect(serviceId, timeout?) -> Promise<ParentWorker>
+
+// Options (spawn mode)
+options: {
+    autoRestart?: boolean,
+    maxRestartAttempts?: number,    // default: 5
+    defaultTimeout?: number,        // ms
+    heartbeatInterval?: number,     // seconds, default: 5.0
+    heartbeatTimeout?: number,      // seconds, default: 3.0
+    heartbeatMaxMisses?: number,    // default: 3
+}
 
 // Lifecycle
 parent.start() -> Promise<void>
@@ -196,8 +206,14 @@ parent.close() / parent.stop() -> Promise<void>
 parent.call.methodName(...args) -> Promise<any>
 parent.call.withOptions({timeout?, namespace?}).methodName(...args)
 
-// Async variant (Python)
+// Async variant (Python only)
 parent.acall.methodName(...args) -> Coroutine
+
+// Properties
+parent.isHealthy -> boolean         // circuit breaker not tripped
+parent.circuitOpen -> boolean       // circuit breaker state
+parent.lastHeartbeatRttMs -> number | undefined  // last heartbeat RTT
+parent.metrics -> Metrics           // metrics collector (Python/JS)
 ```
 
 ### ChildWorker
@@ -294,13 +310,19 @@ The wire protocol is identical across implementations:
 | Core fields | app, id, type, timestamp | app, id, type, timestamp |
 | CALL fields | function, args, namespace | function, args, namespace |
 | ERROR format | message + traceback | message only |
-| STDOUT forwarding | Yes (multipart) | No (logs locally) |
+| STDOUT forwarding | Yes (multipart) | Yes (multipart) |
 | Spawn arg | `--worker` added | No extra arg |
 | Socket options | defaults | defaults |
 | Send retries | 5 | 5 |
 | Auto-restart | Yes | Yes |
+| Circuit Breaker | Yes | Yes |
+| Heartbeat Monitoring | Yes | Yes |
+| Metrics | Yes | Yes |
+| Structured Logging | Yes | Yes |
+| Default Timeout | Yes | Yes |
+| Sync Calls | Yes | No (async-only) |
 
-> **Async Nature**: This library is async-native. Adapters should use their language's idiomatic async approach (asyncio, Promises, etc.) and support both sync and async method handlers in Child.
+> **Async Nature**: This library is async-native. Adapters should use their language's idiomatic async approach (asyncio, Promises, etc.) and support both sync and async method handlers in Child. JavaScript is async-only (no sync mode) due to Node.js's single-threaded nature.
 
 ### Example: Python Parent, JS Child
 

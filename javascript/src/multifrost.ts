@@ -132,6 +132,13 @@ export class RemoteCallError extends Error {
     }
 }
 
+export class CircuitOpenError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "CircuitOpenError";
+    }
+}
+
 interface PendingRequest {
     resolve: (value: any) => void;
     reject: (error: Error) => void;
@@ -143,6 +150,12 @@ interface ParentWorkerConfig {
     executable?: string;
     serviceId?: string;
     port: number;
+    autoRestart?: boolean;
+    maxRestartAttempts?: number;
+    defaultTimeout?: number;
+    heartbeatInterval?: number;
+    heartbeatTimeout?: number;
+    heartbeatMaxMisses?: number;
 }
 
 export class ParentWorker {
@@ -151,6 +164,28 @@ export class ParentWorker {
     private readonly serviceId?: string;
     private readonly port: number;
     private readonly isSpawnMode: boolean;
+
+    // Configuration
+    public readonly autoRestart: boolean;
+    public readonly maxRestartAttempts: number;
+    public readonly defaultTimeout?: number;
+    public restartCount: number = 0;
+
+    // Circuit breaker state
+    private _consecutiveFailures: number = 0;
+    private _circuitOpen: boolean = false;
+
+    // Heartbeat configuration
+    public readonly heartbeatInterval: number;
+    public readonly heartbeatTimeout: number;
+    public readonly heartbeatMaxMisses: number;
+
+    // Heartbeat state
+    private _pendingHeartbeats: Map<string, { resolve: (value: boolean) => void; reject: (error: Error) => void }> = new Map();
+    private _consecutiveHeartbeatMisses: number = 0;
+    private _lastHeartbeatRttMs?: number;
+    private _heartbeatLoopPromise?: Promise<void>;
+    private _heartbeatRunning: boolean = false;
 
     private socket?: zmq.Dealer;
     private process?: ChildProcess;
@@ -165,15 +200,75 @@ export class ParentWorker {
         this.serviceId = config.serviceId;
         this.port = config.port;
         this.isSpawnMode = !!config.scriptPath;
+        this.autoRestart = config.autoRestart ?? false;
+        this.maxRestartAttempts = config.maxRestartAttempts ?? 5;
+        this.defaultTimeout = config.defaultTimeout;
+        this.heartbeatInterval = config.heartbeatInterval ?? 5.0;
+        this.heartbeatTimeout = config.heartbeatTimeout ?? 3.0;
+        this.heartbeatMaxMisses = config.heartbeatMaxMisses ?? 3;
         this.call = new AsyncRemoteProxy(this);
+    }
+
+    /** Check if the worker is healthy (circuit breaker not tripped). */
+    get isHealthy(): boolean {
+        return !this._circuitOpen && this.running;
+    }
+
+    /** Check if circuit breaker is open. */
+    get circuitOpen(): boolean {
+        return this._circuitOpen;
+    }
+
+    /** Record a failure for circuit breaker tracking. */
+    private _recordFailure(): void {
+        this._consecutiveFailures++;
+        if (this._consecutiveFailures >= this.maxRestartAttempts) {
+            this._circuitOpen = true;
+        }
+    }
+
+    /** Record a success, resetting circuit breaker. */
+    private _recordSuccess(): void {
+        if (this._consecutiveFailures > 0) {
+            this._consecutiveFailures = 0;
+            if (this._circuitOpen) {
+                this._circuitOpen = false;
+            }
+        }
+    }
+
+    /** Get the last heartbeat round-trip time in milliseconds. */
+    get lastHeartbeatRttMs(): number | undefined {
+        return this._lastHeartbeatRttMs;
     }
 
     /**
      * Create a ParentWorker in spawn mode (owns the child process).
      */
-    static spawn(scriptPath: string, executable: string = "node"): ParentWorker {
+    static spawn(
+        scriptPath: string,
+        executable: string = "node",
+        options?: {
+            autoRestart?: boolean;
+            maxRestartAttempts?: number;
+            defaultTimeout?: number;
+            heartbeatInterval?: number;
+            heartbeatTimeout?: number;
+            heartbeatMaxMisses?: number;
+        }
+    ): ParentWorker {
         const port = ParentWorker.findFreePort();
-        return new ParentWorker({ scriptPath, executable, port });
+        return new ParentWorker({
+            scriptPath,
+            executable,
+            port,
+            autoRestart: options?.autoRestart,
+            maxRestartAttempts: options?.maxRestartAttempts,
+            defaultTimeout: options?.defaultTimeout,
+            heartbeatInterval: options?.heartbeatInterval,
+            heartbeatTimeout: options?.heartbeatTimeout,
+            heartbeatMaxMisses: options?.heartbeatMaxMisses,
+        });
     }
 
     /**
@@ -206,6 +301,12 @@ export class ParentWorker {
 
         this.running = true;
         this.startMessageLoop();
+
+        // Start heartbeat loop (spawn mode only)
+        if (this.isSpawnMode && this.heartbeatInterval > 0) {
+            this._heartbeatRunning = true;
+            this._heartbeatLoopPromise = this._heartbeatLoop();
+        }
     }
 
     private async startChildProcess(): Promise<void> {
@@ -248,6 +349,12 @@ export class ParentWorker {
             } catch (error) {
                 console.error("Failed to process message:", error);
             }
+
+            // Check child process health (spawn mode only)
+            if (this.isSpawnMode && this.process && this.process.exitCode !== null) {
+                await this._handleChildExit();
+                break;
+            }
         }
     }
 
@@ -269,6 +376,22 @@ export class ParentWorker {
                     pending.reject(new RemoteCallError(message.error || "Unknown error"));
                 }
             }
+        } else if (message.type === MessageType.HEARTBEAT) {
+            // Handle heartbeat response
+            const heartbeat = this._pendingHeartbeats.get(message.id);
+            if (heartbeat) {
+                this._pendingHeartbeats.delete(message.id);
+
+                // Calculate RTT from timestamp in args if present
+                if (message.args && message.args.length > 0) {
+                    const sentTime = message.args[0] as number;
+                    this._lastHeartbeatRttMs = (Date.now() / 1000 - sentTime) * 1000;
+                }
+
+                // Reset consecutive misses on successful response
+                this._consecutiveHeartbeatMisses = 0;
+                heartbeat.resolve(true);
+            }
         } else if (message.type === MessageType.STDOUT) {
             if (message.output) {
                 const name = this.scriptPath || this.serviceId || "worker";
@@ -289,9 +412,19 @@ export class ParentWorker {
         namespace: string = "default",
         clientName?: string,
     ): Promise<any> {
+        // Check circuit breaker
+        if (this._circuitOpen) {
+            throw new CircuitOpenError(
+                `Circuit breaker open after ${this._consecutiveFailures} consecutive failures`
+            );
+        }
+
         if (!this.running || !this.socket) {
             throw new Error("Worker is not running");
         }
+
+        // Use default timeout if not specified
+        const effectiveTimeout = timeout ?? this.defaultTimeout;
 
         const requestId = randomUUID();
         const message = ComlinkMessage.createCall(functionName, args, namespace, requestId, clientName);
@@ -299,30 +432,207 @@ export class ParentWorker {
         return new Promise((resolve, reject) => {
             let timeoutHandle: NodeJS.Timeout | undefined;
 
-            if (timeout) {
+            if (effectiveTimeout) {
                 timeoutHandle = setTimeout(() => {
                     this.pendingRequests.delete(requestId);
-                    reject(new Error(`Function '${functionName}' timed out after ${timeout}ms`));
-                }, timeout);
+                    this._recordFailure();
+                    reject(new Error(`Function '${functionName}' timed out after ${effectiveTimeout}ms`));
+                }, effectiveTimeout);
             }
 
             this.pendingRequests.set(requestId, {
-                resolve,
-                reject,
+                resolve: (value: any) => {
+                    this._recordSuccess();
+                    resolve(value);
+                },
+                reject: (error: Error) => {
+                    this._recordFailure();
+                    reject(error);
+                },
                 timeout: timeoutHandle,
             });
 
             // Send message with DEALER envelope: [empty_frame, message_data]
-            this.socket!.send([Buffer.alloc(0), message.pack()]).catch(error => {
+            this._sendMessage(message).catch(error => {
                 this.pendingRequests.delete(requestId);
                 if (timeoutHandle) clearTimeout(timeoutHandle);
+                this._recordFailure();
                 reject(new Error(`Failed to send request: ${error}`));
             });
         });
     }
 
+    /** Send a message with retry logic. */
+    private async _sendMessage(message: ComlinkMessage, retries: number = 5): Promise<void> {
+        for (let attempt = 0; attempt < retries; attempt++) {
+            try {
+                // DEALER socket sends with empty delimiter frame
+                await this.socket!.send([Buffer.alloc(0), message.pack()]);
+                return; // Success
+            } catch (error: any) {
+                // Retry on socket busy (EAGAIN)
+                if (error.code === "EAGAIN" && attempt < retries - 1) {
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                    continue;
+                }
+                throw error;
+            }
+        }
+    }
+
+    /** Periodically send heartbeats to child process. */
+    private async _heartbeatLoop(): Promise<void> {
+        // Wait for initial connection
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        while (this.running && this._heartbeatRunning) {
+            try {
+                // Only send heartbeats in spawn mode (we own the child)
+                if (!this.isSpawnMode) {
+                    await new Promise(resolve => setTimeout(resolve, this.heartbeatInterval * 1000));
+                    continue;
+                }
+
+                // Check if child is still running
+                if (this.process && this.process.exitCode !== null) {
+                    // Child died, let message loop handle it
+                    break;
+                }
+
+                // Create heartbeat message with timestamp
+                const heartbeatId = randomUUID();
+                const heartbeat = new ComlinkMessage({
+                    type: MessageType.HEARTBEAT,
+                    id: heartbeatId,
+                    args: [Date.now() / 1000], // Send timestamp for RTT calculation
+                });
+
+                // Create promise for response
+                const heartbeatPromise = new Promise<boolean>((resolve, reject) => {
+                    this._pendingHeartbeats.set(heartbeatId, { resolve, reject });
+                });
+
+                // Send heartbeat
+                await this._sendMessage(heartbeat);
+
+                // Wait for response with timeout
+                try {
+                    await Promise.race([
+                        heartbeatPromise,
+                        new Promise<never>((_, reject) =>
+                            setTimeout(() => reject(new Error("Heartbeat timeout")), this.heartbeatTimeout * 1000)
+                        ),
+                    ]);
+                    // Success - RTT already recorded in handleMessage
+                } catch {
+                    // Heartbeat timed out
+                    this._consecutiveHeartbeatMisses++;
+                    this._pendingHeartbeats.delete(heartbeatId);
+
+                    console.warn(
+                        `Heartbeat missed (${this._consecutiveHeartbeatMisses}/${this.heartbeatMaxMisses})`
+                    );
+
+                    // Check if too many misses
+                    if (this._consecutiveHeartbeatMisses >= this.heartbeatMaxMisses) {
+                        console.error(
+                            `Heartbeat timeout after ${this._consecutiveHeartbeatMisses} consecutive misses`
+                        );
+                        // Treat as failure - trip circuit breaker
+                        this._recordFailure();
+                        break;
+                    }
+                }
+
+                // Wait for next interval
+                await new Promise(resolve => setTimeout(resolve, this.heartbeatInterval * 1000));
+
+            } catch (error) {
+                if (this.running) {
+                    console.error(`Error in heartbeat loop: ${error}`);
+                }
+                await new Promise(resolve => setTimeout(resolve, this.heartbeatInterval * 1000));
+            }
+        }
+    }
+
+    /** Handle child process exit. */
+    private async _handleChildExit(): Promise<void> {
+        const exitCode = this.process?.exitCode ?? -1;
+        console.log(`Child process exited with code ${exitCode}`);
+
+        // Record failure for circuit breaker
+        this._recordFailure();
+
+        // Notify all pending requests
+        for (const [id, pending] of this.pendingRequests) {
+            if (pending.timeout) clearTimeout(pending.timeout);
+            pending.reject(new RemoteCallError("Child process terminated unexpectedly"));
+        }
+        this.pendingRequests.clear();
+
+        // Handle restart
+        if (this.autoRestart && this.restartCount < this.maxRestartAttempts) {
+            await this._attemptRestart();
+        } else {
+            this.running = false;
+        }
+    }
+
+    /** Attempt to restart the child process. */
+    private async _attemptRestart(): Promise<void> {
+        try {
+            this.restartCount++;
+            console.log(`Restarting worker (attempt ${this.restartCount}/${this.maxRestartAttempts})`);
+
+            await new Promise(resolve => setTimeout(resolve, 1000));
+
+            // Start new process
+            const env = { ...process.env, COMLINK_ZMQ_PORT: this.port.toString() };
+            this.process = spawn(this.executable, [this.scriptPath!], { env, shell: true });
+
+            // Quick health check
+            await new Promise(resolve => setTimeout(resolve, 500));
+            if (this.process.exitCode !== null) {
+                throw new Error(`Restart failed (exit code: ${this.process.exitCode})`);
+            }
+
+            console.log("Worker restarted successfully");
+            this.restartCount = 0;
+
+            // Restart heartbeat loop if it was running
+            if (this.heartbeatInterval > 0 && !this._heartbeatRunning) {
+                this._heartbeatRunning = true;
+                this._heartbeatLoopPromise = this._heartbeatLoop();
+            }
+
+        } catch (error) {
+            console.error(`Auto-restart failed: ${error}`);
+            if (this.restartCount >= this.maxRestartAttempts) {
+                console.warn("Max restart attempts reached");
+            }
+            this.running = false;
+        }
+    }
+
     async stop(): Promise<void> {
         this.running = false;
+        this._heartbeatRunning = false;
+
+        // Cancel all pending heartbeats
+        for (const [id, hb] of this._pendingHeartbeats) {
+            hb.reject(new Error("Worker shutting down"));
+        }
+        this._pendingHeartbeats.clear();
+
+        // Wait for heartbeat loop to finish
+        if (this._heartbeatLoopPromise) {
+            try {
+                await this._heartbeatLoopPromise;
+            } catch {
+                // Ignore errors during shutdown
+            }
+        }
 
         // Cancel all pending requests
         for (const [id, pending] of this.pendingRequests) {
@@ -393,6 +703,7 @@ export abstract class ChildWorker {
     private running: boolean = true;
     private socket?: zmq.Router;
     private port?: number;
+    private _lastSenderId?: Buffer;
 
     constructor(serviceId?: string) {
         this.serviceId = serviceId;
@@ -441,14 +752,42 @@ export abstract class ChildWorker {
         const originalConsoleError = console.error;
 
         console.log = (...args: any[]) => {
-            // Can't send output without sender_id in ROUTER mode
-            // For now, just log locally
-            originalConsoleLog(...args);
+            const output = args.map(a => typeof a === "object" ? JSON.stringify(a) : String(a)).join(" ");
+            this._sendOutput(output, MessageType.STDOUT).catch(() => {
+                // Fallback to local log if send fails
+                originalConsoleLog(...args);
+            });
         };
 
         console.error = (...args: any[]) => {
-            originalConsoleError(...args);
+            const output = args.map(a => typeof a === "object" ? JSON.stringify(a) : String(a)).join(" ");
+            this._sendOutput(output, MessageType.STDERR).catch(() => {
+                // Fallback to local log if send fails
+                originalConsoleError(...args);
+            });
         };
+    }
+
+    /** Send output message to parent. */
+    private async _sendOutput(output: string, msgType: MessageType, retries: number = 2): Promise<void> {
+        if (!this.socket || !this._lastSenderId) {
+            return; // No parent connected yet
+        }
+
+        const message = ComlinkMessage.createOutput(output, msgType);
+
+        for (let attempt = 0; attempt < retries; attempt++) {
+            try {
+                await this.socket.send([this._lastSenderId, Buffer.alloc(0), message.pack()]);
+                return;
+            } catch (error: any) {
+                if (attempt < retries - 1) {
+                    await new Promise(resolve => setTimeout(resolve, 1));
+                    continue;
+                }
+                console.warn(`Warning: Failed to send output: ${error}`);
+            }
+        }
     }
 
     async start(): Promise<void> {
@@ -468,6 +807,9 @@ export abstract class ChildWorker {
         for await (const [senderId, empty, messageData] of this.socket) {
             if (!this.running) break;
 
+            // Track sender for output forwarding
+            this._lastSenderId = senderId as Buffer;
+
             try {
                 const message = ComlinkMessage.unpack(messageData as Buffer);
 
@@ -484,6 +826,9 @@ export abstract class ChildWorker {
 
                 if (message.type === MessageType.CALL) {
                     await this.handleFunctionCall(message, senderId as Buffer);
+                } else if (message.type === MessageType.HEARTBEAT) {
+                    // Respond to heartbeat
+                    await this.handleHeartbeat(message, senderId as Buffer);
                 } else if (message.type === MessageType.SHUTDOWN) {
                     console.error("Received shutdown signal");
                     this.running = false;
@@ -530,6 +875,23 @@ export abstract class ChildWorker {
             }
         } catch (error) {
             console.error(`CRITICAL: Failed to send response: ${error}`);
+        }
+    }
+
+    private async handleHeartbeat(message: ComlinkMessage, senderId: Buffer): Promise<void> {
+        // Echo back the heartbeat with the same ID and args (for RTT calculation)
+        const response = new ComlinkMessage({
+            type: MessageType.HEARTBEAT,
+            id: message.id,
+            args: message.args, // Preserve timestamp for RTT calculation
+        });
+
+        try {
+            if (this.socket) {
+                await this.socket.send([senderId, Buffer.alloc(0), response.pack()]);
+            }
+        } catch (error) {
+            console.error(`CRITICAL: Failed to send heartbeat response: ${error}`);
         }
     }
 
