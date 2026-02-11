@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
 
 /// Log levels for structured logging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,7 +129,7 @@ impl LogEntry {
 }
 
 /// Type alias for log handler function.
-pub type LogHandler = Box<dyn Fn(&LogEntry) + Send + Sync>;
+pub type LogHandler = Arc<dyn Fn(&LogEntry) + Send + Sync>;
 
 /// Structured logger with pluggable handlers.
 ///
@@ -136,9 +137,10 @@ pub type LogHandler = Box<dyn Fn(&LogEntry) + Send + Sync>;
 ///
 /// ```rust,no_run
 /// use multifrost::logging::{StructuredLogger, LogEvent, LogLevel};
+/// use std::sync::Arc;
 ///
 /// let logger = StructuredLogger::new(
-///     Some(Box::new(|entry| {
+///     Some(Arc::new(|entry| {
 ///         println!("{}", entry.to_json());
 ///     })),
 ///     LogLevel::Info,
@@ -148,6 +150,7 @@ pub type LogHandler = Box<dyn Fn(&LogEntry) + Send + Sync>;
 ///
 /// logger.info(LogEvent::WorkerStart, "Worker started");
 /// ```
+#[derive(Clone)]
 pub struct StructuredLogger {
     handler: Option<LogHandler>,
     level: LogLevel,

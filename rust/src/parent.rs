@@ -2,13 +2,13 @@ use crate::error::{MultifrostError, Result};
 use crate::message::{Message, MessageType};
 use crate::registry::ServiceRegistry;
 use crate::metrics::Metrics;
-use crate::logging::{StructuredLogger, LogEvent, LogLevel, LogOptions};
+use crate::logging::{StructuredLogger, LogLevel};
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{oneshot, Mutex, RwLock};
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
@@ -122,6 +122,7 @@ impl ParentWorker {
         };
 
         let worker_id = format!("{:x}", md5::compute(format!("{}-{}", config.script_path.as_deref().unwrap_or("connect"), std::process::id())));
+        let service_id = config.service_id.clone();
 
         Self {
             config,
@@ -136,10 +137,10 @@ impl ParentWorker {
             last_heartbeat_rtt_ms: Arc::new(RwLock::new(None)),
             metrics,
             logger: StructuredLogger::new(
-                Some(Box::new(default_log_handler)),
+                Some(Arc::new(|entry| println!("{}", entry.to_json()))),
                 LogLevel::Info,
                 Some(worker_id),
-                config.service_id.clone(),
+                service_id,
             ),
             restart_count: Arc::new(RwLock::new(0)),
         }
@@ -166,7 +167,7 @@ impl ParentWorker {
     }
 
     /// Set a custom log handler.
-    pub fn set_log_handler(&mut self, handler: Box<dyn Fn(&crate::logging::LogEntry) + Send + Sync>) {
+    pub fn set_log_handler(&mut self, handler: Arc<dyn Fn(&crate::logging::LogEntry) + Send + Sync>) {
         self.logger.set_handler(handler);
     }
 
@@ -442,10 +443,6 @@ fn find_free_port_sync() -> u16 {
         .unwrap_or(5555)
 }
 
-fn default_log_handler(entry: &crate::logging::LogEntry) {
-    println!("{}", entry.to_json());
-}
-
 async fn message_loop(
     socket: Arc<Mutex<Option<DealerSocket>>>,
     pending: PendingRequests,
@@ -461,12 +458,12 @@ async fn message_loop(
     heartbeat_interval: Duration,
     heartbeat_timeout: Duration,
     heartbeat_max_misses: usize,
-    max_restart_attempts: usize,
-    auto_restart: bool,
-    restart_count: Arc<RwLock<usize>>,
-    script_path: Option<String>,
-    executable: String,
-    port: u16,
+    _max_restart_attempts: usize,
+    _auto_restart: bool,
+    _restart_count: Arc<RwLock<usize>>,
+    _script_path: Option<String>,
+    _executable: String,
+    _port: u16,
 ) {
     // Start heartbeat loop if in spawn mode
     if is_spawn_mode && heartbeat_interval.as_secs() > 0 {
@@ -585,7 +582,7 @@ async fn heartbeat_loop(
     pending_heartbeats: PendingHeartbeats,
     running: Arc<RwLock<bool>>,
     consecutive_heartbeat_misses: Arc<RwLock<usize>>,
-    last_heartbeat_rtt_ms: Arc<RwLock<Option<f64>>>,
+    _last_heartbeat_rtt_ms: Arc<RwLock<Option<f64>>>,
     metrics: Option<Metrics>,
     logger: StructuredLogger,
     heartbeat_interval: Duration,
@@ -623,12 +620,12 @@ async fn heartbeat_loop(
         {
             let mut socket_guard = socket.lock().await;
             if let Some(ref mut socket) = *socket_guard {
-                let zmq_msg: ZmqMessage = vec![
+                let zmq_msg_result: std::result::Result<ZmqMessage, _> = vec![
                     Bytes::from(vec![]),
                     Bytes::from(packed),
                 ].try_into();
 
-                if let Ok(msg) = zmq_msg {
+                if let Ok(msg) = zmq_msg_result {
                     let _ = socket.send(msg).await;
                 }
             }
