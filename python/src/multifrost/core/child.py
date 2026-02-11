@@ -246,14 +246,19 @@ class ChildWorker:
 
             # Call the function (sync or async)
             if asyncio.iscoroutinefunction(func):
-                # Handle async functions
+                # Handle async functions - detect if already in async context
                 try:
-                    loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
+                    loop = asyncio.get_running_loop()
+                    # Already in async context - can't use run_until_complete
+                    # Create a new thread with its own event loop
+                    import concurrent.futures
 
-                result = loop.run_until_complete(func(*args))
+                    with concurrent.futures.ThreadPoolExecutor() as executor:
+                        future = executor.submit(asyncio.run, func(*args))
+                        result = future.result()
+                except RuntimeError:
+                    # No running loop - safe to create one
+                    result = asyncio.run(func(*args))
             else:
                 # Handle sync functions
                 result = func(*args)

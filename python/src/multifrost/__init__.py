@@ -70,6 +70,23 @@ result = await worker.acall.add(1, 2)
 await worker.close()
 ```
 
+### With Observability (Metrics & Logging)
+```python
+from multifrost import ParentWorker, default_json_handler
+
+# Enable structured logging
+worker = ParentWorker.spawn("child.py", log_handler=default_json_handler)
+await worker.start()
+
+# Make calls (automatically tracked)
+result = await worker.acall.my_function(1, 2)
+
+# Get metrics snapshot
+metrics = worker.metrics.snapshot()
+print(f"Avg latency: {metrics.latency_avg_ms}ms")
+print(f"Error rate: {metrics.requests_failed / metrics.requests_total}")
+```
+
 ## Architecture
 
 The library uses ROUTER/DEALER socket pattern:
@@ -86,18 +103,46 @@ For migration guide, see: python/REFACTOR.md
 - MessageType: Enum for message types
 - ComlinkMessage: Message container class
 - ServiceRegistry: Service discovery and registration
+- Metrics: Metrics collection for observability
+- StructuredLogger: Structured logging with correlation IDs
 """
 
-from .core.async_worker import ParentWorker
+from .core.async_worker import ParentWorker, RemoteCallError, CircuitOpenError
 from .core.child import ChildWorker
 from .core.message import MessageType, ComlinkMessage
 from .core.service_registry import ServiceRegistry
+from .core.metrics import Metrics, MetricsSnapshot, RequestMetrics
+from .core.logging import (
+    StructuredLogger,
+    LogEntry,
+    LogEvent,
+    LogLevel,
+    LogHandler,
+    default_json_handler,
+    default_pretty_handler,
+)
 
-__version__ = "4.0.0"
+__version__ = "3.0.0"
 __all__ = [
+    # Core
     "ParentWorker",
     "ChildWorker",
     "MessageType",
     "ComlinkMessage",
     "ServiceRegistry",
+    # Errors
+    "RemoteCallError",
+    "CircuitOpenError",
+    # Metrics
+    "Metrics",
+    "MetricsSnapshot",
+    "RequestMetrics",
+    # Logging
+    "StructuredLogger",
+    "LogEntry",
+    "LogEvent",
+    "LogLevel",
+    "LogHandler",
+    "default_json_handler",
+    "default_pretty_handler",
 ]

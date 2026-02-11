@@ -6,7 +6,7 @@ import uuid
 import time
 import msgpack
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 
 class MessageType(Enum):
@@ -33,6 +33,7 @@ class ComlinkMessage:
     - id: str = unique UUID
     - type: str = "call"|"response"|"error"|"stdout"|"stderr"|"heartbeat"|"shutdown"
     - timestamp: float = unix timestamp
+    - metadata: dict = optional metadata for tracing, timing, context
 
     Call message fields:
     - function: str = function name to call
@@ -48,6 +49,13 @@ class ComlinkMessage:
 
     Output message fields:
     - output: str = stdout/stderr content
+
+    Metadata fields (optional):
+    - correlation_id: str = for distributed tracing across services
+    - parent_request_id: str = for nested call chains
+    - timestamp_sent: float = when request was sent
+    - timestamp_received: float = when response was received
+    - custom: dict = user-defined metadata
     """
 
     def __init__(self, **kwargs):
@@ -57,6 +65,7 @@ class ComlinkMessage:
         self.type = None
         self.timestamp = time.time()
         self.client_name = None
+        self.metadata: Dict[str, Any] = {}
 
         # Override with any provided values
         for key, value in kwargs.items():
@@ -68,10 +77,21 @@ class ComlinkMessage:
         function: str,
         args: tuple = (),
         namespace: str = "default",
-        msg_id: str = None,
-        client_name: str = None,
+        msg_id: Optional[str] = None,
+        client_name: Optional[str] = None,
+        correlation_id: Optional[str] = None,
+        parent_request_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ):
-        """Create a function call message."""
+        """Create a function call message with optional tracing metadata."""
+        msg_metadata: Dict[str, Any] = metadata.copy() if metadata else {}
+        msg_metadata["timestamp_sent"] = time.time()
+
+        if correlation_id:
+            msg_metadata["correlation_id"] = correlation_id
+        if parent_request_id:
+            msg_metadata["parent_request_id"] = parent_request_id
+
         return cls(
             type=MessageType.CALL.value,
             id=msg_id or str(uuid.uuid4()),
@@ -79,17 +99,42 @@ class ComlinkMessage:
             args=args,
             namespace=namespace,
             client_name=client_name,
+            metadata=msg_metadata,
         )
 
     @classmethod
-    def create_response(cls, result: Any, msg_id: str):
-        """Create a response message."""
-        return cls(type=MessageType.RESPONSE.value, id=msg_id, result=result)
+    def create_response(
+        cls,
+        result: Any,
+        msg_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        """Create a response message with optional metadata."""
+        msg_metadata: Dict[str, Any] = metadata.copy() if metadata else {}
+        msg_metadata["timestamp_received"] = time.time()
+        return cls(
+            type=MessageType.RESPONSE.value,
+            id=msg_id,
+            result=result,
+            metadata=msg_metadata,
+        )
 
     @classmethod
-    def create_error(cls, error: str, msg_id: str):
-        """Create an error message."""
-        return cls(type=MessageType.ERROR.value, id=msg_id, error=error)
+    def create_error(
+        cls,
+        error: str,
+        msg_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        """Create an error message with optional metadata."""
+        msg_metadata: Dict[str, Any] = metadata.copy() if metadata else {}
+        msg_metadata["timestamp_received"] = time.time()
+        return cls(
+            type=MessageType.ERROR.value,
+            id=msg_id,
+            error=error,
+            metadata=msg_metadata,
+        )
 
     @classmethod
     def create_output(cls, output: str, msg_type: MessageType):
