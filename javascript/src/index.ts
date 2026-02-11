@@ -7,16 +7,16 @@ import {
     CircuitOpenError,
 } from "./multifrost.js";
 import { ServiceRegistry } from "./service_registry.js";
-import { Metrics, MetricsSnapshot, MetricsDict, RequestMetrics } from "./metrics.js";
+import { Metrics } from "./metrics.js";
+import type { MetricsSnapshot, MetricsDict, RequestMetrics } from "./metrics.js";
 import {
     StructuredLogger,
     LogLevel,
     LogEvent,
-    LogEntry,
-    LogHandler,
     defaultJsonHandler,
     defaultPrettyHandler,
 } from "./logging.js";
+import type { LogEntry, LogHandler } from "./logging.js";
 
 export default {
     ParentWorker,
@@ -44,15 +44,13 @@ export {
     ServiceRegistry,
     // Metrics
     Metrics,
-    MetricsSnapshot,
-    MetricsDict,
-    RequestMetrics,
     // Logging
     StructuredLogger,
     LogLevel,
     LogEvent,
-    LogEntry,
-    LogHandler,
     defaultJsonHandler,
     defaultPrettyHandler,
 };
+
+// Type-only exports
+export type { LogEntry, LogHandler, MetricsSnapshot, MetricsDict, RequestMetrics };

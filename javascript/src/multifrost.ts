@@ -192,6 +192,9 @@ export class ParentWorker {
     private running: boolean = false;
     private readonly pendingRequests: Map<string, PendingRequest> = new Map();
 
+    // Mutex for socket send operations
+    private _sendLock: Promise<void> = Promise.resolve();
+
     public readonly call: AsyncRemoteProxy;
 
     private constructor(config: ParentWorkerConfig) {
@@ -462,21 +465,39 @@ export class ParentWorker {
         });
     }
 
-    /** Send a message with retry logic. */
+    /** Send a message with retry logic and mutex for socket safety. */
     private async _sendMessage(message: ComlinkMessage, retries: number = 5): Promise<void> {
-        for (let attempt = 0; attempt < retries; attempt++) {
-            try {
-                // DEALER socket sends with empty delimiter frame
-                await this.socket!.send([Buffer.alloc(0), message.pack()]);
-                return; // Success
-            } catch (error: any) {
-                // Retry on socket busy (EAGAIN)
-                if (error.code === "EAGAIN" && attempt < retries - 1) {
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                    continue;
+        // Simple mutex: wait for previous send to complete, then chain our operation
+        const previousLock = this._sendLock;
+
+        let releaseLock: () => void;
+        this._sendLock = new Promise<void>(resolve => {
+            releaseLock = resolve;
+        });
+
+        // Wait for previous operation to complete
+        await previousLock;
+
+        try {
+            for (let attempt = 0; attempt < retries; attempt++) {
+                try {
+                    // DEALER socket sends with empty delimiter frame
+                    await this.socket!.send([Buffer.alloc(0), message.pack()]);
+                    return; // Success
+                } catch (error: any) {
+                    // Retry on socket busy (EAGAIN or "busy" errors)
+                    const isBusy = error.code === "EAGAIN" ||
+                                   error.message?.includes("busy") ||
+                                   error.message?.includes("in progress");
+                    if (isBusy && attempt < retries - 1) {
+                        await new Promise(resolve => setTimeout(resolve, 100));
+                        continue;
+                    }
+                    throw error;
                 }
-                throw error;
             }
+        } finally {
+            releaseLock!();
         }
     }
 
