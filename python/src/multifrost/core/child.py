@@ -207,11 +207,46 @@ class ChildWorker:
             # Handle message types
             if message.type == MessageType.CALL.value:
                 self._handle_function_call(message, sender_id)
+            elif message.type == MessageType.HEARTBEAT.value:
+                self._handle_heartbeat(message, sender_id)
             elif message.type == MessageType.SHUTDOWN.value:
                 self._running = False
 
         except Exception as e:
             print(f"ERROR: Failed to process message: {e}", file=sys.stderr)
+
+    def _handle_heartbeat(self, message: ComlinkMessage, sender_id):
+        """
+        Handle a heartbeat message - echo it back immediately.
+
+        Args:
+            message: The heartbeat message
+            sender_id: Sender identity for ROUTER socket response
+        """
+        try:
+            # Extract original timestamp from request
+            original_ts = None
+            if hasattr(message, "metadata") and message.metadata:
+                original_ts = message.metadata.get("hb_timestamp")
+
+            if original_ts is None:
+                original_ts = time.time()
+
+            # Create heartbeat response with same ID and original timestamp
+            response = ComlinkMessage.create_heartbeat_response(
+                request_id=message.id,
+                original_timestamp=original_ts,
+            )
+
+            # Send response with ROUTER envelope
+            self.socket.send_multipart([sender_id, b"", response.pack()], zmq.NOBLOCK)
+
+        except zmq.Again:
+            # Socket busy - heartbeats are best-effort
+            pass
+        except Exception as e:
+            # Don't log heartbeat failures - they're frequent and noisy
+            pass
 
     def _handle_function_call(self, message: ComlinkMessage, sender_id):
         """

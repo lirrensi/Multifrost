@@ -49,6 +49,11 @@ class MetricsSnapshot:
     circuit_breaker_trips: int = 0
     circuit_breaker_state: str = "closed"  # closed, open, half-open
 
+    # Heartbeat
+    heartbeat_rtt_avg_ms: float = 0.0
+    heartbeat_rtt_last_ms: float = 0.0
+    heartbeat_misses: int = 0
+
     # Time window
     window_seconds: float = 0.0
 
@@ -100,6 +105,10 @@ class Metrics:
 
         # Latency samples (circular buffer)
         self._latencies: deque = deque(maxlen=max_latency_samples)
+
+        # Heartbeat RTT samples
+        self._heartbeat_rtts: deque = deque(maxlen=100)
+        self._heartbeat_misses = 0
 
         # Request tracking (for in-flight requests)
         self._inflight: Dict[str, RequestMetrics] = {}
@@ -165,6 +174,16 @@ class Metrics:
         with self._lock:
             self._circuit_breaker_state = "half-open"
 
+    def record_heartbeat_rtt(self, rtt_ms: float):
+        """Record a heartbeat round-trip time."""
+        with self._lock:
+            self._heartbeat_rtts.append(rtt_ms)
+
+    def record_heartbeat_miss(self):
+        """Record a missed heartbeat (timeout)."""
+        with self._lock:
+            self._heartbeat_misses += 1
+
     def snapshot(self) -> MetricsSnapshot:
         """Get a point-in-time snapshot of all metrics."""
         with self._lock:
@@ -188,6 +207,14 @@ class Metrics:
                 latency_avg = latency_p50 = latency_p95 = latency_p99 = 0.0
                 latency_min = latency_max = 0.0
 
+            # Calculate heartbeat RTT average
+            heartbeat_rtts = list(self._heartbeat_rtts)
+            if heartbeat_rtts:
+                heartbeat_rtt_avg = sum(heartbeat_rtts) / len(heartbeat_rtts)
+                heartbeat_rtt_last = heartbeat_rtts[-1]
+            else:
+                heartbeat_rtt_avg = heartbeat_rtt_last = 0.0
+
             return MetricsSnapshot(
                 requests_total=self._requests_total,
                 requests_success=self._requests_success,
@@ -202,6 +229,9 @@ class Metrics:
                 queue_max_depth=self._queue_max_depth,
                 circuit_breaker_trips=self._circuit_breaker_trips,
                 circuit_breaker_state=self._circuit_breaker_state,
+                heartbeat_rtt_avg_ms=heartbeat_rtt_avg,
+                heartbeat_rtt_last_ms=heartbeat_rtt_last,
+                heartbeat_misses=self._heartbeat_misses,
                 window_seconds=self.window_seconds,
             )
 
@@ -216,6 +246,8 @@ class Metrics:
             self._queue_depth = 0
             self._queue_max_depth = 0
             self._latencies.clear()
+            self._heartbeat_rtts.clear()
+            self._heartbeat_misses = 0
             self._inflight.clear()
 
     def to_dict(self) -> Dict[str, Any]:
@@ -247,5 +279,10 @@ class Metrics:
             "circuit_breaker": {
                 "trips": snapshot.circuit_breaker_trips,
                 "state": snapshot.circuit_breaker_state,
+            },
+            "heartbeat": {
+                "rtt_avg_ms": round(snapshot.heartbeat_rtt_avg_ms, 2),
+                "rtt_last_ms": round(snapshot.heartbeat_rtt_last_ms, 2),
+                "misses": snapshot.heartbeat_misses,
             },
         }

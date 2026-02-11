@@ -407,6 +407,131 @@ class TestIntegration:
         assert len(entries) == 1
 
 
+class TestHeartbeat:
+    """Test heartbeat functionality."""
+
+    def test_create_heartbeat_message(self):
+        """Test creating a heartbeat message."""
+        msg = ComlinkMessage.create_heartbeat()
+
+        assert msg.type == MessageType.HEARTBEAT.value
+        assert msg.id is not None
+        assert "hb_timestamp" in msg.metadata
+
+    def test_create_heartbeat_with_id(self):
+        """Test creating a heartbeat with specific ID."""
+        msg = ComlinkMessage.create_heartbeat(msg_id="hb-123")
+
+        assert msg.id == "hb-123"
+        assert msg.type == MessageType.HEARTBEAT.value
+
+    def test_create_heartbeat_response(self):
+        """Test creating a heartbeat response."""
+        original_ts = time.time() - 0.01  # 10ms ago
+        response = ComlinkMessage.create_heartbeat_response(
+            request_id="hb-123",
+            original_timestamp=original_ts,
+        )
+
+        assert response.id == "hb-123"
+        assert response.type == MessageType.HEARTBEAT.value
+        assert response.metadata["hb_timestamp"] == original_ts
+        assert response.metadata["hb_response"] is True
+
+    def test_heartbeat_pack_unpack(self):
+        """Test packing and unpacking heartbeat message."""
+        original = ComlinkMessage.create_heartbeat(msg_id="hb-456")
+        packed = original.pack()
+        unpacked = ComlinkMessage.unpack(packed)
+
+        assert unpacked.id == "hb-456"
+        assert unpacked.type == MessageType.HEARTBEAT.value
+        assert "hb_timestamp" in unpacked.metadata
+
+    def test_metrics_heartbeat_rtt(self):
+        """Test recording heartbeat RTT in metrics."""
+        metrics = Metrics()
+
+        # Record some heartbeat RTTs
+        metrics.record_heartbeat_rtt(5.5)
+        metrics.record_heartbeat_rtt(10.2)
+        metrics.record_heartbeat_rtt(3.1)
+
+        snapshot = metrics.snapshot()
+        assert snapshot.heartbeat_rtt_last_ms == 3.1
+        assert snapshot.heartbeat_rtt_avg_ms > 0
+
+    def test_metrics_heartbeat_miss(self):
+        """Test recording heartbeat misses in metrics."""
+        metrics = Metrics()
+
+        metrics.record_heartbeat_miss()
+        metrics.record_heartbeat_miss()
+
+        snapshot = metrics.snapshot()
+        assert snapshot.heartbeat_misses == 2
+
+    def test_heartbeat_log_events(self):
+        """Test heartbeat logging events."""
+        entries = []
+        logger = StructuredLogger(
+            handler=lambda e: entries.append(e),
+            level=LogLevel.DEBUG,
+        )
+
+        # Test heartbeat_sent
+        logger.heartbeat_sent()
+        assert entries[-1].event == "heartbeat_sent"
+
+        # Test heartbeat_received
+        logger.heartbeat_received(rtt_ms=5.5)
+        assert entries[-1].event == "heartbeat_received"
+        assert entries[-1].duration_ms == 5.5
+
+        # Test heartbeat_missed
+        logger.heartbeat_missed(consecutive=2, max_allowed=3)
+        assert entries[-1].event == "heartbeat_missed"
+        assert entries[-1].metadata["consecutive_misses"] == 2
+
+        # Test heartbeat_timeout
+        logger.heartbeat_timeout(misses=3)
+        assert entries[-1].event == "heartbeat_timeout"
+
+    def test_parent_worker_heartbeat_config(self):
+        """Test ParentWorker heartbeat configuration."""
+        from multifrost import ParentWorker
+
+        # Default config
+        worker = ParentWorker.spawn("dummy.py")
+        assert worker.heartbeat_interval == 5.0
+        assert worker.heartbeat_timeout == 3.0
+        assert worker.heartbeat_max_misses == 3
+
+        # Custom config
+        worker = ParentWorker.spawn(
+            "dummy.py",
+            heartbeat_interval=10.0,
+            heartbeat_timeout=5.0,
+            heartbeat_max_misses=5,
+        )
+        assert worker.heartbeat_interval == 10.0
+        assert worker.heartbeat_timeout == 5.0
+        assert worker.heartbeat_max_misses == 5
+
+        # Disabled heartbeats
+        worker = ParentWorker.spawn("dummy.py", heartbeat_interval=0)
+        assert worker.heartbeat_interval == 0
+
+    def test_parent_worker_heartbeat_rtt_property(self):
+        """Test accessing heartbeat RTT from ParentWorker."""
+        from multifrost import ParentWorker
+
+        worker = ParentWorker.spawn("dummy.py")
+
+        # Initially None (no heartbeats yet)
+        assert worker.last_heartbeat_rtt_ms is None
+
+
 def run_tests():
     """Run all tests."""
     print("Running TestMetrics...")
@@ -446,6 +571,19 @@ def run_tests():
     t.test_parent_worker_metrics_property()
     t.test_set_log_handler()
     print("  [OK] All TestIntegration passed")
+
+    print("Running TestHeartbeat...")
+    t = TestHeartbeat()
+    t.test_create_heartbeat_message()
+    t.test_create_heartbeat_with_id()
+    t.test_create_heartbeat_response()
+    t.test_heartbeat_pack_unpack()
+    t.test_metrics_heartbeat_rtt()
+    t.test_metrics_heartbeat_miss()
+    t.test_heartbeat_log_events()
+    t.test_parent_worker_heartbeat_config()
+    t.test_parent_worker_heartbeat_rtt_property()
+    print("  [OK] All TestHeartbeat passed")
 
     print("\n[PASS] All tests passed!")
 

@@ -83,6 +83,9 @@ class ParentWorker:
         default_timeout: Optional[float] = None,
         enable_metrics: bool = True,
         log_handler: Optional[LogHandler] = None,
+        heartbeat_interval: float = 5.0,
+        heartbeat_timeout: float = 3.0,
+        heartbeat_max_misses: int = 3,
     ):
         # Internal config - use factory methods instead
         self._script_path = script_path
@@ -100,6 +103,17 @@ class ParentWorker:
         # Circuit breaker state
         self._consecutive_failures = 0
         self._circuit_open = False
+
+        # Heartbeat configuration
+        self.heartbeat_interval = heartbeat_interval
+        self.heartbeat_timeout = heartbeat_timeout
+        self.heartbeat_max_misses = heartbeat_max_misses
+
+        # Heartbeat state
+        self._pending_heartbeats: Dict[str, asyncio.Future] = {}
+        self._consecutive_heartbeat_misses = 0
+        self._last_heartbeat_rtt_ms: Optional[float] = None
+        self._heartbeat_task: Optional[asyncio.Task] = None
 
         # Metrics collection
         self.enable_metrics = enable_metrics
@@ -168,6 +182,11 @@ class ParentWorker:
         """Check if circuit breaker is open."""
         return self._circuit_open
 
+    @property
+    def last_heartbeat_rtt_ms(self) -> Optional[float]:
+        """Get the last heartbeat round-trip time in milliseconds."""
+        return self._last_heartbeat_rtt_ms
+
     @staticmethod
     def spawn(
         script_path: str,
@@ -177,6 +196,9 @@ class ParentWorker:
         default_timeout: Optional[float] = None,
         enable_metrics: bool = True,
         log_handler: Optional[LogHandler] = None,
+        heartbeat_interval: float = 5.0,
+        heartbeat_timeout: float = 3.0,
+        heartbeat_max_misses: int = 3,
     ) -> "ParentWorker":
         """
         Create a ParentWorker in spawn mode (owns the child process).
@@ -189,6 +211,9 @@ class ParentWorker:
             default_timeout: Default timeout for calls in seconds
             enable_metrics: Whether to collect metrics
             log_handler: Optional handler for structured logs
+            heartbeat_interval: Seconds between heartbeats (0 to disable)
+            heartbeat_timeout: Seconds to wait for heartbeat response
+            heartbeat_max_misses: Consecutive misses before triggering failure
 
         Returns:
             ParentWorker instance configured for spawn mode
@@ -201,6 +226,9 @@ class ParentWorker:
             default_timeout=default_timeout,
             enable_metrics=enable_metrics,
             log_handler=log_handler,
+            heartbeat_interval=heartbeat_interval,
+            heartbeat_timeout=heartbeat_timeout,
+            heartbeat_max_misses=heartbeat_max_misses,
         )
 
     @staticmethod
@@ -271,6 +299,10 @@ class ParentWorker:
 
         # Start ZMQ event loop
         self._zmq_task = asyncio.create_task(self._zmq_event_loop())
+
+        # Start heartbeat task (spawn mode only)
+        if self._is_spawn_mode and self.heartbeat_interval > 0:
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
         # Wait for connection
         await asyncio.sleep(1)
@@ -579,6 +611,8 @@ class ParentWorker:
             # Handle different message types
             if message.type in [MessageType.RESPONSE.value, MessageType.ERROR.value]:
                 await self._handle_response(message)
+            elif message.type == MessageType.HEARTBEAT.value:
+                await self._handle_heartbeat_response(message)
             elif message.type == MessageType.STDOUT.value:
                 output = getattr(message, "output", "")
                 if output:
@@ -616,6 +650,104 @@ class ParentWorker:
         else:  # ERROR
             error = getattr(message, "error", "Unknown error")
             future.set_exception(RemoteCallError(error))
+
+    async def _handle_heartbeat_response(self, message: ComlinkMessage):
+        """Handle heartbeat response from child process."""
+        async with self._lock:
+            future = self._pending_heartbeats.pop(message.id, None)
+
+        if not future or future.done():
+            return
+
+        # Calculate RTT from original timestamp
+        original_ts = None
+        if hasattr(message, "metadata") and message.metadata:
+            original_ts = message.metadata.get("hb_timestamp")
+
+        if original_ts:
+            rtt_ms = (time.time() - original_ts) * 1000
+            self._last_heartbeat_rtt_ms = rtt_ms
+
+            # Record to metrics
+            if self._metrics:
+                self._metrics.record_heartbeat_rtt(rtt_ms)
+
+        # Reset consecutive misses on successful response
+        self._consecutive_heartbeat_misses = 0
+
+        # Complete the future
+        future.set_result(True)
+
+    async def _heartbeat_loop(self):
+        """
+        Periodically send heartbeats to child process.
+
+        If too many consecutive heartbeats are missed, triggers circuit breaker.
+        """
+        # Wait for initial connection
+        await asyncio.sleep(1.0)
+
+        while self.running:
+            try:
+                # Only send heartbeats in spawn mode (we own the child)
+                if not self._is_spawn_mode:
+                    await asyncio.sleep(self.heartbeat_interval)
+                    continue
+
+                # Check if child is still running
+                if self.process and self.process.poll() is not None:
+                    # Child died, let _zmq_event_loop handle it
+                    break
+
+                # Create heartbeat message
+                heartbeat_id = str(uuid.uuid4())
+                heartbeat = ComlinkMessage.create_heartbeat(msg_id=heartbeat_id)
+
+                # Create future for response
+                future = asyncio.Future()
+                async with self._lock:
+                    self._pending_heartbeats[heartbeat_id] = future
+
+                # Send heartbeat
+                await self._send_message(heartbeat)
+
+                # Wait for response with timeout
+                try:
+                    await asyncio.wait_for(future, timeout=self.heartbeat_timeout)
+                    # Success - RTT already recorded in _handle_heartbeat_response
+                except asyncio.TimeoutError:
+                    # Heartbeat timed out
+                    self._consecutive_heartbeat_misses += 1
+
+                    # Clean up pending heartbeat
+                    async with self._lock:
+                        self._pending_heartbeats.pop(heartbeat_id, None)
+
+                    # Log missed heartbeat
+                    self._logger.heartbeat_missed(
+                        consecutive=self._consecutive_heartbeat_misses,
+                        max_allowed=self.heartbeat_max_misses,
+                    )
+
+                    # Check if too many misses
+                    if self._consecutive_heartbeat_misses >= self.heartbeat_max_misses:
+                        self._logger.heartbeat_timeout(
+                            misses=self._consecutive_heartbeat_misses,
+                        )
+                        # Treat as failure - trip circuit breaker
+                        self._record_failure()
+                        # Could also trigger child exit handling here
+                        break
+
+                # Wait for next interval
+                await asyncio.sleep(self.heartbeat_interval)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if self.running:
+                    print(f"Error in heartbeat loop: {e}")
+                await asyncio.sleep(self.heartbeat_interval)
 
     async def _handle_child_exit(self):
         """Handle child process exit."""
@@ -715,6 +847,21 @@ class ParentWorker:
 
         # Cleanup resources
         try:
+            # Cancel heartbeat task
+            if self._heartbeat_task and not self._heartbeat_task.done():
+                self._heartbeat_task.cancel()
+                try:
+                    await self._heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Cancel pending heartbeats
+            async with self._lock:
+                for hb_id, future in self._pending_heartbeats.items():
+                    if not future.done():
+                        future.cancel()
+                self._pending_heartbeats.clear()
+
             # Wait for ZMQ task
             if self._zmq_task and not self._zmq_task.done():
                 self._zmq_task.cancel()

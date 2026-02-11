@@ -48,6 +48,12 @@ class LogEvent(Enum):
     PROCESS_SPAWN = "process_spawn"
     PROCESS_EXIT = "process_exit"
 
+    # Heartbeat
+    HEARTBEAT_SENT = "heartbeat_sent"
+    HEARTBEAT_RECEIVED = "heartbeat_received"
+    HEARTBEAT_MISSED = "heartbeat_missed"
+    HEARTBEAT_TIMEOUT = "heartbeat_timeout"
+
     # Queue
     QUEUE_OVERFLOW = "queue_overflow"
 
@@ -301,6 +307,37 @@ class StructuredLogger:
             f"Child process exited with code {exit_code}",
             level=level,
             metadata={"exit_code": exit_code},
+        )
+
+    def heartbeat_sent(self):
+        """Log heartbeat sent."""
+        self.debug(
+            LogEvent.HEARTBEAT_SENT,
+            "Heartbeat sent",
+        )
+
+    def heartbeat_received(self, rtt_ms: float):
+        """Log heartbeat response received."""
+        self.debug(
+            LogEvent.HEARTBEAT_RECEIVED,
+            f"Heartbeat received (RTT: {rtt_ms:.1f}ms)",
+            duration_ms=rtt_ms,
+        )
+
+    def heartbeat_missed(self, consecutive: int, max_allowed: int):
+        """Log missed heartbeat."""
+        self.warn(
+            LogEvent.HEARTBEAT_MISSED,
+            f"Heartbeat missed ({consecutive}/{max_allowed})",
+            metadata={"consecutive_misses": consecutive, "max_allowed": max_allowed},
+        )
+
+    def heartbeat_timeout(self, misses: int):
+        """Log heartbeat timeout (too many misses)."""
+        self.error(
+            LogEvent.HEARTBEAT_TIMEOUT,
+            f"Heartbeat timeout after {misses} consecutive misses",
+            metadata={"total_misses": misses},
         )
 
 

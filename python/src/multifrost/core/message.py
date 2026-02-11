@@ -141,6 +141,52 @@ class ComlinkMessage:
         """Create stdout/stderr output message."""
         return cls(type=msg_type.value, output=output)
 
+    @classmethod
+    def create_heartbeat(
+        cls,
+        msg_id: Optional[str] = None,
+        timestamp: Optional[float] = None,
+        is_response: bool = False,
+    ):
+        """
+        Create a heartbeat message.
+
+        Args:
+            msg_id: Optional message ID (auto-generated if not provided)
+            timestamp: Timestamp to include (defaults to now)
+            is_response: If True, this is a heartbeat response
+
+        Returns:
+            ComlinkMessage with type "heartbeat"
+        """
+        msg_metadata = {"hb_timestamp": timestamp or time.time()}
+        return cls(
+            type=MessageType.HEARTBEAT.value,
+            id=msg_id or str(uuid.uuid4()),
+            metadata=msg_metadata,
+        )
+
+    @classmethod
+    def create_heartbeat_response(cls, request_id: str, original_timestamp: float):
+        """
+        Create a heartbeat response message.
+
+        Args:
+            request_id: The ID of the heartbeat request
+            original_timestamp: The timestamp from the request (for RTT calculation)
+
+        Returns:
+            ComlinkMessage with type "heartbeat" (response)
+        """
+        return cls(
+            type=MessageType.HEARTBEAT.value,
+            id=request_id,
+            metadata={
+                "hb_timestamp": original_timestamp,
+                "hb_response": True,
+            },
+        )
+
     def extract_call_args(self):
         """Extract args from simple list format."""
         if hasattr(self, "args"):
