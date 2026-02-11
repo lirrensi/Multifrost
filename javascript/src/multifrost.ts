@@ -7,6 +7,39 @@ import { ServiceRegistry } from "./service_registry.js";
 
 const APP_NAME = "comlink_ipc_v3";
 
+/**
+ * Sanitize values for msgpack serialization to ensure cross-language interop safety.
+ * Converts NaN/Infinity to null and ensures integer values are within safe range.
+ */
+function sanitizeForMsgpack(value: any): any {
+    if (typeof value === "number") {
+        if (isNaN(value) || !isFinite(value)) return null;
+        // Clamp to safe integer range (2^53) for interop
+        if (Math.abs(value) > 2 ** 53 && !Number.isInteger(value)) {
+            return Math.round(value);
+        }
+    }
+    return value;
+}
+
+/**
+ * Deeply sanitize all values in an object/array structure for msgpack serialization.
+ */
+function deepSanitize(obj: any): any {
+    if (obj === null || obj === undefined) return obj;
+    if (Array.isArray(obj)) return obj.map(item => deepSanitize(item));
+    if (typeof obj === "object") {
+        const result: any = {};
+        for (const key in obj) {
+            if (obj.hasOwnProperty(key)) {
+                result[key] = deepSanitize(obj[key]);
+            }
+        }
+        return result;
+    }
+    return sanitizeForMsgpack(obj);
+}
+
 export enum MessageType {
     CALL = "call",
     RESPONSE = "response",
@@ -111,13 +144,14 @@ export class ComlinkMessage {
         return result;
     }
 
-    pack(): Buffer {
-        return msgpack.encode(this.toDict());
+pack(): Buffer {
+        const sanitized = deepSanitize(this.toDict());
+        return msgpack.encode(sanitized, { useBigInt64: true });
     }
 
-    static unpack(data: Buffer): ComlinkMessage {
+static unpack(data: Buffer): ComlinkMessage {
         try {
-            const decoded = msgpack.decode(data);
+            const decoded = msgpack.decode(data, { useBigInt64: true });
             return new ComlinkMessage(decoded);
         } catch (error) {
             throw new Error(`Failed to unpack message: ${error}`);

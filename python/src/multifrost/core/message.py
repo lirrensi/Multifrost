@@ -4,6 +4,7 @@ Message handling for ZeroMQ communication.
 
 import uuid
 import time
+import math
 import msgpack
 from enum import Enum
 from typing import Any, Optional, Dict
@@ -22,6 +23,40 @@ class MessageType(Enum):
 
 
 APP_NAME = "comlink_ipc_v3"
+
+
+def _sanitize_for_msgpack(obj: Any) -> Any:
+    """Sanitize object for msgpack interop safety across languages.
+
+    Handles:
+    - NaN/Infinity → null
+    - Integer overflow → clamp to int64
+    - Non-string keys → string conversion
+    - Binary data → proper binary type
+    """
+    INT64_MAX = 2**63 - 1
+    INT64_MIN = -(2**63)
+
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_for_msgpack(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_sanitize_for_msgpack(v) for v in obj]
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    elif isinstance(obj, int):
+        return max(INT64_MIN, min(INT64_MAX, obj))
+    return obj
+
+
+def _filter_none(obj: Any) -> Any:
+    """Remove None values from dict for optional field handling."""
+    if isinstance(obj, dict):
+        return {k: v for k, v in obj.items() if v is not None}
+    elif isinstance(obj, list):
+        return [_filter_none(v) for v in obj]
+    return obj
 
 
 class ComlinkMessage:
@@ -202,8 +237,11 @@ class ComlinkMessage:
         }
 
     def pack(self) -> bytes:
-        """Pack message for ZeroMQ transmission."""
-        return msgpack.packb(self.to_dict())
+        """Pack message for ZeroMQ transmission with interop safety."""
+        data = self.to_dict()
+        sanitized = _sanitize_for_msgpack(data)
+        filtered = _filter_none(sanitized)
+        return msgpack.packb(filtered, use_bin_type=True)
 
     @classmethod
     def unpack(cls, data: bytes) -> "ComlinkMessage":
@@ -216,8 +254,15 @@ class ComlinkMessage:
             if len(data) == 0:
                 raise ValueError("Empty message data")
 
-            # Unpack with msgpack
-            unpacked = msgpack.unpackb(data, raw=False)
+            # Unpack with size limits (DoS protection)
+            unpacked = msgpack.unpackb(
+                data,
+                raw=False,
+                max_bin_len=10 * 1024 * 1024,
+                max_str_len=10 * 1024 * 1024,
+                max_array_len=100_000,
+                max_map_len=100_000,
+            )
 
             # Validate it's a dict
             if not isinstance(unpacked, dict):
@@ -227,8 +272,8 @@ class ComlinkMessage:
             return cls(**unpacked)
 
         except msgpack.exceptions.ExtraData as e:
-            raise msgpack.exceptions.ExtraData(f"Message contains extra data: {e}")
+            raise ValueError(f"Message contains extra data: {e}")
         except msgpack.exceptions.UnpackException as e:
-            raise msgpack.exceptions.UnpackException(f"Failed to unpack message: {e}")
+            raise ValueError(f"Failed to unpack message: {e}")
         except Exception as e:
             raise ValueError(f"Failed to create ComlinkMessage: {e}")
