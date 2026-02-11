@@ -55,11 +55,18 @@ mod message;
 mod registry;
 mod child;
 mod parent;
+mod metrics;
+mod logging;
 
 pub use error::{MultifrostError, Result};
 pub use message::{Message, MessageType};
 pub use registry::ServiceRegistry;
 pub use child::{ChildWorker, ChildWorkerContext, run_worker};
 pub use parent::ParentWorker;
+pub use metrics::{Metrics, MetricsSnapshot, RequestMetrics};
+pub use logging::{
+    StructuredLogger, LogEntry, LogEvent, LogLevel, LogHandler,
+    default_json_handler, default_pretty_handler, LogOptions,
+};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

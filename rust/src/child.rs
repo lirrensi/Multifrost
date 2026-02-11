@@ -5,8 +5,16 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::env;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
+use zeromq::{RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
+
+fn current_timestamp() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
 
 #[async_trait]
 pub trait ChildWorker: Send + Sync + 'static {
@@ -17,7 +25,7 @@ pub struct ChildWorkerContext {
     namespace: String,
     service_id: Option<String>,
     running: bool,
-    socket: Option<DealerSocket>,
+    socket: Option<RouterSocket>,
 }
 
 impl ChildWorkerContext {
@@ -57,19 +65,24 @@ pub async fn run_worker<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) {
 async fn run_worker_inner<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) -> Result<()> {
     let ctx = Arc::new(RwLock::new(ctx));
     let is_spawn_mode;
-    
+
     // Setup ZMQ socket
     {
         let mut ctx_guard = ctx.write().await;
         let port_env = env::var("COMLINK_ZMQ_PORT").ok();
         is_spawn_mode = port_env.is_some();
-        
-        let mut socket = DealerSocket::new();
-        
+
+        let mut socket = RouterSocket::new();
+
         if let Some(port_str) = port_env {
             // Spawn mode: connect to parent's port
             let port: u16 = port_str.parse()
                 .map_err(|_| MultifrostError::InvalidMessage("Invalid port".to_string()))?;
+            if !(1024..=65535).contains(&port) {
+                return Err(MultifrostError::InvalidMessage(
+                    format!("Port {} out of valid range (1024-65535)", port)
+                ));
+            }
             socket.connect(&format!("tcp://127.0.0.1:{}", port)).await
                 .map_err(|e| MultifrostError::ZmqError(e.to_string()))?;
         } else if let Some(ref service_id) = ctx_guard.service_id {
@@ -82,36 +95,37 @@ async fn run_worker_inner<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) ->
                 "Need COMLINK_ZMQ_PORT env or service_id".to_string()
             ));
         }
-        
+
         ctx_guard.socket = Some(socket);
         ctx_guard.running = true;
     }
-    
+
     // Send ready message in spawn mode
     if is_spawn_mode {
         let ready_msg = Message::create_ready();
         let packed = ready_msg.pack()?;
-        
+
+        // ROUTER sends: [empty, message] when connecting to parent's DEALER
         let zmq_msg: ZmqMessage = vec![
             Bytes::from(vec![]),  // Empty frame for DEALER
             Bytes::from(packed),
         ].try_into()
             .map_err(|_| MultifrostError::InvalidMessage("Empty message".to_string()))?;
-        
+
         let mut ctx_guard = ctx.write().await;
         if let Some(ref mut socket) = ctx_guard.socket {
             socket.send(zmq_msg).await
                 .map_err(|e| MultifrostError::ZmqError(e.to_string()))?;
         }
     }
-    
+
     // Message loop
     let worker = Arc::new(worker);
-    
+
     loop {
         let ctx_clone = Arc::clone(&ctx);
         let worker_clone = Arc::clone(&worker);
-        
+
         let msg_result = {
             let mut ctx_guard = ctx_clone.write().await;
             if !ctx_guard.running {
@@ -123,7 +137,7 @@ async fn run_worker_inner<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) ->
                 break;
             }
         };
-        
+
         match msg_result {
             Ok(zmq_msg) => {
                 if let Err(e) = handle_message(ctx_clone, worker_clone, zmq_msg).await {
@@ -135,7 +149,7 @@ async fn run_worker_inner<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) ->
             }
         }
     }
-    
+
     // Cleanup
     {
         let mut ctx_guard = ctx.write().await;
@@ -144,7 +158,7 @@ async fn run_worker_inner<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) ->
             let _ = ServiceRegistry::unregister(service_id).await;
         }
     }
-    
+
     Ok(())
 }
 
@@ -153,20 +167,21 @@ async fn handle_message<W: ChildWorker>(
     worker: Arc<W>,
     zmq_msg: ZmqMessage,
 ) -> Result<()> {
-    // DEALER receives: [empty, message_data]
+    // ROUTER receives: [sender_id, empty, message_data]
     let frames: Vec<_> = zmq_msg.into_vec();
-    
-    if frames.len() < 2 {
+
+    if frames.len() < 3 {
         return Err(MultifrostError::InvalidMessage("Not enough frames".to_string()));
     }
-    
-    let message_data = frames[1].to_vec();
+
+    let sender_id = frames[0].to_vec();
+    let message_data = frames[2].to_vec();
     let message = Message::unpack(&message_data)?;
-    
+
     if !message.is_valid() {
         return Err(MultifrostError::InvalidMessage("Invalid message".to_string()));
     }
-    
+
     // Check namespace
     {
         let ctx_guard = ctx.read().await;
@@ -176,7 +191,7 @@ async fn handle_message<W: ChildWorker>(
             }
         }
     }
-    
+
     let response = match message.msg_type {
         MessageType::Call => {
             handle_function_call(worker, &message).await
@@ -186,17 +201,28 @@ async fn handle_message<W: ChildWorker>(
             ctx_guard.running = false;
             return Ok(());
         }
-        MessageType::Ready | MessageType::Response | MessageType::Error => {
+        MessageType::Heartbeat => {
+            // Handle heartbeat - echo back with response
+            let msg_id = message.id.clone();
+            let original_ts = message.metadata
+                .as_ref()
+                .and_then(|m| m.get("hb_timestamp"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or_else(|| current_timestamp());
+            Message::create_heartbeat_response(&msg_id, original_ts)
+        }
+        MessageType::Ready | MessageType::Response | MessageType::Error | MessageType::Stdout | MessageType::Stderr => {
             return Ok(());
         }
     };
-    
-    // Send response - DEALER sends: [empty, message]
+
+    // Send response - ROUTER sends: [sender_id, empty, message]
     let response_data = response.pack()?;
-    
+
     let mut ctx_guard = ctx.write().await;
     if let Some(ref mut socket) = ctx_guard.socket {
         let reply: ZmqMessage = vec![
+            Bytes::from(sender_id),
             Bytes::from(vec![]),
             Bytes::from(response_data),
         ].try_into()
@@ -204,7 +230,7 @@ async fn handle_message<W: ChildWorker>(
         socket.send(reply).await
             .map_err(|e| MultifrostError::ZmqError(e.to_string()))?;
     }
-    
+
     Ok(())
 }
 
@@ -213,11 +239,11 @@ async fn handle_function_call<W: ChildWorker>(
     message: &Message,
 ) -> Message {
     let msg_id = message.id.clone();
-    
+
     match message.function {
         Some(ref func) => {
             let args = message.args.clone().unwrap_or_default();
-            
+
             // Prevent calling private methods
             if func.starts_with('_') {
                 return Message::create_error(
@@ -225,7 +251,7 @@ async fn handle_function_call<W: ChildWorker>(
                     &msg_id,
                 );
             }
-            
+
             match worker.handle_call(func, args).await {
                 Ok(result) => Message::create_response(result, &msg_id),
                 Err(e) => Message::create_error(&e.to_string(), &msg_id),

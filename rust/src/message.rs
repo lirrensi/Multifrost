@@ -10,6 +10,9 @@ pub enum MessageType {
     Call,
     Response,
     Error,
+    Stdout,
+    Stderr,
+    Heartbeat,
     Shutdown,
     Ready,
 }
@@ -39,7 +42,13 @@ pub struct Message {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
+    pub output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub client_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Custom serializer for timestamp to handle msgpack integer/float ambiguity
@@ -87,7 +96,9 @@ impl Message {
             namespace: None,
             result: None,
             error: None,
+            output: None,
             client_name: None,
+            metadata: None,
         }
     }
 
@@ -102,7 +113,9 @@ impl Message {
             namespace: Some("default".to_string()),
             result: None,
             error: None,
+            output: None,
             client_name: None,
+            metadata: None,
         }
     }
 
@@ -117,7 +130,9 @@ impl Message {
             namespace: None,
             result: Some(result),
             error: None,
+            output: None,
             client_name: None,
+            metadata: None,
         }
     }
 
@@ -132,7 +147,9 @@ impl Message {
             namespace: None,
             result: None,
             error: Some(error.to_string()),
+            output: None,
             client_name: None,
+            metadata: None,
         }
     }
 
@@ -142,6 +159,60 @@ impl Message {
 
     pub fn create_ready() -> Self {
         Self::new(MessageType::Ready)
+    }
+
+    pub fn create_stdout(output: &str) -> Self {
+        Self {
+            app: APP_NAME.to_string(),
+            id: Uuid::new_v4().to_string(),
+            msg_type: MessageType::Stdout,
+            timestamp: current_timestamp(),
+            output: Some(output.to_string()),
+            ..Default::default()
+        }
+    }
+
+    pub fn create_stderr(output: &str) -> Self {
+        Self {
+            app: APP_NAME.to_string(),
+            id: Uuid::new_v4().to_string(),
+            msg_type: MessageType::Stderr,
+            timestamp: current_timestamp(),
+            output: Some(output.to_string()),
+            ..Default::default()
+        }
+    }
+
+    pub fn create_heartbeat(msg_id: Option<String>, timestamp: Option<f64>) -> Self {
+        let hb_timestamp = timestamp.unwrap_or_else(|| current_timestamp());
+        let metadata = serde_json::json!({
+            "hb_timestamp": hb_timestamp
+        });
+
+        Self {
+            app: APP_NAME.to_string(),
+            id: msg_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+            msg_type: MessageType::Heartbeat,
+            timestamp: current_timestamp(),
+            metadata: Some(metadata),
+            ..Default::default()
+        }
+    }
+
+    pub fn create_heartbeat_response(request_id: &str, original_timestamp: f64) -> Self {
+        let metadata = serde_json::json!({
+            "hb_timestamp": original_timestamp,
+            "hb_response": true
+        });
+
+        Self {
+            app: APP_NAME.to_string(),
+            id: request_id.to_string(),
+            msg_type: MessageType::Heartbeat,
+            timestamp: current_timestamp(),
+            metadata: Some(metadata),
+            ..Default::default()
+        }
     }
 
     pub fn pack(&self) -> Result<Vec<u8>> {
@@ -156,6 +227,25 @@ impl Message {
 
     pub fn is_valid(&self) -> bool {
         self.app == APP_NAME && !self.id.is_empty()
+    }
+}
+
+impl Default for Message {
+    fn default() -> Self {
+        Self {
+            app: APP_NAME.to_string(),
+            id: Uuid::new_v4().to_string(),
+            msg_type: MessageType::Call,
+            timestamp: current_timestamp(),
+            function: None,
+            args: None,
+            namespace: None,
+            result: None,
+            error: None,
+            output: None,
+            client_name: None,
+            metadata: None,
+        }
     }
 }
 

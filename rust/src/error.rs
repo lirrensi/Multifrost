@@ -17,6 +17,9 @@ pub enum MultifrostError {
     #[error("Remote call error: {0}")]
     RemoteCallError(String),
 
+    #[error("Circuit breaker is open after {0} consecutive failures")]
+    CircuitOpenError(usize),
+
     #[error("Timeout waiting for response")]
     TimeoutError,
 

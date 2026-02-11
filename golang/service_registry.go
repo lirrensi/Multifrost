@@ -164,11 +164,8 @@ func (r *ServiceRegistry) load() error {
 	return json.Unmarshal(data, &r.services)
 }
 
-// save writes the registry to disk
+// save writes the registry to disk (caller must hold lock)
 func (r *ServiceRegistry) save() error {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
 	data, err := json.MarshalIndent(r.services, "", "  ")
 	if err != nil {
 		return err
@@ -341,11 +338,26 @@ func ListServices() (map[string]ServiceInfo, error) {
 func ClearRegistry() error {
 	r := getRegistry()
 
+	// Acquire lock
+	lock, err := acquireLock()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: Failed to acquire registry lock: %v\n", err)
+	}
+
+	if lock != nil {
+		defer func() {
+			if releaseErr := releaseLock(lock); releaseErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: Failed to release registry lock: %v\n", releaseErr)
+			}
+		}()
+	}
+
 	r.mu.Lock()
 	r.services = make(map[string]ServiceInfo)
+	err = r.save()
 	r.mu.Unlock()
 
-	return r.save()
+	return err
 }
 
 // GetRegistryPath returns the current registry file path (for debugging)

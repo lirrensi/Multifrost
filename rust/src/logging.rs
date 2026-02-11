@@ -1,0 +1,476 @@
+//! Structured logging with correlation IDs for observability.
+//!
+//! Provides JSON-formatted logs with pluggable output handlers.
+
+use serde::{Deserialize, Serialize};
+use std::fmt;
+
+/// Log levels for structured logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LogLevel::Debug => write!(f, "debug"),
+            LogLevel::Info => write!(f, "info"),
+            LogLevel::Warn => write!(f, "warn"),
+            LogLevel::Error => write!(f, "error"),
+        }
+    }
+}
+
+/// Standard log events for IPC operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogEvent {
+    // Lifecycle
+    WorkerStart,
+    WorkerStop,
+    WorkerRestart,
+
+    // Requests
+    RequestStart,
+    RequestEnd,
+    RequestTimeout,
+    RequestError,
+
+    // Circuit breaker
+    CircuitOpen,
+    CircuitClose,
+    CircuitHalfOpen,
+
+    // Connection
+    SocketConnect,
+    SocketDisconnect,
+    SocketReconnect,
+
+    // Process
+    ProcessSpawn,
+    ProcessExit,
+
+    // Heartbeat
+    HeartbeatSent,
+    HeartbeatReceived,
+    HeartbeatMissed,
+    HeartbeatTimeout,
+
+    // Queue
+    QueueOverflow,
+}
+
+impl fmt::Display for LogEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = serde_json::to_string(self).unwrap_or_default();
+        write!(f, "{}", s.trim_matches('"'))
+    }
+}
+
+/// Structured log entry with all context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    // Required
+    pub event: String,
+    pub level: String,
+    pub message: String,
+    pub timestamp: f64,
+
+    // Correlation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_request_id: Option<String>,
+
+    // Context
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+
+    // Timing
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<f64>,
+
+    // Status
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+
+    // Metrics snapshot (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<serde_json::Value>,
+
+    // Custom metadata
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+impl LogEntry {
+    /// Convert to JSON string.
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_default()
+    }
+}
+
+/// Type alias for log handler function.
+pub type LogHandler = Box<dyn Fn(&LogEntry) + Send + Sync>;
+
+/// Structured logger with pluggable handlers.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use multifrost::logging::{StructuredLogger, LogEvent, LogLevel};
+///
+/// let logger = StructuredLogger::new(
+///     Some(Box::new(|entry| {
+///         println!("{}", entry.to_json());
+///     })),
+///     LogLevel::Info,
+///     Some("worker-1".to_string()),
+///     None,
+/// );
+///
+/// logger.info(LogEvent::WorkerStart, "Worker started");
+/// ```
+pub struct StructuredLogger {
+    handler: Option<LogHandler>,
+    level: LogLevel,
+    worker_id: Option<String>,
+    service_id: Option<String>,
+}
+
+impl StructuredLogger {
+    /// Create a new structured logger.
+    pub fn new(
+        handler: Option<LogHandler>,
+        level: LogLevel,
+        worker_id: Option<String>,
+        service_id: Option<String>,
+    ) -> Self {
+        Self {
+            handler,
+            level,
+            worker_id,
+            service_id,
+        }
+    }
+
+    /// Set or update the log handler.
+    pub fn set_handler(&mut self, handler: LogHandler) {
+        self.handler = Some(handler);
+    }
+
+    /// Set default context for all log entries.
+    pub fn set_context(&mut self, worker_id: Option<String>, service_id: Option<String>) {
+        if worker_id.is_some() {
+            self.worker_id = worker_id;
+        }
+        if service_id.is_some() {
+            self.service_id = service_id;
+        }
+    }
+
+    /// Check if this level should be logged.
+    fn should_log(&self, level: LogLevel) -> bool {
+        level as u8 >= self.level as u8
+    }
+
+    /// Log an event with structured data.
+    pub fn log(&self, event: LogEvent, message: &str, level: LogLevel, options: LogOptions) {
+        if self.handler.is_none() || !self.should_log(level) {
+            return;
+        }
+
+        let entry = LogEntry {
+            event: event.to_string(),
+            level: level.to_string(),
+            message: message.to_string(),
+            timestamp: current_timestamp(),
+            worker_id: self.worker_id.clone(),
+            service_id: self.service_id.clone(),
+            correlation_id: options.correlation_id,
+            request_id: options.request_id,
+            parent_request_id: options.parent_request_id,
+            function: options.function,
+            namespace: options.namespace,
+            duration_ms: options.duration_ms,
+            success: options.success,
+            error: options.error,
+            error_type: options.error_type,
+            metrics: options.metrics,
+            metadata: options.metadata,
+        };
+
+        if let Some(ref handler) = self.handler {
+            handler(&entry);
+        }
+    }
+
+    /// Log at DEBUG level.
+    pub fn debug(&self, event: LogEvent, message: &str, options: LogOptions) {
+        self.log(event, message, LogLevel::Debug, options);
+    }
+
+    /// Log at INFO level.
+    pub fn info(&self, event: LogEvent, message: &str, options: LogOptions) {
+        self.log(event, message, LogLevel::Info, options);
+    }
+
+    /// Log at WARN level.
+    pub fn warn(&self, event: LogEvent, message: &str, options: LogOptions) {
+        self.log(event, message, LogLevel::Warn, options);
+    }
+
+    /// Log at ERROR level.
+    pub fn error(&self, event: LogEvent, message: &str, options: LogOptions) {
+        self.log(event, message, LogLevel::Error, options);
+    }
+
+    // Convenience methods for common events
+
+    /// Log request start.
+    pub fn request_start(
+        &self,
+        request_id: &str,
+        function: &str,
+        namespace: &str,
+        correlation_id: Option<String>,
+        metadata: Option<serde_json::Value>,
+    ) {
+        self.debug(
+            LogEvent::RequestStart,
+            &format!("Calling {}", function),
+            LogOptions {
+                request_id: Some(request_id.to_string()),
+                function: Some(function.to_string()),
+                namespace: Some(namespace.to_string()),
+                correlation_id,
+                metadata,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Log request completion.
+    pub fn request_end(
+        &self,
+        request_id: &str,
+        function: &str,
+        duration_ms: f64,
+        success: bool,
+        error: Option<String>,
+        correlation_id: Option<String>,
+    ) {
+        let event = if success {
+            LogEvent::RequestEnd
+        } else {
+            LogEvent::RequestError
+        };
+        let level = if success {
+            LogLevel::Info
+        } else {
+            LogLevel::Warn
+        };
+
+        self.log(
+            event,
+            &format!(
+                "{} {}",
+                if success { "Completed" } else { "Failed" },
+                function
+            ),
+            level,
+            LogOptions {
+                request_id: Some(request_id.to_string()),
+                function: Some(function.to_string()),
+                duration_ms: Some(duration_ms),
+                success: Some(success),
+                error,
+                correlation_id,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Log circuit breaker opening.
+    pub fn circuit_open(&self, failures: usize) {
+        self.warn(
+            LogEvent::CircuitOpen,
+            &format!("Circuit breaker opened after {} failures", failures),
+            LogOptions::default(),
+        );
+    }
+
+    /// Log circuit breaker closing (recovery).
+    pub fn circuit_close(&self) {
+        self.info(
+            LogEvent::CircuitClose,
+            "Circuit breaker closed (recovered)",
+            LogOptions::default(),
+        );
+    }
+
+    /// Log worker start.
+    pub fn worker_start(&self, mode: &str) {
+        self.info(
+            LogEvent::WorkerStart,
+            &format!("Worker started in {} mode", mode),
+            LogOptions::default(),
+        );
+    }
+
+    /// Log worker stop.
+    pub fn worker_stop(&self, reason: &str) {
+        self.info(
+            LogEvent::WorkerStop,
+            &format!("Worker stopped: {}", reason),
+            LogOptions::default(),
+        );
+    }
+
+    /// Log child process exit.
+    pub fn process_exit(&self, exit_code: i32) {
+        let level = if exit_code == 0 {
+            LogLevel::Info
+        } else {
+            LogLevel::Warn
+        };
+        self.log(
+            LogEvent::ProcessExit,
+            &format!("Child process exited with code {}", exit_code),
+            level,
+            LogOptions {
+                metadata: Some(serde_json::json!({ "exit_code": exit_code })),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Log heartbeat sent.
+    pub fn heartbeat_sent(&self) {
+        self.debug(
+            LogEvent::HeartbeatSent,
+            "Heartbeat sent",
+            LogOptions::default(),
+        );
+    }
+
+    /// Log heartbeat response received.
+    pub fn heartbeat_received(&self, rtt_ms: f64) {
+        self.debug(
+            LogEvent::HeartbeatReceived,
+            &format!("Heartbeat received (RTT: {:.1}ms)", rtt_ms),
+            LogOptions {
+                duration_ms: Some(rtt_ms),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Log missed heartbeat.
+    pub fn heartbeat_missed(&self, consecutive: usize, max_allowed: usize) {
+        self.warn(
+            LogEvent::HeartbeatMissed,
+            &format!("Heartbeat missed ({}/{})", consecutive, max_allowed),
+            LogOptions {
+                metadata: Some(serde_json::json!({
+                    "consecutive_misses": consecutive,
+                    "max_allowed": max_allowed,
+                })),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// Log heartbeat timeout (too many misses).
+    pub fn heartbeat_timeout(&self, misses: usize) {
+        self.error(
+            LogEvent::HeartbeatTimeout,
+            &format!("Heartbeat timeout after {} consecutive misses", misses),
+            LogOptions {
+                metadata: Some(serde_json::json!({ "total_misses": misses })),
+                ..Default::default()
+            },
+        );
+    }
+}
+
+/// Options for log entries.
+#[derive(Default)]
+pub struct LogOptions {
+    pub correlation_id: Option<String>,
+    pub request_id: Option<String>,
+    pub parent_request_id: Option<String>,
+    pub function: Option<String>,
+    pub namespace: Option<String>,
+    pub duration_ms: Option<f64>,
+    pub success: Option<bool>,
+    pub error: Option<String>,
+    pub error_type: Option<String>,
+    pub metrics: Option<serde_json::Value>,
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Default handler that prints JSON to stdout.
+pub fn default_json_handler(entry: &LogEntry) {
+    println!("{}", entry.to_json());
+}
+
+/// Default handler that prints human-readable output.
+pub fn default_pretty_handler(entry: &LogEntry) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let time_str = format!(
+        "{:02}:{:02}:{:02}",
+        (timestamp / 3600) % 24,
+        (timestamp / 60) % 60,
+        timestamp % 60
+    );
+    let level = format!("{:<5}", entry.level.to_uppercase());
+    let prefix = format!("[{}] [{}]", time_str, level);
+
+    let mut parts = vec![prefix, entry.event.clone(), entry.message.clone()];
+
+    if let Some(ref req_id) = entry.request_id {
+        parts.push(format!("req={}", &req_id[..req_id.len().min(8)]));
+    }
+    if let Some(ref func) = entry.function {
+        parts.push(format!("fn={}", func));
+    }
+    if let Some(duration) = entry.duration_ms {
+        parts.push(format!("{:.1}ms", duration));
+    }
+    if let Some(ref err) = entry.error {
+        parts.push(format!("error={}", err));
+    }
+
+    println!("{}", parts.join(" "));
+}
+
+fn current_timestamp() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}

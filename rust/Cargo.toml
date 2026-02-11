@@ -17,6 +17,7 @@ uuid = { version = "1", features = ["v4"] }
 thiserror = "1"
 async-trait = "0.1"
 dirs = "5"
+md5 = "0.7"
 
 [[example]]
 name = "math_worker"
