@@ -127,7 +127,7 @@ export class StructuredLogger {
         serviceId?: string;
     }) {
         this.handler = options?.handler;
-        this.level = options?.level ?? LogLevel.INFO;
+        this.level = options?.level !== undefined ? options.level : LogLevel.INFO;
         this.workerId = options?.workerId;
         this.serviceId = options?.serviceId;
     }
@@ -175,7 +175,7 @@ export class StructuredLogger {
             event: event,
             level: (options?.level ?? LogLevel.INFO).valueOf(),
             message,
-            timestamp: Date.now() / 1000,
+            timestamp: Date.now(), // Use milliseconds for consistency
             workerId: this.workerId,
             serviceId: this.serviceId,
             correlationId: options?.correlationId,
@@ -321,7 +321,7 @@ export function defaultJsonHandler(entry: LogEntry): void {
 
 /** Default handler that prints human-readable output. */
 export function defaultPrettyHandler(entry: LogEntry): void {
-    const timestamp = new Date(entry.timestamp * 1000).toLocaleTimeString("en-US", { hour12: false });
+    const timestamp = new Date(entry.timestamp).toLocaleTimeString("en-US", { hour12: false });
     const level = entry.level.toUpperCase().padEnd(5);
     const prefix = `[${timestamp}] [${level}]`;
 

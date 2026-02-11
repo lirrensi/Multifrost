@@ -51,7 +51,7 @@ async function testSpawnMode(): Promise<void> {
     console.log("\n=== Test: Spawn Mode ===");
 
     // Spawn ourselves with --worker flag
-    const worker = ParentWorker.spawn(__filename + " --worker", "npx tsx");
+    const worker = ParentWorker.spawn(`${__filename} --worker`, "npx tsx");
     await worker.start();
 
     // Wait for connection

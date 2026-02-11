@@ -11,7 +11,7 @@ const APP_NAME = "comlink_ipc_v3";
  * Sanitize values for msgpack serialization to ensure cross-language interop safety.
  * Converts NaN/Infinity to null and ensures integer values are within safe range.
  */
-function sanitizeForMsgpack(value: any): any {
+function sanitizeForMsgpack(value: unknown): unknown {
     if (typeof value === "number") {
         if (isNaN(value) || !isFinite(value)) return null;
         // Clamp to safe integer range (2^53) for interop
@@ -25,14 +25,14 @@ function sanitizeForMsgpack(value: any): any {
 /**
  * Deeply sanitize all values in an object/array structure for msgpack serialization.
  */
-function deepSanitize(obj: any): any {
+function deepSanitize(obj: unknown): unknown {
     if (obj === null || obj === undefined) return obj;
     if (Array.isArray(obj)) return obj.map(item => deepSanitize(item));
     if (typeof obj === "object") {
-        const result: any = {};
+        const result: Record<string, unknown> = {};
         for (const key in obj) {
-            if (obj.hasOwnProperty(key)) {
-                result[key] = deepSanitize(obj[key]);
+            if (Object.prototype.hasOwnProperty.call(obj, key)) {
+                result[key] = deepSanitize((obj as Record<string, unknown>)[key]);
             }
         }
         return result;
@@ -56,12 +56,12 @@ export interface ComlinkMessageData {
     type: string;
     timestamp: number;
     function?: string;
-    args?: any[];
+    args?: unknown[];
     namespace?: string;
-    result?: any;
+    result?: unknown;
     error?: string;
     output?: string;
-    client_name?: string;
+    clientName?: string;
 }
 
 export class ComlinkMessage {
@@ -70,12 +70,12 @@ export class ComlinkMessage {
     public type: string;
     public timestamp: number;
     public function?: string;
-    public args?: any[];
+    public args?: unknown[];
     public namespace?: string;
-    public result?: any;
+    public result?: unknown;
     public error?: string;
     public output?: string;
-    public client_name?: string;
+    public clientName?: string;
 
     constructor(data: Partial<ComlinkMessageData> = {}) {
         this.id = data.id || randomUUID();
@@ -85,9 +85,9 @@ export class ComlinkMessage {
         Object.assign(this, data);
     }
 
-    static createCall(
+static createCall(
         functionName: string,
-        args: any[] = [],
+        args: unknown[] = [],
         namespace: string = "default",
         msgId?: string,
         clientName?: string,
@@ -98,11 +98,11 @@ export class ComlinkMessage {
             function: functionName,
             args,
             namespace,
-            client_name: clientName,
+            clientName,
         });
     }
 
-    static createResponse(result: any, msgId: string): ComlinkMessage {
+    static createResponse(result: unknown, msgId: string): ComlinkMessage {
         return new ComlinkMessage({
             type: MessageType.RESPONSE,
             id: msgId,
@@ -139,22 +139,23 @@ export class ComlinkMessage {
         if (this.result !== undefined) result.result = this.result;
         if (this.error !== undefined) result.error = this.error;
         if (this.output !== undefined) result.output = this.output;
-        if (this.client_name !== undefined) result.client_name = this.client_name;
+        if (this.clientName !== undefined) result.clientName = this.clientName;
 
         return result;
     }
 
 pack(): Buffer {
         const sanitized = deepSanitize(this.toDict());
-        return msgpack.encode(sanitized, { useBigInt64: true });
+        return msgpack.encode(sanitized);
     }
-
-static unpack(data: Buffer): ComlinkMessage {
+    
+    static unpack(data: Buffer): ComlinkMessage {
         try {
-            const decoded = msgpack.decode(data, { useBigInt64: true });
+            const decoded = msgpack.decode(data);
             return new ComlinkMessage(decoded);
         } catch (error) {
-            throw new Error(`Failed to unpack message: ${error}`);
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            throw new Error(`Failed to unpack message: ${errorMessage}`);
         }
     }
 }
@@ -174,7 +175,7 @@ export class CircuitOpenError extends Error {
 }
 
 interface PendingRequest {
-    resolve: (value: any) => void;
+    resolve: (value: unknown) => void;
     reject: (error: Error) => void;
     timeout?: NodeJS.Timeout;
 }
@@ -320,7 +321,7 @@ export class ParentWorker {
         const server = net.createServer();
         server.listen(0);
         const address = server.address();
-        const port = address && typeof address === "object" ? address.port : 5555;
+        const port = address && typeof address === "object" ? address.port : 5555; // Fallback port if address is unavailable
         server.close();
         return port;
     }
@@ -329,20 +330,33 @@ export class ParentWorker {
         // Setup ZeroMQ DEALER socket
         this.socket = new zmq.Dealer();
 
-        if (this.isSpawnMode) {
-            await this.socket.bind(`tcp://*:${this.port}`);
-            await this.startChildProcess();
-        } else {
-            await this.socket.connect(`tcp://localhost:${this.port}`);
-        }
+        try {
+            if (this.isSpawnMode) {
+                await this.socket.bind(`tcp://*:${this.port}`);
+                await this.startChildProcess();
+            } else {
+                await this.socket.connect(`tcp://localhost:${this.port}`);
+            }
 
-        this.running = true;
-        this.startMessageLoop();
+            this.running = true;
+            this.startMessageLoop();
 
-        // Start heartbeat loop (spawn mode only)
-        if (this.isSpawnMode && this.heartbeatInterval > 0) {
-            this._heartbeatRunning = true;
-            this._heartbeatLoopPromise = this._heartbeatLoop();
+            // Start heartbeat loop (spawn mode only)
+            if (this.isSpawnMode && this.heartbeatInterval > 0) {
+                this._heartbeatRunning = true;
+                this._heartbeatLoopPromise = this._heartbeatLoop();
+            }
+        } catch (error) {
+            // Clean up socket on error
+            if (this.socket) {
+                try {
+                    this.socket.close();
+                } catch {
+                    // Ignore cleanup errors
+                }
+                this.socket = undefined;
+            }
+            throw error;
         }
     }
 
@@ -384,7 +398,8 @@ export class ParentWorker {
                 const comlinkMessage = ComlinkMessage.unpack(message as Buffer);
                 await this.handleMessage(comlinkMessage);
             } catch (error) {
-                console.error("Failed to process message:", error);
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                console.error("Failed to process message:", errorMessage);
             }
 
             // Check child process health (spawn mode only)
@@ -422,7 +437,7 @@ export class ParentWorker {
                 // Calculate RTT from timestamp in args if present
                 if (message.args && message.args.length > 0) {
                     const sentTime = message.args[0] as number;
-                    this._lastHeartbeatRttMs = (Date.now() / 1000 - sentTime) * 1000;
+                    this._lastHeartbeatRttMs = Date.now() - sentTime * 1000;
                 }
 
                 // Reset consecutive misses on successful response
@@ -442,13 +457,13 @@ export class ParentWorker {
         }
     }
 
-    async callFunction(
+    async callFunction<T = unknown>(
         functionName: string,
-        args: any[] = [],
+        args: unknown[] = [],
         timeout?: number,
         namespace: string = "default",
         clientName?: string,
-    ): Promise<any> {
+    ): Promise<T> {
         // Check circuit breaker
         if (this._circuitOpen) {
             throw new CircuitOpenError(
@@ -463,27 +478,47 @@ export class ParentWorker {
         // Use default timeout if not specified
         const effectiveTimeout = timeout ?? this.defaultTimeout;
 
+        // Validate timeout is a positive number if provided
+        if (effectiveTimeout !== undefined && (typeof effectiveTimeout !== "number" || effectiveTimeout <= 0)) {
+            throw new Error("Timeout must be a positive number");
+        }
+
         const requestId = randomUUID();
         const message = ComlinkMessage.createCall(functionName, args, namespace, requestId, clientName);
 
         return new Promise((resolve, reject) => {
             let timeoutHandle: NodeJS.Timeout | undefined;
+            let settled = false;
+
+            const settle = (isSuccess: boolean) => {
+                if (settled) return;
+                settled = true;
+                if (timeoutHandle) {
+                    clearTimeout(timeoutHandle);
+                    timeoutHandle = undefined;
+                }
+                this.pendingRequests.delete(requestId);
+                if (isSuccess) {
+                    this._recordSuccess();
+                } else {
+                    this._recordFailure();
+                }
+            };
 
             if (effectiveTimeout) {
                 timeoutHandle = setTimeout(() => {
-                    this.pendingRequests.delete(requestId);
-                    this._recordFailure();
+                    settle(false);
                     reject(new Error(`Function '${functionName}' timed out after ${effectiveTimeout}ms`));
                 }, effectiveTimeout);
             }
 
             this.pendingRequests.set(requestId, {
-                resolve: (value: any) => {
-                    this._recordSuccess();
-                    resolve(value);
+                resolve: (value: unknown) => {
+                    settle(true);
+                    resolve(value as T);
                 },
                 reject: (error: Error) => {
-                    this._recordFailure();
+                    settle(false);
                     reject(error);
                 },
                 timeout: timeoutHandle,
@@ -491,10 +526,9 @@ export class ParentWorker {
 
             // Send message with DEALER envelope: [empty_frame, message_data]
             this._sendMessage(message).catch(error => {
-                this.pendingRequests.delete(requestId);
-                if (timeoutHandle) clearTimeout(timeoutHandle);
-                this._recordFailure();
-                reject(new Error(`Failed to send request: ${error}`));
+                settle(false);
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                reject(new Error(`Failed to send request: ${errorMessage}`));
             });
         });
     }
@@ -540,7 +574,7 @@ export class ParentWorker {
         // Wait for initial connection
         await new Promise(resolve => setTimeout(resolve, 1000));
 
-        while (this.running && this._heartbeatRunning) {
+        while (this._heartbeatRunning && this.running) {
             try {
                 // Only send heartbeats in spawn mode (we own the child)
                 if (!this.isSpawnMode) {
@@ -559,7 +593,7 @@ export class ParentWorker {
                 const heartbeat = new ComlinkMessage({
                     type: MessageType.HEARTBEAT,
                     id: heartbeatId,
-                    args: [Date.now() / 1000], // Send timestamp for RTT calculation
+                    args: [Date.now()], // Send timestamp for RTT calculation
                 });
 
                 // Create promise for response
@@ -575,7 +609,7 @@ export class ParentWorker {
                     await Promise.race([
                         heartbeatPromise,
                         new Promise<never>((_, reject) =>
-                            setTimeout(() => reject(new Error("Heartbeat timeout")), this.heartbeatTimeout * 1000)
+                            setTimeout(() => reject(new Error("Heartbeat timeout")), this.heartbeatTimeout)
                         ),
                     ]);
                     // Success - RTT already recorded in handleMessage
@@ -603,9 +637,11 @@ export class ParentWorker {
                 await new Promise(resolve => setTimeout(resolve, this.heartbeatInterval * 1000));
 
             } catch (error) {
-                if (this.running) {
-                    console.error(`Error in heartbeat loop: ${error}`);
+                if (!this._heartbeatRunning || !this.running) {
+                    // Loop should stop
+                    break;
                 }
+                console.error(`Error in heartbeat loop: ${error}`);
                 await new Promise(resolve => setTimeout(resolve, this.heartbeatInterval * 1000));
             }
         }
@@ -654,6 +690,7 @@ export class ParentWorker {
 
             console.log("Worker restarted successfully");
             this.restartCount = 0;
+            this._consecutiveFailures = 0; // Reset failure count on successful restart
 
             // Restart heartbeat loop if it was running
             if (this.heartbeatInterval > 0 && !this._heartbeatRunning) {
@@ -778,13 +815,13 @@ export abstract class ChildWorker {
 
             this.socket = new zmq.Router();
             await this.socket.connect(`tcp://localhost:${this.port}`);
-            console.error(`DEBUG: Connected to tcp://localhost:${this.port}`);
+            console.log(`DEBUG: Connected to tcp://localhost:${this.port}`);
 
         } else if (this.serviceId) {
             // CONNECT MODE: Register service, bind to port
             try {
                 this.port = await ServiceRegistry.register(this.serviceId);
-                console.error(`Service '${this.serviceId}' ready on port ${this.port}`);
+                console.log(`Service '${this.serviceId}' ready on port ${this.port}`);
             } catch (error: any) {
                 console.error(`FATAL: ${error.message}`);
                 process.exit(1);
@@ -806,18 +843,20 @@ export abstract class ChildWorker {
         const originalConsoleLog = console.log;
         const originalConsoleError = console.error;
 
-        console.log = (...args: any[]) => {
+        console.log = (...args: unknown[]) => {
             const output = args.map(a => typeof a === "object" ? JSON.stringify(a) : String(a)).join(" ");
-            this._sendOutput(output, MessageType.STDOUT).catch(() => {
+            this._sendOutput(output, MessageType.STDOUT).catch((error) => {
                 // Fallback to local log if send fails
+                console.warn(`Failed to send stdout to parent, using local log: ${error}`);
                 originalConsoleLog(...args);
             });
         };
 
-        console.error = (...args: any[]) => {
+        console.error = (...args: unknown[]) => {
             const output = args.map(a => typeof a === "object" ? JSON.stringify(a) : String(a)).join(" ");
-            this._sendOutput(output, MessageType.STDERR).catch(() => {
+            this._sendOutput(output, MessageType.STDERR).catch((error) => {
                 // Fallback to local log if send fails
+                console.warn(`Failed to send stderr to parent, using local log: ${error}`);
                 originalConsoleError(...args);
             });
         };
@@ -825,8 +864,14 @@ export abstract class ChildWorker {
 
     /** Send output message to parent. */
     private async _sendOutput(output: string, msgType: MessageType, retries: number = 2): Promise<void> {
-        if (!this.socket || !this._lastSenderId) {
-            return; // No parent connected yet
+        if (!this.socket) {
+            console.warn("Cannot send output: socket not initialized");
+            return;
+        }
+        
+        if (!this._lastSenderId) {
+            // Buffer is undefined or empty - parent not connected yet
+            return;
         }
 
         const message = ComlinkMessage.createOutput(output, msgType);
@@ -835,12 +880,13 @@ export abstract class ChildWorker {
             try {
                 await this.socket.send([this._lastSenderId, Buffer.alloc(0), message.pack()]);
                 return;
-            } catch (error: any) {
+            } catch (error) {
+                const errorMessage = error instanceof Error ? error.message : String(error);
                 if (attempt < retries - 1) {
                     await new Promise(resolve => setTimeout(resolve, 1));
                     continue;
                 }
-                console.warn(`Warning: Failed to send output: ${error}`);
+                console.warn(`Warning: Failed to send output: ${errorMessage}`);
             }
         }
     }
@@ -904,8 +950,10 @@ export abstract class ChildWorker {
             }
 
             const args = message.args || [];
-            const func = (this as any)[message.function];
-
+            
+            // Use proper type checking instead of any
+            const func = (this as Record<string, unknown>)[message.function];
+            
             if (typeof func !== "function") {
                 throw new Error(`Function '${message.function}' not found or not callable`);
             }
@@ -914,7 +962,7 @@ export abstract class ChildWorker {
                 throw new Error(`Cannot call private method '${message.function}'`);
             }
 
-            const result = await func.apply(this, args);
+            const result = await (func as (...args: unknown[]) => unknown).apply(this, args);
             response = ComlinkMessage.createResponse(result, message.id);
 
         } catch (error) {
@@ -929,7 +977,8 @@ export abstract class ChildWorker {
                 await this.socket.send([senderId, Buffer.alloc(0), response.pack()]);
             }
         } catch (error) {
-            console.error(`CRITICAL: Failed to send response: ${error}`);
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            console.error(`CRITICAL: Failed to send response: ${errorMessage}`);
         }
     }
 

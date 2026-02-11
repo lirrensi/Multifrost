@@ -35,8 +35,8 @@ export class ServiceRegistry {
         try {
             const data = await fs.readFile(ServiceRegistry.REGISTRY_PATH, 'utf-8');
             return JSON.parse(data);
-        } catch (error: any) {
-            if (error.code === 'ENOENT') {
+        } catch (error) {
+            if (error instanceof Error && 'code' in error && error.code === 'ENOENT') {
                 return {};
             }
             throw error;

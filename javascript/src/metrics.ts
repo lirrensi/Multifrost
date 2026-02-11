@@ -205,7 +205,7 @@ export class Metrics {
         let latencyMax = 0;
 
         if (latencies.length > 0) {
-            const sorted = latencies.sort((a, b) => a - b);
+            const sorted = [...latencies].sort((a, b) => a - b);
             const n = sorted.length;
             const p50Idx = Math.floor(n * 0.5);
             const p95Idx = Math.floor(n * 0.95);
