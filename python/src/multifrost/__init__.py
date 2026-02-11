@@ -64,7 +64,9 @@ await worker.close()
 worker = ParentWorker.spawn("node_worker.js", executable="node")
 await worker.start()
 
+# Synchronous call (blocking) - call property returns SyncProxy
 result = worker.call.add(1, 2)
+# Asynchronous call (non-blocking) - acall property returns AsyncProxy
 result = await worker.acall.add(1, 2)
 
 await worker.close()

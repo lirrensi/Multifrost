@@ -438,10 +438,10 @@ class ParentWorker:
         # Check if we can make a call
         if self._is_spawn_mode:
             if not self.running or not self.process or self.process.poll() is not None:
-                raise Exception("Child process is not running")
+                raise RemoteCallError("Child process is not running")
         else:
             if not self.running:
-                raise Exception("Worker is not running")
+                raise RemoteCallError("Worker is not running")
 
         # Use default timeout if not specified
         effective_timeout = timeout if timeout is not None else self.default_timeout

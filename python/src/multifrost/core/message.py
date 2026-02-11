@@ -222,7 +222,7 @@ class ComlinkMessage:
             },
         )
 
-    def extract_call_args(self):
+    def extract_call_args(self) -> tuple:
         """Extract args from simple list format."""
         if hasattr(self, "args"):
             return tuple(self.args)
