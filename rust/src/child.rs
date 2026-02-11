@@ -72,13 +72,11 @@ async fn run_worker_inner<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) ->
                 .map_err(|_| MultifrostError::InvalidMessage("Invalid port".to_string()))?;
             socket.connect(&format!("tcp://127.0.0.1:{}", port)).await
                 .map_err(|e| MultifrostError::ZmqError(e.to_string()))?;
-            eprintln!("Connected to tcp://127.0.0.1:{}", port);
         } else if let Some(ref service_id) = ctx_guard.service_id {
             // Service mode: register service and bind
             let port = ServiceRegistry::register(service_id).await?;
             socket.bind(&format!("tcp://0.0.0.0:{}", port)).await
                 .map_err(|e| MultifrostError::ZmqError(e.to_string()))?;
-            eprintln!("Service '{}' ready on port {}", service_id, port);
         } else {
             return Err(MultifrostError::InvalidMessage(
                 "Need COMLINK_ZMQ_PORT env or service_id".to_string()
@@ -104,7 +102,6 @@ async fn run_worker_inner<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) ->
         if let Some(ref mut socket) = ctx_guard.socket {
             socket.send(zmq_msg).await
                 .map_err(|e| MultifrostError::ZmqError(e.to_string()))?;
-            eprintln!("Sent ready message to parent");
         }
     }
     
@@ -129,8 +126,6 @@ async fn run_worker_inner<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) ->
         
         match msg_result {
             Ok(zmq_msg) => {
-                let frames: Vec<_> = zmq_msg.clone().into_vec();
-                eprintln!("Child: Received {} frames", frames.len());
                 if let Err(e) = handle_message(ctx_clone, worker_clone, zmq_msg).await {
                     eprintln!("Error handling message: {}", e);
                 }
@@ -160,17 +155,13 @@ async fn handle_message<W: ChildWorker>(
 ) -> Result<()> {
     // DEALER receives: [empty, message_data]
     let frames: Vec<_> = zmq_msg.into_vec();
-    eprintln!("Child: handle_message with {} frames", frames.len());
     
     if frames.len() < 2 {
         return Err(MultifrostError::InvalidMessage("Not enough frames".to_string()));
     }
     
     let message_data = frames[1].to_vec();
-    eprintln!("Child: message_data length = {}", message_data.len());
-    
     let message = Message::unpack(&message_data)?;
-    eprintln!("Child: unpacked message type = {:?}", message.msg_type);
     
     if !message.is_valid() {
         return Err(MultifrostError::InvalidMessage("Invalid message".to_string()));
@@ -195,12 +186,13 @@ async fn handle_message<W: ChildWorker>(
             ctx_guard.running = false;
             return Ok(());
         }
-        _ => return Ok(()),
+        MessageType::Ready | MessageType::Response | MessageType::Error => {
+            return Ok(());
+        }
     };
     
     // Send response - DEALER sends: [empty, message]
     let response_data = response.pack()?;
-    eprintln!("Child: Sending response for msg_id={}", response.id);
     
     let mut ctx_guard = ctx.write().await;
     if let Some(ref mut socket) = ctx_guard.socket {

@@ -20,6 +20,7 @@ pub struct Message {
     pub id: String,
     #[serde(rename = "type")]
     pub msg_type: MessageType,
+    #[serde(with = "timestamp_as_f64")]
     pub timestamp: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
@@ -39,6 +40,39 @@ pub struct Message {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub client_name: Option<String>,
+}
+
+/// Custom serializer for timestamp to handle msgpack integer/float ambiguity
+mod timestamp_as_f64 {
+    use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Always serialize as f64 to ensure msgpack uses float type
+        value.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<f64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Handle both integer and float from msgpack
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Numeric {
+            Float(f64),
+            Int(i64),
+            UInt(u64),
+        }
+
+        match Numeric::deserialize(deserializer)? {
+            Numeric::Float(f) => Ok(f),
+            Numeric::Int(i) => Ok(i as f64),
+            Numeric::UInt(u) => Ok(u as f64),
+        }
+    }
 }
 
 impl Message {
@@ -111,7 +145,9 @@ impl Message {
     }
 
     pub fn pack(&self) -> Result<Vec<u8>> {
-        rmp_serde::to_vec(self).map_err(MultifrostError::from)
+        // Use named (map-based) serialization so field order doesn't matter
+        let packed = rmp_serde::to_vec_named(self).map_err(MultifrostError::from)?;
+        Ok(packed)
     }
 
     pub fn unpack(data: &[u8]) -> Result<Self> {

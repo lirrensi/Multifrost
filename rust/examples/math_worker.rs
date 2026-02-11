@@ -17,25 +17,21 @@ impl ChildWorker for MathWorker {
             "add" => {
                 let a = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
                 let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
-                eprintln!("Computing {} + {}", a, b);
                 Ok(serde_json::json!(a + b))
             }
             "multiply" => {
                 let a = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
                 let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
-                eprintln!("Computing {} * {}", a, b);
                 Ok(serde_json::json!(a * b))
             }
             "factorial" => {
                 let n = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
                 let result: u64 = (1..=n).product();
-                eprintln!("Computing {}! = {}", n, result);
                 Ok(serde_json::json!(result))
             }
             "fibonacci" => {
                 let n = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
                 let result = fibonacci(n);
-                eprintln!("Fibonacci({}) = {}", n, result);
                 Ok(serde_json::json!(result))
             }
             _ => Err(MultifrostError::FunctionNotFound(function.to_string()))
@@ -62,11 +58,9 @@ async fn main() {
     
     let ctx = if args.contains(&"--service".to_string()) {
         // Service mode - register with service registry
-        eprintln!("Starting MathWorker as service 'math-service'...");
         ChildWorkerContext::new().with_service_id("math-service")
     } else {
         // Spawn mode - parent will provide port via env
-        eprintln!("Starting MathWorker in spawn mode...");
         ChildWorkerContext::new()
     };
     

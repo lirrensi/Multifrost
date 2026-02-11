@@ -3,22 +3,27 @@
 //! Run with: cargo run --example spawn
 
 use multifrost::{ParentWorker, MultifrostError};
-use std::time::Duration;
+use std::env;
 
 #[tokio::main]
 async fn main() -> Result<(), MultifrostError> {
     println!("Spawning math worker...");
     
-    // Spawn the worker process using just the command
+    // Get the current directory and build the path to the math_worker binary
+    let current_dir = env::current_dir().expect("Failed to get current dir");
+    let worker_path = current_dir
+        .join("target")
+        .join("debug")
+        .join("examples")
+        .join("math_worker.exe");
+    
     let mut worker = ParentWorker::spawn_command(
-        "cargo run --example math_worker"
+        worker_path.to_str().expect("Invalid path")
     )?;
     
+    // start() waits for child to be ready before returning
     worker.start().await?;
     println!("Worker started!\n");
-    
-    // Give worker time to initialize
-    tokio::time::sleep(Duration::from_millis(500)).await;
     
     println!("Calling remote functions...\n");
     

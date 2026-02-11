@@ -33,6 +33,8 @@ Multifrost enables a **Parent** process to call methods on a **Child** worker pr
 | **Spawn** | Parent binds, Child connects | Parent owns child process | Parent controls worker lifetime |
 | **Connect** | Child binds, Parent connects | Child registers with discovery | Long-running services |
 
+> **Spawn** creates a full OS process. The executable can be any language runtime (python, node, etc.).
+
 ## Wire Protocol
 
 ### Transport
@@ -78,6 +80,8 @@ All messages share core fields:
 }
 ```
 
+- `client_name`: In connect mode, helps parent identify which worker to use without manually starting it
+
 #### RESPONSE
 ```json
 {
@@ -109,6 +113,21 @@ All messages share core fields:
   "output": "printed text"
 }
 ```
+
+> **Note**: These are broadcast to all connected parents in multi-parent scenarios.
+
+#### HEARTBEAT / SHUTDOWN
+```json
+{
+  "app": "comlink_ipc_v3",
+  "id": "<uuid>",
+  "type": "heartbeat",
+  "timestamp": 1234.5
+}
+```
+
+- **HEARTBEAT**: Reserved for future use (connection health monitoring)
+- **SHUTDOWN**: Child should stop processing when received
 
 ## Lifecycle Flows
 
@@ -156,6 +175,8 @@ Rules:
 - Dead PIDs are overwritten
 - Unregister only removes if PID matches
 - File locking required for concurrent access
+- **Discovery polling**: 100ms interval, 5s default timeout
+- **Lock timeout**: 10s max wait for registry lock
 
 ## API Surface (Language-Agnostic)
 
@@ -203,6 +224,9 @@ child.listFunctions() -> string[]
 - [ ] Set `COMLINK_ZMQ_PORT` env in spawn mode
 - [ ] Handle timeout with appropriate error
 - [ ] Log STDOUT/STDERR with context prefix
+- [ ] Retry send up to 5 times on socket busy (default)
+- [ ] Reject all pending requests with error if child crashes
+- [ ] Handle SIGINT/SIGTERM for graceful shutdown
 
 ### Child Must
 
@@ -212,6 +236,9 @@ child.listFunctions() -> string[]
 - [ ] Reject calls to functions starting with `_`
 - [ ] Send ERROR for missing/non-callable functions
 - [ ] Continue loop after handling errors
+- [ ] Validate port is in range 1024-65535, exit if invalid
+- [ ] Handle SIGINT/SIGTERM for graceful shutdown
+- [ ] Support both sync and async method handlers
 
 ### Both Must
 
@@ -220,6 +247,13 @@ child.listFunctions() -> string[]
 - [ ] Preserve `id` across request/response
 - [ ] Ignore unknown message fields
 - [ ] Support namespace filtering (default: `default`)
+- [ ] Use default socket options unless specifically needed
+- [ ] Send all messages (including STDOUT/STDERR) with proper multipart framing
+
+### Optional Features
+
+- [ ] **Auto-restart**: Parent may auto-restart crashed child (configurable attempts)
+- [ ] **client_name**: For connect mode, helps parent identify its worker
 
 ## Cross-Language Compatibility
 
@@ -231,9 +265,13 @@ The wire protocol is identical across implementations:
 | Core fields | app, id, type, timestamp | app, id, type, timestamp |
 | CALL fields | function, args, namespace | function, args, namespace |
 | ERROR format | message + traceback | message only |
-| STDOUT forwarding | Yes | No (logs locally) |
+| STDOUT forwarding | Yes (multipart) | No (logs locally) |
 | Spawn arg | `--worker` added | No extra arg |
-| Socket timeouts | RCVTIMEO=100, SNDTIMEO=100 | defaults |
+| Socket options | defaults | defaults |
+| Send retries | 5 | 5 |
+| Auto-restart | Yes | Yes |
+
+> **Async Nature**: This library is async-native. Adapters should use their language's idiomatic async approach (asyncio, Promises, etc.) and support both sync and async method handlers in Child.
 
 ### Example: Python Parent, JS Child
 
@@ -282,6 +320,8 @@ MathWorker().run()
 | Invalid app id | Message ignored |
 | Namespace mismatch | Message ignored |
 | Timeout | Parent raises TimeoutError / rejects Promise |
+| Child crash | Parent rejects pending with RemoteCallError |
+| Invalid port (spawn) | Child exits immediately |
 
 ## Concurrency
 
@@ -296,3 +336,15 @@ MathWorker().run()
 - Only use on localhost or trusted networks
 - Do not expose ports to untrusted clients
 - Validate inputs in worker methods (args are untrusted)
+
+## Versioning
+
+- App ID `comlink_ipc_v3` identifies protocol version
+- Different app ID = hard fail (no negotiation)
+- New fields must be optional; receivers ignore unknowns
+
+## Large Payloads
+
+- No chunking defined
+- Message size is sender's responsibility
+- Bounded by ZMQ and memory limits

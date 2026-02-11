@@ -11,6 +11,7 @@ use zeromq::{RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
 
 type PendingRequests = Arc<Mutex<HashMap<String, oneshot::Sender<Result<serde_json::Value>>>>>;
 type ChildIdentity = Arc<Mutex<Option<Vec<u8>>>>;
+type ReadySignal = Arc<Mutex<Option<oneshot::Sender<()>>>>;
 
 pub struct ParentWorker {
     script_path: Option<String>,
@@ -23,6 +24,7 @@ pub struct ParentWorker {
     running: Arc<Mutex<bool>>,
     pending: PendingRequests,
     child_identity: ChildIdentity,
+    ready_signal: ReadySignal,
 }
 
 impl ParentWorker {
@@ -40,6 +42,7 @@ impl ParentWorker {
             running: Arc::new(Mutex::new(false)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             child_identity: Arc::new(Mutex::new(None)),
+            ready_signal: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -57,6 +60,7 @@ impl ParentWorker {
             running: Arc::new(Mutex::new(false)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             child_identity: Arc::new(Mutex::new(None)),
+            ready_signal: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -74,6 +78,7 @@ impl ParentWorker {
             running: Arc::new(Mutex::new(false)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             child_identity: Arc::new(Mutex::new(None)),
+            ready_signal: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -82,48 +87,41 @@ impl ParentWorker {
         let mut socket = RouterSocket::new();
         
         if self.is_spawn_mode {
-            eprintln!("Parent: Binding to tcp://0.0.0.0:{}", self.port);
             socket.bind(&format!("tcp://0.0.0.0:{}", self.port))
                 .await
-                .map_err(|e| {
-                    eprintln!("Parent: Bind failed: {}", e);
-                    MultifrostError::ZmqError(e.to_string())
-                })?;
-            eprintln!("Parent: Bind successful, starting child process");
+                .map_err(|e| MultifrostError::ZmqError(e.to_string()))?;
             self.start_child_process()?;
         } else {
-            eprintln!("Parent: Connecting to tcp://127.0.0.1:{}", self.port);
             socket.connect(&format!("tcp://127.0.0.1:{}", self.port))
                 .await
-                .map_err(|e| {
-                    eprintln!("Parent: Connect failed: {}", e);
-                    MultifrostError::ZmqError(e.to_string())
-                })?;
+                .map_err(|e| MultifrostError::ZmqError(e.to_string()))?;
         }
         
         *self.socket.lock().await = Some(socket);
         *self.running.lock().await = true;
+        
+        // Create ready signal channel
+        let (ready_tx, ready_rx) = oneshot::channel();
+        *self.ready_signal.lock().await = Some(ready_tx);
         
         // Start message loop in background
         let socket = Arc::clone(&self.socket);
         let pending = Arc::clone(&self.pending);
         let running = Arc::clone(&self.running);
         let child_identity = Arc::clone(&self.child_identity);
+        let ready_signal = Arc::clone(&self.ready_signal);
         
         tokio::spawn(async move {
-            message_loop(socket, pending, running, child_identity).await;
+            message_loop(socket, pending, running, child_identity, ready_signal).await;
         });
         
-        // Give child time to start and send ready message
-        eprintln!("Parent: Waiting for child to be ready...");
-        tokio::time::sleep(Duration::from_millis(10000)).await;
-        
-        // Check if child identity was received
-        let id_guard = self.child_identity.lock().await;
-        if id_guard.is_some() {
-            eprintln!("Parent: Child identity received, ready!");
-        } else {
-            eprintln!("Parent: Warning - no child identity received yet");
+        // Wait for child to be ready (with timeout)
+        if self.is_spawn_mode {
+            match tokio::time::timeout(Duration::from_secs(5), ready_rx).await {
+                Ok(Ok(())) => {} // Child is ready
+                Ok(Err(_)) => return Err(MultifrostError::TimeoutError),
+                Err(_) => return Err(MultifrostError::TimeoutError),
+            }
         }
         
         Ok(())
@@ -147,30 +145,40 @@ impl ParentWorker {
         };
         
         cmd.env("COMLINK_ZMQ_PORT", self.port.to_string())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         
-        eprintln!("Parent: Spawning child: {:?}", cmd);
         self.process = Some(cmd.spawn()?);
         Ok(())
     }
 
-    /// Call a remote function
+    /// Call a remote function with typed result
     pub async fn call<T: serde::de::DeserializeOwned>(
         &self,
         function: &str,
         args: Vec<serde_json::Value>,
     ) -> Result<T> {
+        let value = self.call_raw(function, args).await?;
+        serde_json::from_value(value)
+            .map_err(MultifrostError::JsonError)
+    }
+
+    /// Call a remote function returning raw JSON Value
+    pub async fn call_raw(
+        &self,
+        function: &str,
+        args: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
         self.call_with_timeout(function, args, None).await
     }
 
     /// Call a remote function with timeout
-    pub async fn call_with_timeout<T: serde::de::DeserializeOwned>(
+    pub async fn call_with_timeout(
         &self,
         function: &str,
         args: Vec<serde_json::Value>,
         timeout_ms: Option<u64>,
-    ) -> Result<T> {
+    ) -> Result<serde_json::Value> {
         if !*self.running.lock().await {
             return Err(MultifrostError::NotRunningError);
         }
@@ -195,13 +203,11 @@ impl ParentWorker {
         
         // Send message - ROUTER needs [identity, empty, message]
         let packed = message.pack()?;
-        eprintln!("Parent: Sending Call message, msg_id={}, packed_len={}", msg_id, packed.len());
         
         {
             let mut socket_guard = self.socket.lock().await;
             if let Some(ref mut socket) = *socket_guard {
                 let zmq_msg: ZmqMessage = if let Some(ref id) = identity {
-                    eprintln!("Parent: Sending to identity {:?} (len={})", id, id.len());
                     vec![
                         Bytes::from(id.clone()),
                         Bytes::from(vec![]),
@@ -224,7 +230,7 @@ impl ParentWorker {
         }
         
         // Wait for response
-        let inner_result: serde_json::Value = if let Some(timeout) = timeout_ms {
+        let result: serde_json::Value = if let Some(timeout) = timeout_ms {
             match tokio::time::timeout(
                 Duration::from_millis(timeout),
                 rx
@@ -242,12 +248,35 @@ impl ParentWorker {
             }
         };
         
-        serde_json::from_value(inner_result)
-            .map_err(MultifrostError::JsonError)
+        Ok(result)
     }
 
-    /// Stop the worker
+    /// Stop the worker gracefully
     pub async fn stop(&mut self) {
+        // Send shutdown message first
+        {
+            let identity = self.child_identity.lock().await.clone();
+            let mut socket_guard = self.socket.lock().await;
+            
+            if let (Some(ref id), Some(ref mut socket)) = (identity, socket_guard.as_mut()) {
+                let shutdown_msg = Message::create_shutdown();
+                if let Ok(packed) = shutdown_msg.pack() {
+                    let zmq_msg: std::result::Result<ZmqMessage, _> = vec![
+                        Bytes::from(id.clone()),
+                        Bytes::from(vec![]),
+                        Bytes::from(packed),
+                    ].try_into();
+                    
+                    if let Ok(msg) = zmq_msg {
+                        let _ = socket.send(msg).await;
+                    }
+                }
+            }
+        }
+        
+        // Give child a moment to process shutdown
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        
         *self.running.lock().await = false;
         
         // Cancel pending requests
@@ -264,7 +293,7 @@ impl ParentWorker {
             drop(socket);
         }
         
-        // Kill child process
+        // Kill child process if still running
         if let Some(ref mut child) = self.process {
             let _ = child.kill();
             let _ = child.wait();
@@ -284,11 +313,10 @@ async fn message_loop(
     pending: PendingRequests,
     running: Arc<Mutex<bool>>,
     child_identity: ChildIdentity,
+    ready_signal: ReadySignal,
 ) {
-    eprintln!("Parent: Message loop started");
     loop {
         if !*running.lock().await {
-            eprintln!("Parent: Message loop stopping (not running)");
             break;
         }
         
@@ -296,36 +324,21 @@ async fn message_loop(
         let msg_result = {
             let mut socket_guard = socket.lock().await;
             if let Some(ref mut sock) = *socket_guard {
-                // Release lock after timeout so send can acquire it
-                tokio::time::timeout(
-                    Duration::from_millis(100),
-                    sock.recv()
-                ).await
+                tokio::time::timeout(Duration::from_millis(100), sock.recv()).await
             } else {
-                eprintln!("Parent: Socket is None, breaking");
                 break;
             }
         };
         
-        // Handle timeout - just continue the loop
         let zmq_msg = match msg_result {
             Ok(Ok(msg)) => msg,
-            Ok(Err(e)) => {
-                eprintln!("ZMQ receive error: {}", e);
-                continue;
-            }
-            Err(_) => {
-                // Timeout - continue loop to check running flag
-                continue;
-            }
+            Ok(Err(_)) | Err(_) => continue,
         };
         
         let frames: Vec<_> = zmq_msg.into_vec();
-        eprintln!("Parent: Received {} frames", frames.len());
         
         // ROUTER receives: [identity, empty, message_data]
         if frames.len() < 3 {
-            eprintln!("Parent: Not enough frames, skipping");
             continue;
         }
         
@@ -334,7 +347,6 @@ async fn message_loop(
             let mut id_guard = child_identity.lock().await;
             if id_guard.is_none() {
                 *id_guard = Some(frames[0].to_vec());
-                eprintln!("Parent: Stored child identity");
             }
         }
         
@@ -363,14 +375,15 @@ async fn message_loop(
                         }
                     }
                     MessageType::Ready => {
-                        // Child is ready - identity already stored above
+                        let mut ready_guard = ready_signal.lock().await;
+                        if let Some(tx) = ready_guard.take() {
+                            let _ = tx.send(());
+                        }
                     }
-                    _ => {}
+                    MessageType::Call | MessageType::Shutdown => {}
                 }
             }
-            Err(e) => {
-                eprintln!("Failed to unpack message: {}", e);
-            }
+            Err(_) => {}
         }
     }
 }

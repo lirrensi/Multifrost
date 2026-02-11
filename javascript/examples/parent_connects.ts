@@ -13,7 +13,7 @@
  * npx ts-node examples/parent_connects.ts      # Terminal 2
  */
 
-import { ParentWorker } from "../javascript/src/multifrost.js";
+import { ParentWorker } from "../src/multifrost.js";
 
 
 async function parentTask(parentId: number): Promise<void> {

@@ -1,3 +1,6 @@
+TODO: rewrite it all to better;
+
+
 # Multifrost
 
 **Multifrost** is a lightweight, zero-boilerplate IPC (inter-process communication) library for Python and JavaScript/Node.js inspired by [comlink.js](https://github.com/GoogleChromeLabs/comlink).

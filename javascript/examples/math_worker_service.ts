@@ -6,7 +6,7 @@
  * npx ts-node examples/math_worker_service.ts
  */
 
-import { ChildWorker } from "../javascript/src/multifrost.js";
+import { ChildWorker } from "../src/multifrost.js";
 
 
 class MathWorker extends ChildWorker {
