@@ -700,6 +700,31 @@ func (pw *ParentWorker) IsRunning() bool {
 	return pw.running
 }
 
+// IsSpawnMode returns whether the worker was spawned (vs connect mode)
+func (pw *ParentWorker) IsSpawnMode() bool {
+	return pw.isSpawnMode
+}
+
+// ScriptPath returns the script path for spawned workers
+func (pw *ParentWorker) ScriptPath() string {
+	return pw.scriptPath
+}
+
+// ServiceID returns the service ID for connect mode workers
+func (pw *ParentWorker) ServiceID() string {
+	return pw.serviceID
+}
+
+// ConsecutiveFailures returns the number of consecutive failures
+func (pw *ParentWorker) ConsecutiveFailures() int {
+	return pw.consecutiveFailures
+}
+
+// ConsecutiveHeartbeatMisses returns the number of consecutive heartbeat misses
+func (pw *ParentWorker) ConsecutiveHeartbeatMisses() int {
+	return pw.consecutiveHeartbeatMisses
+}
+
 // SyncProxy provides synchronous method calling
 type SyncProxy struct {
 	worker *ParentWorker
@@ -708,6 +733,13 @@ type SyncProxy struct {
 // Call calls a function synchronously
 func (p *SyncProxy) Call(functionName string, args ...any) (any, error) {
 	return p.worker.CallFunction(context.Background(), functionName, args...)
+}
+
+// CallWithTimeout calls a function with a timeout
+func (p *SyncProxy) CallWithTimeout(functionName string, timeout time.Duration, args ...any) (any, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return p.worker.CallFunction(ctx, functionName, args...)
 }
 
 // AsyncProxy provides asynchronous method calling

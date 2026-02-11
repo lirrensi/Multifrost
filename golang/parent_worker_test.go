@@ -15,9 +15,9 @@ func TestParentWorker_SpawnMode(t *testing.T) {
 		require.NotNil(t, worker)
 
 		// Verify worker was created with correct configuration
-		assert.True(t, worker.isSpawnMode)
-		assert.NotEmpty(t, worker.scriptPath)
-		assert.Greater(t, worker.port, 0)
+		assert.True(t, worker.IsSpawnMode())
+		assert.NotEmpty(t, worker.ScriptPath())
+		assert.Greater(t, worker.GetPort(), 0)
 	})
 }
 
@@ -32,9 +32,9 @@ func TestParentWorker_ConnectMode(t *testing.T) {
 		require.NotNil(t, worker)
 
 		// Verify worker was created with correct configuration
-		assert.False(t, worker.isSpawnMode)
-		assert.Equal(t, "test-service", worker.serviceID)
-		assert.Equal(t, 5555, worker.port)
+		assert.False(t, worker.IsSpawnMode())
+		assert.Equal(t, "test-service", worker.ServiceID())
+		assert.Equal(t, 5555, worker.GetPort())
 	})
 }
 
@@ -146,6 +146,11 @@ func TestParentWorker_ProxyInterfaces(t *testing.T) {
 		worker := NewParentWorker(ParentWorkerConfig{})
 		assert.NotNil(t, worker.ACall)
 	})
+
+	t.Run("sync proxy has CallWithTimeout", func(t *testing.T) {
+		worker := NewParentWorker(ParentWorkerConfig{})
+		assert.NotNil(t, worker.Call.CallWithTimeout)
+	})
 }
 
 func TestParentWorker_StateManagement(t *testing.T) {
@@ -159,5 +164,35 @@ func TestParentWorker_StateManagement(t *testing.T) {
 	t.Run("running state", func(t *testing.T) {
 		worker := NewParentWorker(ParentWorkerConfig{})
 		assert.False(t, worker.IsRunning())
+	})
+
+	t.Run("spawn mode getter", func(t *testing.T) {
+		spawnWorker := Spawn("test_worker", "go", "run")
+		assert.True(t, spawnWorker.IsSpawnMode())
+
+		connectWorker := NewParentWorker(ParentWorkerConfig{})
+		assert.False(t, connectWorker.IsSpawnMode())
+	})
+
+	t.Run("script path getter", func(t *testing.T) {
+		worker := Spawn("path/to/worker.go", "go", "run")
+		assert.NotEmpty(t, worker.ScriptPath())
+	})
+
+	t.Run("service ID getter", func(t *testing.T) {
+		worker := NewParentWorker(ParentWorkerConfig{
+			ServiceID: "my-service",
+		})
+		assert.Equal(t, "my-service", worker.ServiceID())
+	})
+
+	t.Run("consecutive failures getter", func(t *testing.T) {
+		worker := NewParentWorker(ParentWorkerConfig{})
+		assert.Equal(t, 0, worker.ConsecutiveFailures())
+	})
+
+	t.Run("consecutive heartbeat misses getter", func(t *testing.T) {
+		worker := NewParentWorker(ParentWorkerConfig{})
+		assert.Equal(t, 0, worker.ConsecutiveHeartbeatMisses())
 	})
 }

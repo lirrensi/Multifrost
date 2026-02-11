@@ -1,6 +1,8 @@
 package multifrost
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -138,9 +140,27 @@ func TestMessage_Errors(t *testing.T) {
 		assert.Equal(t, "test error", err.Error())
 	})
 
+	t.Run("remote call error with wrapped error", func(t *testing.T) {
+		wrappedErr := fmt.Errorf("original error")
+		err := &RemoteCallError{Message: "test error", Err: wrappedErr}
+		assert.Equal(t, "test error: original error", err.Error())
+		assert.Equal(t, wrappedErr, err.Unwrap())
+		assert.True(t, errors.Is(err, wrappedErr))
+	})
+
 	t.Run("circuit open error", func(t *testing.T) {
 		err := &CircuitOpenError{ConsecutiveFailures: 5}
 		assert.Contains(t, err.Error(), "circuit breaker open")
 		assert.Contains(t, err.Error(), "5")
+	})
+
+	t.Run("circuit open error with wrapped error", func(t *testing.T) {
+		wrappedErr := fmt.Errorf("connection failed")
+		err := &CircuitOpenError{ConsecutiveFailures: 3, Err: wrappedErr}
+		assert.Contains(t, err.Error(), "circuit breaker open")
+		assert.Contains(t, err.Error(), "3")
+		assert.Contains(t, err.Error(), "connection failed")
+		assert.Equal(t, wrappedErr, err.Unwrap())
+		assert.True(t, errors.Is(err, wrappedErr))
 	})
 }

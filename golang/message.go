@@ -239,17 +239,36 @@ func validateMetadata(meta *map[string]any) error {
 // RemoteCallError represents an error from a remote call
 type RemoteCallError struct {
 	Message string
+	Err     error
 }
 
 func (e *RemoteCallError) Error() string {
+	if e.Err != nil {
+		return e.Message + ": " + e.Err.Error()
+	}
 	return e.Message
+}
+
+// Unwrap returns the wrapped error for errors.Is/As support
+func (e *RemoteCallError) Unwrap() error {
+	return e.Err
 }
 
 // CircuitOpenError is raised when circuit breaker is open (too many consecutive failures)
 type CircuitOpenError struct {
 	ConsecutiveFailures int
+	Err                 error
 }
 
 func (e *CircuitOpenError) Error() string {
-	return fmt.Sprintf("circuit breaker open after %d consecutive failures", e.ConsecutiveFailures)
+	msg := fmt.Sprintf("circuit breaker open after %d consecutive failures", e.ConsecutiveFailures)
+	if e.Err != nil {
+		return msg + ": " + e.Err.Error()
+	}
+	return msg
+}
+
+// Unwrap returns the wrapped error for errors.Is/As support
+func (e *CircuitOpenError) Unwrap() error {
+	return e.Err
 }
