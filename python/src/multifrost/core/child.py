@@ -6,6 +6,7 @@ import asyncio
 import os
 import signal
 import sys
+import threading
 import time
 import traceback
 import zmq
@@ -49,6 +50,10 @@ class ChildWorker:
         # IO redirection
         self.original_stdout = None
         self.original_stderr = None
+
+        # Dedicated event loop for async function calls
+        self._async_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._async_thread: Optional[threading.Thread] = None
 
     def _setup_io_redirection(self):
         """Redirect stdout/stderr to send messages over ZMQ."""
@@ -134,24 +139,49 @@ class ChildWorker:
             print(f"FATAL: Unexpected error: {e}", file=sys.stderr)
             sys.exit(1)
 
+    def _setup_async_loop(self):
+        """Setup a dedicated event loop in a separate thread for async function calls."""
+
+        def run_loop():
+            self._async_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._async_loop)
+            self._async_loop.run_forever()
+
+        self._async_thread = threading.Thread(target=run_loop, daemon=True)
+        self._async_thread.start()
+
     def _send_output(self, msg_type: MessageType, output: str):
         """
-        Send stdout/stderr output to parent.
+        Send stdout/stderr output to parent with retry logic.
 
         Args:
             msg_type: MessageType.STDOUT or MessageType.STDERR
             output: The output text to send
         """
-        if self.socket:
+        if not self.socket:
+            return
+
+        message = ComlinkMessage.create_output(output, msg_type)
+        max_retries = 2
+        retry_delay = 0.001  # 1ms
+
+        for attempt in range(max_retries):
             try:
-                message = ComlinkMessage.create_output(output, msg_type)
                 self.socket.send(message.pack(), zmq.NOBLOCK)
+                return  # Success
             except zmq.Again:
-                # Socket busy, skip this output (acceptable for stdout/stderr)
-                pass
-            except Exception:
-                # Ignore output send failures - don't break the worker
-                pass
+                # Socket busy, retry after brief delay
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                # Last attempt will fall through to pass
+            except zmq.ZMQError as e:
+                # ZMQ-specific error - log and skip
+                print(f"Warning: ZMQ error sending output: {e}", file=sys.stderr)
+                return
+            except Exception as e:
+                # Unexpected error - log and skip to avoid breaking worker
+                print(f"Warning: Error sending output: {e}", file=sys.stderr)
+                return
 
     def _start(self):
         """Start the worker message loop."""
@@ -161,6 +191,7 @@ class ChildWorker:
             )
 
         self._setup_zmq()
+        self._setup_async_loop()
 
         while self._running:
             try:
@@ -281,19 +312,17 @@ class ChildWorker:
 
             # Call the function (sync or async)
             if asyncio.iscoroutinefunction(func):
-                # Handle async functions - detect if already in async context
-                try:
-                    loop = asyncio.get_running_loop()
-                    # Already in async context - can't use run_until_complete
-                    # Create a new thread with its own event loop
-                    import concurrent.futures
+                # Handle async functions using the dedicated event loop
+                if self._async_loop is None or not self._async_loop.is_running():
+                    raise RuntimeError(
+                        "Async loop not available for async function calls"
+                    )
 
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future = executor.submit(asyncio.run, func(*args))
-                        result = future.result()
-                except RuntimeError:
-                    # No running loop - safe to create one
-                    result = asyncio.run(func(*args))
+                # Submit coroutine to the dedicated event loop and wait for result
+                future = asyncio.run_coroutine_threadsafe(func(*args), self._async_loop)
+                result = future.result(
+                    timeout=30.0
+                )  # 30 second timeout for async calls
             else:
                 # Handle sync functions
                 result = func(*args)
@@ -344,6 +373,12 @@ class ChildWorker:
             sys.stdout = self.original_stdout
         if self.original_stderr:
             sys.stderr = self.original_stderr
+
+        # Cleanup async loop
+        if self._async_loop and self._async_loop.is_running():
+            self._async_loop.call_soon_threadsafe(self._async_loop.stop)
+            if self._async_thread and self._async_thread.is_alive():
+                self._async_thread.join(timeout=2.0)
 
         # Cleanup resources
         try:

@@ -906,7 +906,30 @@ class ParentWorker:
         await self.close()
 
     def __del__(self):
-        """Cleanup on deletion."""
-        if not self._closed and self._loop and not self._loop.is_closed():
-            # Schedule cleanup on the event loop
-            self._loop.call_soon_threadsafe(lambda: asyncio.create_task(self.close()))
+        """Cleanup on deletion - minimal cleanup without relying on event loop."""
+        # Only attempt cleanup if we're not already closed and have resources to clean
+        if not self._closed:
+            # Close socket directly without event loop
+            if hasattr(self, "socket") and self.socket:
+                try:
+                    self.socket.close(linger=0)
+                except Exception:
+                    pass
+
+            # Terminate process directly without event loop
+            if hasattr(self, "_is_spawn_mode") and self._is_spawn_mode:
+                if hasattr(self, "process") and self.process:
+                    try:
+                        self.process.terminate()
+                    except Exception:
+                        pass
+
+            # Terminate context directly without event loop
+            if hasattr(self, "context") and self.context:
+                try:
+                    self.context.term()
+                except Exception:
+                    pass
+
+            # Mark as closed to prevent double cleanup
+            self._closed = True

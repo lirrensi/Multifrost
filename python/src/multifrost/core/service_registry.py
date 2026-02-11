@@ -129,7 +129,15 @@ class ServiceRegistry:
     @staticmethod
     async def unregister(service_id: str):
         """Process cleans up its own entry on shutdown."""
-        await ServiceRegistry._acquire_lock()
+        try:
+            await ServiceRegistry._acquire_lock()
+        except RuntimeError as e:
+            # Lock acquisition failed - log warning but don't crash
+            print(
+                f"Warning: Could not acquire lock for unregister: {e}", file=sys.stderr
+            )
+            return
+
         try:
             services = ServiceRegistry._read_registry()
             if service_id in services:
@@ -138,6 +146,9 @@ class ServiceRegistry:
                 if reg["pid"] == os.getpid():
                     del services[service_id]
                     ServiceRegistry._write_registry(services)
+        except Exception as e:
+            # Log error but don't crash during shutdown
+            print(f"Warning: Error during unregister: {e}", file=sys.stderr)
         finally:
             await ServiceRegistry._release_lock()
 
@@ -152,23 +163,37 @@ class ServiceRegistry:
 
     @staticmethod
     async def _acquire_lock():
-        """Acquire file lock with timeout."""
+        """Acquire file lock with timeout using atomic file creation."""
         max_wait = 10  # seconds
         start = time.time()
 
         while time.time() - start < max_wait:
             try:
                 ServiceRegistry._ensure_registry_dir()
-                lock_file = open(ServiceRegistry.LOCK_PATH, "w")
 
+                # Atomic file creation - fails if file already exists
                 if sys.platform == "win32":
                     import msvcrt
 
-                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    # Use os.open with O_CREAT | O_EXCL for atomic creation
+                    fd = os.open(
+                        ServiceRegistry.LOCK_PATH,
+                        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    )
+                    lock_file = os.fdopen(fd, "w")
+                    # Apply lock to the file descriptor
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                 else:
                     import fcntl
 
-                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    # Use os.open with O_CREAT | O_EXCL for atomic creation
+                    fd = os.open(
+                        ServiceRegistry.LOCK_PATH,
+                        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    )
+                    lock_file = os.fdopen(fd, "w")
+                    # Apply lock to the file descriptor
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
                 # Write our PID to lock file
                 lock_file.write(str(os.getpid()))
@@ -177,14 +202,14 @@ class ServiceRegistry:
                 ServiceRegistry._lock_file = lock_file
                 return
             except (IOError, OSError):
-                # Lock held by another process
+                # Lock held by another process (file already exists)
                 await asyncio.sleep(0.1)
 
         raise RuntimeError(f"Could not acquire registry lock after {max_wait}s")
 
     @staticmethod
     async def _release_lock():
-        """Release file lock."""
+        """Release file lock and remove lock file."""
         if hasattr(ServiceRegistry, "_lock_file") and ServiceRegistry._lock_file:
             try:
                 if sys.platform == "win32":
@@ -198,6 +223,11 @@ class ServiceRegistry:
 
                     fcntl.flock(ServiceRegistry._lock_file.fileno(), fcntl.LOCK_UN)
                 ServiceRegistry._lock_file.close()
+                # Remove the lock file atomically
+                try:
+                    os.unlink(ServiceRegistry.LOCK_PATH)
+                except OSError:
+                    pass
             except Exception:
                 pass
             finally:

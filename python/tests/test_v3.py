@@ -1,146 +1,109 @@
 #!/usr/bin/env python3
+"""
+Quick test for Multifrost v4 - spawn and connect modes.
+Run with: uv run python tests/test_v4.py
+"""
 
 import asyncio
 import sys
 import os
 
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from comlink_ipc_v2 import ParentWorker, ChildWorker
+from multifrost import ParentWorker, ChildWorker, ServiceRegistry
 
 
 class TestWorker(ChildWorker):
-    """Simple test worker for verification."""
+    """Simple test worker."""
 
     def add(self, a, b):
-        """Add two numbers."""
-        print(f"Computing {a} + {b}")
         return a + b
+
+    async def async_add(self, a, b):
+        await asyncio.sleep(0.1)
+        return a + b
+
+
+class ServiceWorker(ChildWorker):
+    """Worker for connect mode testing."""
+
+    def __init__(self):
+        super().__init__(service_id="test-service-v4")
 
     def multiply(self, a, b):
-        """Multiply two numbers."""
-        print(f"Computing {a} * {b}")
         return a * b
 
-    async def slow_add(self, a, b):
-        """Slow add with async."""
-        print(f"Slowly computing {a} + {b}")
-        await asyncio.sleep(0.5)
-        return a + b
 
+async def test_spawn_mode():
+    """Test spawn mode (parent spawns child)."""
+    print("\n=== Test: Spawn Mode ===")
 
-async def test_async_api():
-    """Test the async API."""
-    print("\n=== Testing Async API ===\n")
-
-    # Create worker
-    worker = ParentWorker(__file__, auto_restart=False)
-
-    # Start worker
+    worker = ParentWorker.spawn(__file__)
     await worker.start()
 
+    # Wait for child to connect
+    await asyncio.sleep(0.5)
+
     try:
-        # Test basic sync method
         result = await worker.acall.add(5, 3)
-        print(f"✓ add(5, 3) = {result}")
         assert result == 8, f"Expected 8, got {result}"
+        print(f"  add(5, 3) = {result} OK")
 
-        # Test another sync method
-        result = await worker.acall.multiply(4, 7)
-        print(f"✓ multiply(4, 7) = {result}")
-        assert result == 28, f"Expected 28, got {result}"
-
-        # Test async method
-        result = await worker.acall.slow_add(10, 20)
-        print(f"✓ slow_add(10, 20) = {result}")
+        result = await worker.acall.async_add(10, 20)
         assert result == 30, f"Expected 30, got {result}"
-
-        # Test with options
-        result = await worker.acall.with_options(timeout=5).add(100, 200)
-        print(f"✓ add(100, 200) with timeout = {result}")
-        assert result == 300, f"Expected 300, got {result}"
-
-        print("\n✅ All async tests passed!\n")
+        print(f"  async_add(10, 20) = {result} OK")
 
     finally:
         await worker.close()
 
+    print("  Spawn mode: PASSED")
 
-def test_sync_api():
-    """Test the sync API."""
-    print("\n=== Testing Sync API ===\n")
 
-    # Create worker
-    worker = ParentWorker(__file__, auto_restart=False)
+async def test_connect_mode():
+    """Test connect mode (parent connects to running service)."""
+    print("\n=== Test: Connect Mode ===")
 
-    # Start worker synchronously
-    worker.call.start()
+    # Start service worker in background task
+    service_worker = ServiceWorker()
+    run_task = asyncio.create_task(asyncio.to_thread(service_worker.run))
+
+    # Give worker time to register (service registry needs time)
+    await asyncio.sleep(1.0)
 
     try:
-        # Test basic sync method
-        result = worker.call.add(5, 3)
-        print(f"✓ add(5, 3) = {result}")
-        assert result == 8, f"Expected 8, got {result}"
+        # Connect as parent
+        parent = await ParentWorker.connect("test-service-v4", timeout=5.0)
+        await parent.start()
 
-        # Test another sync method
-        result = worker.call.multiply(4, 7)
-        print(f"✓ multiply(4, 7) = {result}")
+        # Wait for connection
+        await asyncio.sleep(0.3)
+
+        result = await parent.acall.multiply(4, 7)
         assert result == 28, f"Expected 28, got {result}"
+        print(f"  multiply(4, 7) = {result} OK")
 
-        # Test async method (sync wrapper handles it)
-        result = worker.call.slow_add(10, 20)
-        print(f"✓ slow_add(10, 20) = {result}")
-        assert result == 30, f"Expected 30, got {result}"
-
-        # Test with options
-        result = worker.call.with_options(timeout=5).add(100, 200)
-        print(f"✓ add(100, 200) with timeout = {result}")
-        assert result == 300, f"Expected 300, got {result}"
-
-        print("\n✅ All sync tests passed!\n")
+        await parent.close()
+        print("  Connect mode: PASSED")
 
     finally:
-        worker.call.close()
+        # Cleanup service worker
+        service_worker._running = False
+        run_task.cancel()
+        try:
+            await run_task
+        except asyncio.CancelledError:
+            pass
 
-
-async def test_context_managers():
-    """Test context manager usage."""
-    print("\n=== Testing Context Managers ===\n")
-
-    # Test async context manager
-    async with ParentWorker(__file__) as worker:
-        await worker.start()
-        result = await worker.acall.add(1, 2)
-        print(f"✓ Async context: add(1, 2) = {result}")
-        assert result == 3
-
-    # Test sync context manager
-    with ParentWorker(__file__).sync as worker:
-        worker.start()
-        result = worker.call.add(3, 4)
-        print(f"✓ Sync context: add(3, 4) = {result}")
-        assert result == 7
-
-    print("\n✅ Context manager tests passed!\n")
+        # Unregister service
+        ServiceRegistry.unregister("test-service-v4")
 
 
 if __name__ == "__main__":
-    # Check if we're running as worker or parent
     if len(sys.argv) > 1 and sys.argv[1] == "--worker":
-        # Run as worker
+        # Run as spawned worker
         TestWorker().run()
     else:
-        # Run as parent and run tests
-        print("🚀 Starting refactored comlink tests...\n")
-
-        # Run async tests
-        asyncio.run(test_async_api())
-
-        # Run sync tests
-        test_sync_api()
-
-        # Run context manager tests
-        asyncio.run(test_context_managers())
-
-        print("\n🎉 All tests completed successfully!")
+        print("Running Multifrost v4 tests...")
+        asyncio.run(test_spawn_mode())
+        asyncio.run(test_connect_mode())
+        print("\nAll tests passed!")

@@ -170,13 +170,14 @@ Location: `~/.multifrost/services.json`
 }
 ```
 
-Rules:
+ Rules:
 - Registration fails if service_id exists with live PID
 - Dead PIDs are overwritten
 - Unregister only removes if PID matches
-- File locking required for concurrent access
+- **Atomic file locking**: Uses `O_CREAT | O_EXCL` for lock acquisition to prevent race conditions
 - **Discovery polling**: 100ms interval, 5s default timeout
 - **Lock timeout**: 10s max wait for registry lock
+- **Graceful failure**: Lock acquisition failures are logged but don't crash the process
 
 ## API Surface (Language-Agnostic)
 
@@ -237,8 +238,10 @@ child.listFunctions() -> string[]
 - [ ] Send ERROR for missing/non-callable functions
 - [ ] Continue loop after handling errors
 - [ ] Validate port is in range 1024-65535, exit if invalid
-- [ ] Handle SIGINT/SIGTERM for graceful shutdown
-- [ ] Support both sync and async method handlers
+ - [ ] Handle SIGINT/SIGTERM for graceful shutdown
+ - [ ] Support both sync and async method handlers
+ - [ ] Use dedicated event loop for async handlers (Python: run_coroutine_threadsafe)
+ - [ ] Include timeout for async function calls (Python: 30s default)
 
 ### Both Must
 
@@ -250,10 +253,36 @@ child.listFunctions() -> string[]
 - [ ] Use default socket options unless specifically needed
 - [ ] Send all messages (including STDOUT/STDERR) with proper multipart framing
 
-### Optional Features
+ ### Optional Features
 
-- [ ] **Auto-restart**: Parent may auto-restart crashed child (configurable attempts)
-- [ ] **client_name**: For connect mode, helps parent identify its worker
+ - [ ] **Auto-restart**: Parent may auto-restart crashed child (configurable attempts)
+ - [ ] **client_name**: For connect mode, helps parent identify its worker
+
+### Reliability Improvements
+
+The Python implementation includes several reliability enhancements:
+
+#### Service Registry Locking
+- Uses atomic file creation (`os.open()` with `O_CREAT | O_EXCL`) to prevent TOCTOU race conditions
+- Lock file is removed after release to prevent stale locks
+- Lock acquisition failures are logged gracefully without crashing
+
+#### Async Function Handling
+- ChildWorker maintains a dedicated event loop in a daemon thread for async method handlers
+- Uses `asyncio.run_coroutine_threadsafe()` instead of creating new threads per call
+- 30-second timeout on async function calls to prevent hangs
+- Proper cleanup of async loop on shutdown
+
+#### Output Forwarding
+- `_send_output()` retries failed sends (2 attempts, 1ms delay)
+- Distinguishes between retryable errors (`zmq.Again`) and fatal errors
+- Logs warnings for send failures instead of silently ignoring
+
+#### Resource Cleanup
+- `__del__` performs minimal synchronous cleanup without relying on event loop
+- Directly closes socket, terminates process, and terminates context
+- Uses `hasattr()` checks to safely access attributes during garbage collection
+- Prevents race conditions where cleanup tasks may never run if loop is closing
 
 ## Cross-Language Compatibility
 
@@ -319,16 +348,19 @@ MathWorker().run()
 | Private method (`_foo`) | ERROR: "Cannot call private method X" |
 | Invalid app id | Message ignored |
 | Namespace mismatch | Message ignored |
-| Timeout | Parent raises TimeoutError / rejects Promise |
-| Child crash | Parent rejects pending with RemoteCallError |
-| Invalid port (spawn) | Child exits immediately |
+ | Timeout | Parent raises TimeoutError / rejects Promise |
+ | Child crash | Parent rejects pending with RemoteCallError |
+ | Invalid port (spawn) | Child exits immediately |
+ | Output send failure | Child retries up to 2 times with 1ms delay, logs warnings |
+ | Registry lock failure | Logs warning, continues without crashing |
 
-## Concurrency
+ ## Concurrency
 
-- Parent may issue concurrent calls (tracked by `id`)
-- Responses may arrive out of order (matched by `id`)
-- Child processes one message at a time in its loop
-- No threading in Child handlers by default
+ - Parent may issue concurrent calls (tracked by `id`)
+ - Responses may arrive out of order (matched by `id`)
+ - Child processes one message at a time in its loop
+ - **Python async handling**: ChildWorker uses a dedicated event loop in a daemon thread for async function calls, avoiding thread-per-call overhead
+ - **Cleanup**: `__del__` performs minimal synchronous cleanup without relying on event loop to prevent race conditions during garbage collection
 
 ## Security
 
