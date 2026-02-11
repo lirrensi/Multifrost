@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/signal"
 	"reflect"
+	"strings"
 	"syscall"
+	"time"
 
 	zmq "github.com/go-zeromq/zmq4"
 )
@@ -23,6 +25,13 @@ type ChildWorker struct {
 	socket  zmq.Socket
 	port    int
 	done    chan struct{}
+
+	// Output forwarding
+	lastSenderID   []byte
+	originalStdout *os.File
+	originalStderr *os.File
+	stdoutPipe     *os.File
+	stderrPipe     *os.File
 }
 
 // NewChildWorker creates a new ChildWorker instance
@@ -95,7 +104,89 @@ func (w *ChildWorker) setupZMQ() error {
 		return fmt.Errorf("need COMLINK_ZMQ_PORT env or ServiceID parameter")
 	}
 
+	// Setup output redirection AFTER ZMQ is ready
+	if err := w.setupOutputRedirection(); err != nil {
+		return fmt.Errorf("failed to setup output redirection: %w", err)
+	}
+
 	return nil
+}
+
+// setupOutputRedirection redirects stdout/stderr to send messages over ZMQ
+func (w *ChildWorker) setupOutputRedirection() error {
+	// Save original stdout/stderr
+	w.originalStdout = os.Stdout
+	w.originalStderr = os.Stderr
+
+	// Create pipes for stdout/stderr
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+	w.stdoutPipe = stdoutW
+
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stderr pipe: %w", err)
+	}
+	w.stderrPipe = stderrW
+
+	// Redirect stdout/stderr to pipes
+	os.Stdout = stdoutW
+	os.Stderr = stderrW
+
+	// Start goroutines to read from pipes and send to parent
+	go w.forwardOutput(stdoutR, MessageTypeStdout)
+	go w.forwardOutput(stderrR, MessageTypeStderr)
+
+	return nil
+}
+
+// forwardOutput reads from a pipe and sends output messages to parent
+func (w *ChildWorker) forwardOutput(pipe *os.File, msgType MessageType) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := pipe.Read(buf)
+		if n > 0 {
+			output := string(buf[:n])
+			w.sendOutput(output, msgType)
+		}
+		if err != nil {
+			break
+		}
+	}
+}
+
+// sendOutput sends stdout/stderr output to parent with retry logic
+func (w *ChildWorker) sendOutput(output string, msgType MessageType) {
+	if w.socket == nil || len(w.lastSenderID) == 0 {
+		return // No parent connected yet
+	}
+
+	// Trim trailing newlines
+	output = strings.TrimRight(output, "\n")
+	if output == "" {
+		return
+	}
+
+	msg := CreateOutput(output, msgType)
+	data, err := msg.Pack()
+	if err != nil {
+		return
+	}
+
+	// Retry up to 2 times with 1ms delay
+	maxRetries := 2
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		zmqMsg := zmq.NewMsgFrom(w.lastSenderID, []byte{}, data)
+		if err := w.socket.Send(zmqMsg); err == nil {
+			return // Success
+		}
+		// Retry after brief delay
+		if attempt < maxRetries-1 {
+			time.Sleep(1 * time.Millisecond)
+		}
+	}
 }
 
 // messageLoop handles incoming messages
@@ -113,6 +204,8 @@ func (w *ChildWorker) messageLoop() {
 		frames := msg.Frames
 		if len(frames) >= 3 {
 			senderID := frames[0]
+			// Track sender for output forwarding
+			w.lastSenderID = senderID
 			// frames[1] is empty delimiter
 			messageData := frames[2]
 			w.handleMessage(messageData, senderID)
@@ -142,9 +235,37 @@ func (w *ChildWorker) handleMessage(data []byte, senderID []byte) {
 	switch msg.Type {
 	case string(MessageTypeCall):
 		w.handleFunctionCall(msg, senderID)
+	case string(MessageTypeHeartbeat):
+		w.handleHeartbeat(msg, senderID)
 	case string(MessageTypeShutdown):
 		w.running = false
 		close(w.done)
+	}
+}
+
+// handleHeartbeat handles a heartbeat message - echo it back immediately
+func (w *ChildWorker) handleHeartbeat(msg *ComlinkMessage, senderID []byte) {
+	// Extract original timestamp from request
+	var originalTs float64
+	if msg.Metadata != nil {
+		if ts, ok := msg.Metadata["hb_timestamp"].(float64); ok {
+			originalTs = ts
+		}
+	}
+
+	// Create heartbeat response with same ID and original timestamp
+	response := CreateHeartbeatResponse(msg.ID, originalTs)
+
+	// Send response with ROUTER envelope
+	data, err := response.Pack()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "CRITICAL: Failed to pack heartbeat response: %v\n", err)
+		return
+	}
+
+	zmqMsg := zmq.NewMsgFrom(senderID, []byte{}, data)
+	if err := w.socket.Send(zmqMsg); err != nil {
+		// Don't log heartbeat failures - they're frequent and noisy
 	}
 }
 
@@ -220,6 +341,22 @@ func (w *ChildWorker) sendResponse(msg *ComlinkMessage, senderID []byte) {
 // Stop stops the worker and cleans up resources
 func (w *ChildWorker) Stop() {
 	w.running = false
+
+	// Restore stdout/stderr
+	if w.originalStdout != nil {
+		os.Stdout = w.originalStdout
+	}
+	if w.originalStderr != nil {
+		os.Stderr = w.originalStderr
+	}
+
+	// Close pipes
+	if w.stdoutPipe != nil {
+		w.stdoutPipe.Close()
+	}
+	if w.stderrPipe != nil {
+		w.stderrPipe.Close()
+	}
 
 	// Cleanup registry entry
 	if w.ServiceID != "" {

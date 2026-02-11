@@ -6,13 +6,16 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 )
 
 const (
-	RegistryFileName = "multifrost_services.json"
+	RegistryFileName = "services.json"
+	LockFileName     = "services.lock"
 	DiscoveryTimeout = 5 * time.Second
+	LockTimeout      = 10 * time.Second
 )
 
 var (
@@ -52,9 +55,98 @@ func getRegistry() *ServiceRegistry {
 
 // getRegistryPath returns the path to the registry file
 func getRegistryPath() string {
-	// Use temp directory for cross-platform compatibility
-	tmpDir := os.TempDir()
-	return filepath.Join(tmpDir, RegistryFileName)
+	// Use ~/.multifrost/services.json for cross-platform compatibility
+	var homeDir string
+	if runtime.GOOS == "windows" {
+		homeDir = os.Getenv("USERPROFILE")
+	} else {
+		homeDir = os.Getenv("HOME")
+	}
+
+	if homeDir == "" {
+		// Fallback to temp directory
+		return filepath.Join(os.TempDir(), RegistryFileName)
+	}
+
+	multifrostDir := filepath.Join(homeDir, ".multifrost")
+	return filepath.Join(multifrostDir, RegistryFileName)
+}
+
+// getLockPath returns the path to the lock file
+func getLockPath() string {
+	// Use ~/.multifrost/services.lock for cross-platform compatibility
+	var homeDir string
+	if runtime.GOOS == "windows" {
+		homeDir = os.Getenv("USERPROFILE")
+	} else {
+		homeDir = os.Getenv("HOME")
+	}
+
+	if homeDir == "" {
+		// Fallback to temp directory
+		return filepath.Join(os.TempDir(), LockFileName)
+	}
+
+	multifrostDir := filepath.Join(homeDir, ".multifrost")
+	return filepath.Join(multifrostDir, LockFileName)
+}
+
+// acquireLock attempts to acquire the registry lock with timeout
+func acquireLock() (*os.File, error) {
+	lockPath := getLockPath()
+	deadline := time.Now().Add(LockTimeout)
+
+	for time.Now().Before(deadline) {
+		// Try to create lock file exclusively (O_CREAT | O_EXCL)
+		// On Unix: os.O_CREATE | os.O_EXCL | os.O_WRONLY
+		// On Windows: same flags work
+		lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err == nil {
+			// Lock acquired successfully
+			return lockFile, nil
+		}
+
+		// Check if file exists (lock held by another process)
+		if os.IsExist(err) {
+			// Check if lock file is stale (older than 10 seconds)
+			if info, statErr := os.Stat(lockPath); statErr == nil {
+				if time.Since(info.ModTime()) > LockTimeout {
+					// Stale lock, try to remove it
+					_ = os.Remove(lockPath)
+					continue
+				}
+			}
+			// Lock is held, wait and retry
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		// Other error
+		return nil, fmt.Errorf("failed to acquire lock: %w", err)
+	}
+
+	return nil, fmt.Errorf("lock acquisition timeout after %v", LockTimeout)
+}
+
+// releaseLock releases the registry lock
+func releaseLock(lockFile *os.File) error {
+	if lockFile == nil {
+		return nil
+	}
+
+	lockPath := getLockPath()
+
+	// Close the file
+	if err := lockFile.Close(); err != nil {
+		return fmt.Errorf("failed to close lock file: %w", err)
+	}
+
+	// Remove the lock file
+	if err := os.Remove(lockPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove lock file: %w", err)
+	}
+
+	return nil
 }
 
 // load reads the registry from disk
@@ -82,20 +174,57 @@ func (r *ServiceRegistry) save() error {
 		return err
 	}
 
-	return os.WriteFile(r.filePath, data, 0644)
+	// Ensure directory exists
+	filePath := r.filePath
+	dir := filepath.Dir(filePath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	return os.WriteFile(filePath, data, 0644)
 }
 
 // Register registers a service with the registry
 func Register(serviceID string, port int) error {
 	r := getRegistry()
 
+	// Acquire lock
+	lock, err := acquireLock()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: Failed to acquire registry lock: %v\n", err)
+		// Continue without lock (best effort)
+	}
+
+	// Ensure lock is released
+	if lock != nil {
+		defer func() {
+			if releaseErr := releaseLock(lock); releaseErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: Failed to release registry lock: %v\n", releaseErr)
+			}
+		}()
+	}
+
+	// Reload to get latest state
+	if err := r.load(); err != nil {
+		return fmt.Errorf("failed to load registry: %w", err)
+	}
+
 	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Check if service already exists with live PID
+	if existing, exists := r.services[serviceID]; exists {
+		if isProcessAlive(existing.PID) {
+			return fmt.Errorf("service '%s' already registered with PID %d", serviceID, existing.PID)
+		}
+		// Dead PID, will overwrite
+	}
+
 	r.services[serviceID] = ServiceInfo{
 		Port:      port,
 		PID:       os.Getpid(),
 		StartTime: time.Now(),
 	}
-	r.mu.Unlock()
 
 	return r.save()
 }
@@ -104,11 +233,41 @@ func Register(serviceID string, port int) error {
 func Unregister(serviceID string) error {
 	r := getRegistry()
 
-	r.mu.Lock()
-	delete(r.services, serviceID)
-	r.mu.Unlock()
+	// Acquire lock
+	lock, err := acquireLock()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: Failed to acquire registry lock: %v\n", err)
+		// Continue without lock (best effort)
+	}
 
-	return r.save()
+	// Ensure lock is released
+	if lock != nil {
+		defer func() {
+			if releaseErr := releaseLock(lock); releaseErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: Failed to release registry lock: %v\n", releaseErr)
+			}
+		}()
+	}
+
+	// Reload to get latest state
+	if err := r.load(); err != nil {
+		return fmt.Errorf("failed to load registry: %w", err)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Only remove if PID matches
+	if existing, exists := r.services[serviceID]; exists {
+		if existing.PID == os.Getpid() {
+			delete(r.services, serviceID)
+			return r.save()
+		}
+		// PID doesn't match, don't unregister
+		return fmt.Errorf("service '%s' registered with different PID", serviceID)
+	}
+
+	return nil
 }
 
 // Discover finds a service by ID and returns its port

@@ -28,6 +28,25 @@ type ParentWorker struct {
 	MaxRestartAttempts int
 	restartCount       int
 
+	// Timeout configuration
+	DefaultTimeout time.Duration
+
+	// Heartbeat configuration
+	HeartbeatInterval  time.Duration
+	HeartbeatTimeout   time.Duration
+	HeartbeatMaxMisses int
+
+	// Circuit breaker state
+	consecutiveFailures int
+	circuitOpen         bool
+
+	// Heartbeat state
+	pendingHeartbeats          map[string]chan bool
+	consecutiveHeartbeatMisses int
+	lastHeartbeatRttMs         float64
+	heartbeatRunning           bool
+	heartbeatStopChan          chan struct{}
+
 	// ZMQ state
 	socket zmq.Socket
 
@@ -43,6 +62,9 @@ type ParentWorker struct {
 	// Channels
 	done     chan struct{}
 	stopChan chan struct{}
+
+	// Metrics
+	metrics *Metrics
 
 	// Proxy interfaces
 	Call  *SyncProxy
@@ -63,6 +85,11 @@ type ParentWorkerConfig struct {
 	Port               int
 	AutoRestart        bool
 	MaxRestartAttempts int
+	DefaultTimeout     time.Duration
+	HeartbeatInterval  time.Duration
+	HeartbeatTimeout   time.Duration
+	HeartbeatMaxMisses int
+	EnableMetrics      bool
 }
 
 // NewParentWorker creates a new ParentWorker with the given config
@@ -73,6 +100,15 @@ func NewParentWorker(config ParentWorkerConfig) *ParentWorker {
 	if config.MaxRestartAttempts == 0 {
 		config.MaxRestartAttempts = 5
 	}
+	if config.HeartbeatInterval == 0 {
+		config.HeartbeatInterval = 5 * time.Second
+	}
+	if config.HeartbeatTimeout == 0 {
+		config.HeartbeatTimeout = 3 * time.Second
+	}
+	if config.HeartbeatMaxMisses == 0 {
+		config.HeartbeatMaxMisses = 3
+	}
 
 	pw := &ParentWorker{
 		scriptPath:         config.ScriptPath,
@@ -82,9 +118,20 @@ func NewParentWorker(config ParentWorkerConfig) *ParentWorker {
 		isSpawnMode:        config.ScriptPath != "",
 		AutoRestart:        config.AutoRestart,
 		MaxRestartAttempts: config.MaxRestartAttempts,
+		DefaultTimeout:     config.DefaultTimeout,
+		HeartbeatInterval:  config.HeartbeatInterval,
+		HeartbeatTimeout:   config.HeartbeatTimeout,
+		HeartbeatMaxMisses: config.HeartbeatMaxMisses,
 		pendingRequests:    make(map[string]*pendingRequest),
+		pendingHeartbeats:  make(map[string]chan bool),
 		done:               make(chan struct{}),
 		stopChan:           make(chan struct{}),
+		heartbeatStopChan:  make(chan struct{}),
+	}
+
+	// Setup metrics if enabled
+	if config.EnableMetrics {
+		pw.metrics = NewMetrics(1000, 60.0)
 	}
 
 	// Setup proxy interfaces
@@ -103,9 +150,10 @@ func Spawn(scriptPath string, executable ...string) *ParentWorker {
 
 	port := findFreePort()
 	return NewParentWorker(ParentWorkerConfig{
-		ScriptPath: scriptPath,
-		Executable: exe,
-		Port:       port,
+		ScriptPath:    scriptPath,
+		Executable:    exe,
+		Port:          port,
+		EnableMetrics: true,
 	})
 }
 
@@ -122,8 +170,9 @@ func Connect(ctx context.Context, serviceID string, timeout ...time.Duration) (*
 	}
 
 	return NewParentWorker(ParentWorkerConfig{
-		ServiceID: serviceID,
-		Port:      port,
+		ServiceID:     serviceID,
+		Port:          port,
+		EnableMetrics: true,
 	}), nil
 }
 
@@ -154,6 +203,12 @@ func (pw *ParentWorker) Start() error {
 
 	// Start message loop
 	go pw.messageLoop()
+
+	// Start heartbeat loop (spawn mode only)
+	if pw.isSpawnMode && pw.HeartbeatInterval > 0 {
+		pw.heartbeatRunning = true
+		go pw.heartbeatLoop()
+	}
 
 	// Wait for connection
 	time.Sleep(500 * time.Millisecond)
@@ -232,6 +287,8 @@ func (pw *ParentWorker) handleMessage(data []byte) {
 	switch msg.Type {
 	case string(MessageTypeResponse), string(MessageTypeError):
 		pw.handleResponse(msg)
+	case string(MessageTypeHeartbeat):
+		pw.handleHeartbeatResponse(msg)
 	case string(MessageTypeStdout):
 		if msg.Output != "" {
 			name := pw.scriptPath
@@ -281,8 +338,44 @@ func (pw *ParentWorker) handleResponse(msg *ComlinkMessage) {
 
 	if msg.Type == string(MessageTypeResponse) {
 		pending.resolve(msg.Result)
+		pw.recordSuccess()
 	} else {
 		pending.reject(&RemoteCallError{Message: msg.Error})
+		pw.recordFailure()
+	}
+}
+
+// handleHeartbeatResponse handles a heartbeat response from child
+func (pw *ParentWorker) handleHeartbeatResponse(msg *ComlinkMessage) {
+	pw.mu.Lock()
+	responseChan, exists := pw.pendingHeartbeats[msg.ID]
+	if exists {
+		delete(pw.pendingHeartbeats, msg.ID)
+	}
+	pw.mu.Unlock()
+
+	if !exists || responseChan == nil {
+		return
+	}
+
+	// Calculate RTT from original timestamp
+	if msg.Metadata != nil {
+		if originalTs, ok := msg.Metadata["hb_timestamp"].(float64); ok {
+			rttMs := (float64(time.Now().UnixNano())/1e9 - originalTs) * 1000
+			pw.lastHeartbeatRttMs = rttMs
+			if pw.metrics != nil {
+				pw.metrics.RecordHeartbeatRtt(rttMs)
+			}
+		}
+	}
+
+	// Reset consecutive misses on successful response
+	pw.consecutiveHeartbeatMisses = 0
+
+	// Signal heartbeat success
+	select {
+	case responseChan <- true:
+	default:
 	}
 }
 
@@ -293,8 +386,19 @@ func (pw *ParentWorker) CallFunction(ctx context.Context, functionName string, a
 
 // CallFunctionWithTimeout calls a function with a specific timeout
 func (pw *ParentWorker) CallFunctionWithTimeout(ctx context.Context, functionName string, timeout time.Duration, args ...any) (any, error) {
+	// Check circuit breaker
+	if pw.circuitOpen {
+		return nil, &CircuitOpenError{ConsecutiveFailures: pw.consecutiveFailures}
+	}
+
 	if !pw.running {
 		return nil, fmt.Errorf("worker is not running")
+	}
+
+	// Use default timeout if not specified
+	effectiveTimeout := timeout
+	if effectiveTimeout == 0 {
+		effectiveTimeout = pw.DefaultTimeout
 	}
 
 	// Create message
@@ -319,7 +423,13 @@ func (pw *ParentWorker) CallFunctionWithTimeout(ctx context.Context, functionNam
 		pw.mu.Unlock()
 	}()
 
-	// Send message
+	// Start metrics tracking
+	var startTime time.Time
+	if pw.metrics != nil {
+		startTime = pw.metrics.StartRequest(msg.ID, functionName, "default")
+	}
+
+	// Send message with retry logic
 	data, err := msg.Pack()
 	if err != nil {
 		return nil, fmt.Errorf("failed to pack message: %w", err)
@@ -327,25 +437,176 @@ func (pw *ParentWorker) CallFunctionWithTimeout(ctx context.Context, functionNam
 
 	// DEALER envelope: [empty_frame, message_data]
 	zmqMsg := zmq.NewMsgFrom([]byte{}, data)
-	if err := pw.socket.Send(zmqMsg); err != nil {
+	if err := pw.sendMessageWithRetry(zmqMsg, 5); err != nil {
 		return nil, fmt.Errorf("failed to send message: %w", err)
 	}
 
 	// Wait for response or timeout
 	var timeoutChan <-chan time.Time
-	if timeout > 0 {
-		timeoutChan = time.After(timeout)
+	if effectiveTimeout > 0 {
+		timeoutChan = time.After(effectiveTimeout)
 	}
 
 	select {
 	case <-ctx.Done():
+		if pw.metrics != nil {
+			pw.metrics.EndRequest(startTime, msg.ID, false, "context cancelled")
+		}
+		pw.recordFailure()
 		return nil, ctx.Err()
 	case <-timeoutChan:
-		return nil, fmt.Errorf("function '%s' timed out after %v", functionName, timeout)
+		if pw.metrics != nil {
+			pw.metrics.EndRequest(startTime, msg.ID, false, "timeout")
+		}
+		pw.recordFailure()
+		return nil, fmt.Errorf("function '%s' timed out after %v", functionName, effectiveTimeout)
 	case result := <-resultChan:
+		if pw.metrics != nil {
+			pw.metrics.EndRequest(startTime, msg.ID, true, "")
+		}
+		pw.recordSuccess()
 		return result, nil
 	case err := <-errorChan:
+		if pw.metrics != nil {
+			pw.metrics.EndRequest(startTime, msg.ID, false, err.Error())
+		}
+		pw.recordFailure()
 		return nil, err
+	}
+}
+
+// sendMessageWithRetry sends a message with retry logic
+func (pw *ParentWorker) sendMessageWithRetry(msg zmq.Msg, maxRetries int) error {
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if err := pw.socket.Send(msg); err == nil {
+			return nil // Success
+		} else {
+			// Check if it's a retryable error (socket busy)
+			if attempt < maxRetries-1 {
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+			return fmt.Errorf("socket busy after %d retries: %w", maxRetries, err)
+		}
+	}
+	return fmt.Errorf("failed to send message after %d retries", maxRetries)
+}
+
+// recordFailure records a failure for circuit breaker tracking
+func (pw *ParentWorker) recordFailure() {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+
+	pw.consecutiveFailures++
+	if pw.consecutiveFailures >= pw.MaxRestartAttempts {
+		pw.circuitOpen = true
+		if pw.metrics != nil {
+			pw.metrics.RecordCircuitBreakerTrip()
+		}
+	}
+}
+
+// recordSuccess records a success, resetting circuit breaker
+func (pw *ParentWorker) recordSuccess() {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+
+	if pw.consecutiveFailures > 0 {
+		pw.consecutiveFailures = 0
+		if pw.circuitOpen {
+			pw.circuitOpen = false
+			if pw.metrics != nil {
+				pw.metrics.RecordCircuitBreakerReset()
+			}
+		}
+	}
+}
+
+// heartbeatLoop periodically sends heartbeats to child process
+func (pw *ParentWorker) heartbeatLoop() {
+	// Wait for initial connection
+	time.Sleep(1 * time.Second)
+
+	for pw.running && pw.heartbeatRunning {
+		select {
+		case <-pw.heartbeatStopChan:
+			return
+		default:
+		}
+
+		// Only send heartbeats in spawn mode (we own the child)
+		if !pw.isSpawnMode {
+			time.Sleep(pw.HeartbeatInterval)
+			continue
+		}
+
+		// Check if child is still running
+		if pw.process != nil && pw.process.Process != nil {
+			// Check if process has exited
+			if pw.process.ProcessState != nil && pw.process.ProcessState.Exited() {
+				// Child died, let message loop handle it
+				return
+			}
+		}
+
+		// Create heartbeat message
+		heartbeat := CreateHeartbeat("")
+
+		// Create channel for response
+		responseChan := make(chan bool, 1)
+		pw.mu.Lock()
+		pw.pendingHeartbeats[heartbeat.ID] = responseChan
+		pw.mu.Unlock()
+
+		// Send heartbeat
+		data, _ := heartbeat.Pack()
+		zmqMsg := zmq.NewMsgFrom([]byte{}, data)
+		if err := pw.sendMessageWithRetry(zmqMsg, 3); err != nil {
+			// Send failed, count as miss
+			pw.mu.Lock()
+			delete(pw.pendingHeartbeats, heartbeat.ID)
+			pw.mu.Unlock()
+
+			pw.consecutiveHeartbeatMisses++
+			fmt.Printf("Heartbeat send failed (%d/%d)\n", pw.consecutiveHeartbeatMisses, pw.HeartbeatMaxMisses)
+
+			if pw.consecutiveHeartbeatMisses >= pw.HeartbeatMaxMisses {
+				fmt.Printf("Heartbeat timeout after %d consecutive misses\n", pw.consecutiveHeartbeatMisses)
+				pw.recordFailure()
+				return
+			}
+
+			time.Sleep(pw.HeartbeatInterval)
+			continue
+		}
+
+		// Wait for response with timeout
+		select {
+		case <-responseChan:
+			// Success - RTT already recorded in handleHeartbeatResponse
+		case <-time.After(pw.HeartbeatTimeout):
+			// Heartbeat timed out
+			pw.mu.Lock()
+			delete(pw.pendingHeartbeats, heartbeat.ID)
+			pw.mu.Unlock()
+
+			pw.consecutiveHeartbeatMisses++
+			if pw.metrics != nil {
+				pw.metrics.RecordHeartbeatMiss()
+			}
+
+			fmt.Printf("Heartbeat missed (%d/%d)\n", pw.consecutiveHeartbeatMisses, pw.HeartbeatMaxMisses)
+
+			// Check if too many misses
+			if pw.consecutiveHeartbeatMisses >= pw.HeartbeatMaxMisses {
+				fmt.Printf("Heartbeat timeout after %d consecutive misses\n", pw.consecutiveHeartbeatMisses)
+				pw.recordFailure()
+				return
+			}
+		}
+
+		// Wait for next interval
+		time.Sleep(pw.HeartbeatInterval)
 	}
 }
 
@@ -356,6 +617,18 @@ func (pw *ParentWorker) Close() error {
 	}
 	pw.closed = true
 	pw.running = false
+	pw.heartbeatRunning = false
+
+	// Stop heartbeat loop
+	close(pw.heartbeatStopChan)
+
+	// Cancel pending heartbeats
+	pw.mu.Lock()
+	for _, hbChan := range pw.pendingHeartbeats {
+		close(hbChan)
+	}
+	pw.pendingHeartbeats = make(map[string]chan bool)
+	pw.mu.Unlock()
 
 	// Signal stop
 	close(pw.stopChan)
@@ -395,6 +668,26 @@ func (pw *ParentWorker) Close() error {
 	}
 
 	return nil
+}
+
+// IsHealthy returns whether the worker is healthy (circuit breaker not tripped)
+func (pw *ParentWorker) IsHealthy() bool {
+	return !pw.circuitOpen && pw.running
+}
+
+// CircuitOpen returns whether the circuit breaker is open
+func (pw *ParentWorker) CircuitOpen() bool {
+	return pw.circuitOpen
+}
+
+// LastHeartbeatRttMs returns the last heartbeat round-trip time in milliseconds
+func (pw *ParentWorker) LastHeartbeatRttMs() float64 {
+	return pw.lastHeartbeatRttMs
+}
+
+// Metrics returns the metrics collector
+func (pw *ParentWorker) Metrics() *Metrics {
+	return pw.metrics
 }
 
 // GetPort returns the current port
