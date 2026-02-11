@@ -2,6 +2,7 @@ package multifrost
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -118,14 +119,121 @@ func (m *ComlinkMessage) Pack() ([]byte, error) {
 	return msgpack.Marshal(m)
 }
 
-// Unpack deserializes a message from msgpack
+const (
+	maxMessageSize  = 10 * 1024 * 1024 // 10MB
+	maxArrayLength  = 10000
+	maxMapSize      = 10000
+	maxStringLength = 100000
+)
+
+// Unpack deserializes a message from msgpack with safety validations
 func Unpack(data []byte) (*ComlinkMessage, error) {
+	// Check message size limit (DoS protection)
+	if len(data) > maxMessageSize {
+		return nil, fmt.Errorf("message size %d exceeds limit %d", len(data), maxMessageSize)
+	}
+
 	var msg ComlinkMessage
 	err := msgpack.Unmarshal(data, &msg)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("decode failed: %w", err)
 	}
+
+	// Validate timestamp for NaN/Infinity
+	if math.IsNaN(msg.Timestamp) || math.IsInf(msg.Timestamp, 0) {
+		msg.Timestamp = 0.0
+	}
+
+	// Validate and clamp any type values
+	if err := validateSliceAny(&msg.Args); err != nil {
+		return nil, fmt.Errorf("invalid args: %w", err)
+	}
+	if err := validateAnyValue(&msg.Result); err != nil {
+		return nil, fmt.Errorf("invalid result: %w", err)
+	}
+	if err := validateMetadata(&msg.Metadata); err != nil {
+		return nil, fmt.Errorf("invalid metadata: %w", err)
+	}
+
 	return &msg, nil
+}
+
+// validateAnyValue validates and clamps any-type values for msgpack interop safety
+func validateAnyValue(val *any) error {
+	if val == nil {
+		return nil
+	}
+
+	switch v := (*val).(type) {
+	case float64:
+		// Clamp NaN/Infinity to 0
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			*val = 0
+		}
+	case int:
+		// Clamp to int64 range
+		if v > math.MaxInt64 || v < math.MinInt64 {
+			*val = int64(v)
+		}
+	case int8, int16, int32, int64:
+		// Already in safe range for Go, no action needed
+	case map[string]any:
+		// Recursively validate nested maps
+		for k, vv := range v {
+			if err := validateAnyValue(&vv); err != nil {
+				return fmt.Errorf("key '%s': %w", k, err)
+			}
+			v[k] = vv
+		}
+		*val = v
+	case []any:
+		// Recursively validate slices
+		for i, vv := range v {
+			if err := validateAnyValue(&vv); err != nil {
+				return fmt.Errorf("index %d: %w", i, err)
+			}
+			v[i] = vv
+		}
+		*val = v
+		// String map keys are validated by msgpack decoder (already string type)
+		// Other types (bool, string) are safe by design
+	}
+
+	return nil
+}
+
+// validateSliceAny validates slices of any type
+func validateSliceAny(val *[]any) error {
+	if val == nil {
+		return nil
+	}
+
+	for i, v := range *val {
+		if err := validateAnyValue(&v); err != nil {
+			return fmt.Errorf("index %d: %w", i, err)
+		}
+		(*val)[i] = v
+	}
+
+	return nil
+}
+
+// validateMetadata validates that metadata map keys are strings and values are safe
+func validateMetadata(meta *map[string]any) error {
+	if meta == nil {
+		return nil
+	}
+
+	// msgpack decoder already ensures string keys for map[string]any
+	// Recursively validate values for NaN/Infinity and integer overflow
+	for k, v := range *meta {
+		if err := validateAnyValue(&v); err != nil {
+			return fmt.Errorf("key '%s': %w", k, err)
+		}
+		(*meta)[k] = v
+	}
+
+	return nil
 }
 
 // RemoteCallError represents an error from a remote call

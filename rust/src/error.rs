@@ -40,6 +40,12 @@ pub enum MultifrostError {
 
     #[error("JSON error: {0}")]
     JsonError(#[from] serde_json::Error),
+
+    #[error("msgpack contains NaN/Infinity values")]
+    MsgpackNaNInfinity,
+
+    #[error("msgpack size limit exceeded: {0}")]
+    MsgpackSizeLimit(String),
 }
 
 pub type Result<T> = std::result::Result<T, MultifrostError>;

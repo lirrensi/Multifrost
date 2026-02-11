@@ -569,7 +569,7 @@ async fn message_loop(
                             let _ = tx.send(true);
                         }
                     }
-                    MessageType::Call | MessageType::Shutdown | MessageType::Ready => {}
+                    MessageType::Call | MessageType::Shutdown | MessageType::Ready | MessageType::Unknown => {}
                 }
             }
             Err(_) => {}

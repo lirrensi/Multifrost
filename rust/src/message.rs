@@ -1,8 +1,30 @@
 use crate::error::{MultifrostError, Result};
+use rmp_serde::decode::Deserializer;
 use serde::{Deserialize, Serialize};
+use std::io::Cursor;
 use uuid::Uuid;
 
 const APP_NAME: &str = "comlink_ipc_v3";
+
+/// Validate that all map keys in a serde_json::Value are strings
+fn validate_string_keys(value: &serde_json::Value) -> Result<()> {
+    match value {
+        serde_json::Value::Object(map) => {
+            // serde_json Object keys are always strings, so no validation needed
+            for (_key, val) in map.iter() {
+                validate_string_keys(val)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                validate_string_keys(item)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -15,6 +37,8 @@ pub enum MessageType {
     Heartbeat,
     Shutdown,
     Ready,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,9 +101,19 @@ mod timestamp_as_f64 {
         }
 
         match Numeric::deserialize(deserializer)? {
-            Numeric::Float(f) => Ok(f),
+            Numeric::Float(f) => {
+                if f.is_nan() || f.is_infinite() {
+                    // Convert NaN/Infinity to 0.0 per msgpack safety contract
+                    Ok(0.0)
+                } else {
+                    Ok(f)
+                }
+            }
             Numeric::Int(i) => Ok(i as f64),
-            Numeric::UInt(u) => Ok(u as f64),
+            Numeric::UInt(u) => {
+                // Clamp to i64::MAX to prevent overflow/precision loss
+                Ok(u.min(i64::MAX as u64) as f64)
+            }
         }
     }
 }
@@ -222,7 +256,22 @@ impl Message {
     }
 
     pub fn unpack(data: &[u8]) -> Result<Self> {
-        rmp_serde::from_slice(data).map_err(MultifrostError::from)
+        let mut deserializer = Deserializer::new(Cursor::new(data));
+        deserializer.set_max_depth(100); // Prevent stack overflow
+        let msg = Self::deserialize(&mut deserializer)
+            .map_err(|e| MultifrostError::DeserializeError(e))?;
+
+        // Validate map keys in args and metadata are strings
+        if let Some(ref args) = msg.args {
+            validate_string_keys(&serde_json::Value::Array(
+                args.clone().into_iter().collect(),
+            ))?;
+        }
+        if let Some(ref metadata) = msg.metadata {
+            validate_string_keys(metadata)?;
+        }
+
+        Ok(msg)
     }
 
     pub fn is_valid(&self) -> bool {

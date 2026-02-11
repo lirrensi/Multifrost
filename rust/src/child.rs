@@ -211,7 +211,7 @@ async fn handle_message<W: ChildWorker>(
                 .unwrap_or_else(|| current_timestamp());
             Message::create_heartbeat_response(&msg_id, original_ts)
         }
-        MessageType::Ready | MessageType::Response | MessageType::Error | MessageType::Stdout | MessageType::Stderr => {
+        MessageType::Ready | MessageType::Response | MessageType::Error | MessageType::Stdout | MessageType::Stderr | MessageType::Unknown => {
             return Ok(());
         }
     };

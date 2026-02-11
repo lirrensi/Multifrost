@@ -17,7 +17,8 @@ async fn main() -> Result<(), MultifrostError> {
         .join("examples")
         .join("math_worker.exe");
     
-    let mut worker = ParentWorker::spawn_command(
+    let mut worker = ParentWorker::spawn(
+        "",
         worker_path.to_str().expect("Invalid path")
     )?;
     
