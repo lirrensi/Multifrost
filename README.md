@@ -12,7 +12,7 @@ Multifrost is a high-performance inter-process communication (IPC) library that 
 - **Cross-Language**: Python ↔ Node.js ↔ Go ↔ Rust ↔ Anything with a runtime
 - **Two Modes**: Spawn (create workers) or Connect (service discovery)
 - **Battle-Tested**: Built on ZeroMQ and msgpack for maximum performance
-- **Async-Native**: Modern async/await APIs in all languages
+- **Async-Native**: Modern async/sync APIs in all languages
 
 ## 💡 Common Use Cases
 
@@ -22,10 +22,10 @@ Multifrost is a high-performance inter-process communication (IPC) library that 
 from multifrost import ParentWorker
 
 worker = ParentWorker.spawn("worker.py")
-worker.start()
+worker.sync.start()
 
 # Call functions from the isolated environment
-result = worker.call.process_data(json_data)
+result = worker.sync.call.process_data(json_data)
 ```
 
 ```python
@@ -56,50 +56,141 @@ console.log(prediction);
 package main
 
 import (
+    "context"
+    "log"
     "github.com/multifrost/golang"
 )
 
 func main() {
-    worker, _ := golang.SpawnWorker("./service.go", nil)
-    worker.Start()
+    // Spawn a Go worker
+    worker := multifrost.Spawn("examples/math_worker", "go", "run")
+    if err := worker.Start(); err != nil {
+        log.Fatalf("Failed to start worker: %v", err)
+    }
+    defer worker.Close()
 
-    // Call the other service
-    result, _ := worker.Call("process", []interface{}{data})
-    fmt.Println(result)
+    // Call remote functions
+    ctx := context.Background()
+
+    result, err := worker.ACall.Call(ctx, "Add", 5, 3)
+    if err != nil {
+        log.Printf("Add failed: %v", err)
+    } else {
+        log.Printf("Add(5, 3) = %v\n", result)
+    }
+
+    result, err = worker.ACall.Call(ctx, "Multiply", 6, 7)
+    if err != nil {
+        log.Printf("Multiply failed: %v", err)
+    } else {
+        log.Printf("Multiply(6, 7) = %v\n", result)
+    }
 }
 ```
 
 ### Offload Heavy Compute to Rust
 ```rust
-// In your Python parent
-worker = ParentWorker.spawn("./heavy_worker.rs", "cargo");
-result = await worker.call.compute_heavy_matrix(matrix_data)
+use multifrost::ParentWorker;
+use serde_json::json;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Spawn Rust worker (compiled binary for maximum performance)
+    let mut worker = ParentWorker::spawn("examples/math_worker.rs", None).await?;
+
+    // Call factorial computation
+    let result: u64 = worker.call("factorial", vec![
+        json!(20),
+    ]).await?;
+    println!("Factorial of 20 = {}", result);
+
+    worker.stop().await;
+    Ok(())
+}
 ```
 
 ```rust
-// heavy_worker.rs
-use multifrost::ChildWorker;
+//! math_worker.rs - Rust worker implementation
+use multifrost::{ChildWorker, ChildWorkerContext, Result, run_worker};
+use async_trait::async_trait;
+use serde_json::Value;
 
-pub struct HeavyWorker;
+struct MathWorker;
 
-impl WorkerMethods for HeavyWorker {
-    fn compute_heavy(&self, data: Vec<f64>) -> Vec<f64> {
-        // CPU-intensive computation in Rust
-        data.iter().map(|x| x * 2.0).collect()
+#[async_trait]
+impl ChildWorker for MathWorker {
+    async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value> {
+        match function {
+            "factorial" => {
+                let n = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+                let result: u64 = (1..=n).product();
+                Ok(serde_json::json!(result))
+            }
+            "fibonacci" => {
+                let n = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+                let result = fibonacci(n);
+                Ok(serde_json::json!(result))
+            }
+            _ => Err(multifrost::MultifrostError::FunctionNotFound(function.to_string()))
+        }
     }
 }
 
-fn main() {
-    HeavyWorker::run();
+fn fibonacci(n: u64) -> u64 {
+    if n == 0 { return 0; }
+    if n == 1 { return 1; }
+
+    let (mut a, mut b) = (0u64, 1u64);
+    for _ in 2..=n {
+        let temp = a.wrapping_add(b);
+        a = b;
+        b = temp;
+    }
+    b
+}
+
+#[tokio::main]
+async fn main() {
+    // Spawn mode (parent will provide port via env)
+    let ctx = ChildWorkerContext::new();
+    run_worker(MathWorker, ctx).await;
 }
 ```
 
-## 📚 Documentation
+## 📚 Documentation Index
 
-- **[Architecture](docs/arch.md)** - Core design principles and protocol
-- **[Protocol](docs/protocol.md)** - Message format and wire protocol
+### Core Documentation
+- **[Architecture Overview](docs/arch.md)** - Core design principles and protocol
+- **[Protocol Specification](docs/protocol.md)** - Message format and wire protocol
 - **[MsgPack Interop](docs/msgpack_interop.md)** - Cross-language data handling
 - **[Get Started](examples/)** - Full examples for each language
+
+### Language-Specific Documentation
+
+#### Python
+- **[Python Architecture](python/docs/arch.md)** - Async-first design, asyncio integration
+- **[Python AGENTS Guide](python/AGENTS.md)** - Development guidelines and patterns
+- **[Python Examples](python/examples/)** - Parent-child patterns, async workers
+
+#### JavaScript / TypeScript
+- **[JavaScript Architecture](javascript/docs/arch.md)** - Event-driven, proxy-based API
+- **[JavaScript AGENTS Guide](javascript/AGENTS.md)** - Development guidelines
+- **[JavaScript Examples](javascript/examples/)** - Node.js workers, TypeScript
+
+#### Go
+- **[Go Architecture](golang/docs/arch.md)** - Goroutines, reflection, type safety
+- **[Go AGENTS Guide](golang/AGENTS.md)** - Development guidelines
+- **[Go Examples](golang/examples/)** - Microservice patterns, spawn/connect
+
+#### Rust
+- **[Rust Architecture](rust/docs/arch.md)** - Type-safe, async-native, Arc<RwLock<>>
+- **[Rust AGENTS Guide](rust/AGENTS.md)** - Development guidelines
+- **[Rust Examples](rust/examples/)** - Heavy compute, async patterns
+
+### Cross-Language Reference
+- **[Error Handling Patterns](docs/error_patterns.md)** - Consistent error handling across languages
+- **[Type Mapping](docs/type_mapping.md)** - Data type compatibility between languages
+- **[Performance Tips](docs/performance.md)** - Optimization strategies
 
 ## 🏗️ How It Works
 
@@ -117,9 +208,9 @@ fn main() {
 │  • Manages life-│       │  • Handles calls
 │    cycle        │       │  • Routes messages
 └─────────────────┘       └─────────────────┘
-         │                              │
-         └──────── ZeroMQ over TCP ──────┘
-              msgpack encoded
+          │                              │
+          └──────── ZeroMQ over TCP ──────┘
+               msgpack encoded
 ```
 
 ### Core Concepts
@@ -127,12 +218,12 @@ fn main() {
 1. **Parent & Child Roles**: Parent initiates calls and manages lifecycle; Child exposes callable methods.
 
 2. **Two Communication Modes**:
-   - **Spawn**: Parent creates child process with `COMLINK_ZMQ_PORT` environment variable
-   - **Connect**: Child registers in service registry (`~/.multifrost/services.json`)
+    - **Spawn**: Parent creates child process with `COMLINK_ZMQ_PORT` environment variable
+    - **Connect**: Child registers in service registry (`~/.multifrost/services.json`)
 
 3. **Message Flow**: All messages use ZeroMQ's multipart framing with msgpack encoding:
-   - CALL → RESPONSE (success) or ERROR (failure)
-   - Full bidirectional communication
+    - CALL → RESPONSE (success) or ERROR (failure)
+    - Full bidirectional communication
 
 4. **Protocol Version**: Uses `comlink_ipc_v3` app ID for version negotiation
 
@@ -206,10 +297,24 @@ make test-javascript
 
 Check out the full examples in the repository:
 
-- **[Python Examples](python/examples/)** - Parent-child patterns, async workers
-- **[JavaScript Examples](javascript/examples/)** - Node.js workers, TypeScript
-- **[Go Examples](golang/examples/)** - Microservice patterns
+### Python
+- **[Python Examples](python/examples/)** - Parent-child patterns, async workers, concurrency
+
+### JavaScript / TypeScript
+- **[JavaScript Examples](javascript/examples/)** - Node.js workers, TypeScript, service discovery
+
+### Go
+- **[Go Examples](golang/examples/)** - Microservice patterns, spawn/connect modes
+  - `math_worker/` - Simple math operations worker
+  - `parent_spawn/` - Parent spawns child worker
+  - `go_calls_python/` - Go calls Python worker
+
+### Rust
 - **[Rust Examples](rust/examples/)** - Heavy compute, async patterns
+  - `math_worker.rs` - Math operations worker
+  - `parent.rs` - Parent connects to service
+  - `spawn.rs` - Parent spawns Rust worker
+  - `connect.rs` - Parent connects to Rust service
 
 ## 🛡️ Security
 
