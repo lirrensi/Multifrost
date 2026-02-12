@@ -14,33 +14,6 @@ Multifrost is a high-performance inter-process communication (IPC) library that 
 - **Battle-Tested**: Built on ZeroMQ and msgpack for maximum performance
 - **Async-Native**: Modern async/await APIs in all languages
 
-## 🚀 Quick Start
-
-### Python
-```bash
-pip install multifrost
-```
-
-### JavaScript / TypeScript
-```bash
-npm install multifrost
-```
-
-### Go
-```bash
-go get github.com/multifrost/golang
-```
-
-### Rust
-```bash
-cargo install https://github.com/multifrost/rust
-```
-
-### uvx (Python)
-```bash
-uvx multifrost
-```
-
 ## 💡 Common Use Cases
 
 ### Bridge Two Python Environments
