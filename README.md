@@ -186,18 +186,21 @@ fn main() {
 ### Python
 ```bash
 # Using pip
-pip install multifrost
+pip install git+https://github.com/lirrensi/Multifrost.git
 
 # Using uv
-uv pip install multifrost
+uv pip install git+https://github.com/lirrensi/Multifrost.git
+
+# Using pipx
+pipx install git+https://github.com/lirrensi/Multifrost.git
 
 # Using uvx (direct run)
-uvx multifrost
+uvx --from git+https://github.com/lirrensi/Multifrost.git
 ```
 
 ### JavaScript / TypeScript
 ```bash
-npm install multifrost
+npm install git+https://github.com/lirrensi/Multifrost.git
 
 # Or use with tsx for TypeScript files
 npx tsx worker.ts
@@ -205,12 +208,12 @@ npx tsx worker.ts
 
 ### Go
 ```bash
-go get github.com/multifrost/golang
+go get https://github.com/lirrensi/Multifrost.git
 ```
 
 ### Rust
 ```bash
-cargo install https://github.com/multifrost/rust
+cargo install --git https://github.com/lirrensi/Multifrost.git
 ```
 
 ### Development
