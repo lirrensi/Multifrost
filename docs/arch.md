@@ -42,7 +42,7 @@ Multifrost enables a **Parent** process to call methods on a **Child** worker pr
 - **Protocol**: ZeroMQ over TCP
 - **Pattern**: ROUTER (Child) <-> DEALER (Parent)
 - **Encoding**: msgpack (map/dict at top level)
-- **App ID**: `comlink_ipc_v3`
+- **App ID**: `comlink_ipc_v4`
 
 ### Multipart Framing
 
@@ -59,7 +59,7 @@ All messages share core fields:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `app` | string | Yes | Must be `comlink_ipc_v3` |
+| `app` | string | Yes | Must be `comlink_ipc_v4` |
 | `id` | string | Yes | UUID v4, correlates request/response |
 | `type` | string | Yes | Message type (see below) |
 | `timestamp` | number | Yes | Unix epoch seconds (float) |
@@ -69,7 +69,7 @@ All messages share core fields:
 #### CALL
 ```json
 {
-  "app": "comlink_ipc_v3",
+  "app": "comlink_ipc_v4",
   "id": "<uuid>",
   "type": "call",
   "timestamp": 1234.5,
@@ -85,7 +85,7 @@ All messages share core fields:
 #### RESPONSE
 ```json
 {
-  "app": "comlink_ipc_v3",
+  "app": "comlink_ipc_v4",
   "id": "<same-as-call>",
   "type": "response",
   "timestamp": 1234.6,
@@ -96,7 +96,7 @@ All messages share core fields:
 #### ERROR
 ```json
 {
-  "app": "comlink_ipc_v3",
+  "app": "comlink_ipc_v4",
   "id": "<same-as-call>",
   "type": "error",
   "timestamp": 1234.6,
@@ -107,7 +107,7 @@ All messages share core fields:
 #### STDOUT / STDERR
 ```json
 {
-  "app": "comlink_ipc_v3",
+  "app": "comlink_ipc_v4",
   "type": "stdout",
   "timestamp": 1234.5,
   "output": "printed text"
@@ -119,7 +119,7 @@ All messages share core fields:
 #### HEARTBEAT / SHUTDOWN
 ```json
 {
-  "app": "comlink_ipc_v3",
+  "app": "comlink_ipc_v4",
   "id": "<uuid>",
   "type": "heartbeat",
   "timestamp": 1234.5
@@ -186,7 +186,7 @@ Location: `~/.multifrost/services.json`
 ```
 // Factory methods
 ParentWorker.spawn(scriptPath, executable?, options?) -> ParentWorker
-ParentWorker.connect(serviceId, timeout?) -> Promise<ParentWorker>
+ParentWorker.connect(serviceId, timeout?) -> ParentWorker
 
 // Options (spawn mode)
 options: {
@@ -198,23 +198,26 @@ options: {
     heartbeatMaxMisses?: number,    // default: 3
 }
 
-// Lifecycle
-parent.start() -> Promise<void>
-parent.close() / parent.stop() -> Promise<void>
+// Handle methods (lifecycle + call interface)
+worker.handle() -> Handle          // async handle (default)
+worker.handle_sync() -> Handle     // sync handle (Python only)
 
-// Remote calls
-parent.call.methodName(...args) -> Promise<any>
-parent.call.withOptions({timeout?, namespace?}).methodName(...args)
+// Handle lifecycle (delegates to worker internals)
+handle.start()                     // spawn/connect (mode: sync or async)
+handle.stop()                      // cleanup (mode: sync or async)
 
-// Async variant (Python only)
-parent.acall.methodName(...args) -> Coroutine
+// Handle remote calls
+handle.call.methodName(...args)
+handle.call.withOptions({timeout?, namespace?}).methodName(...args)
 
-// Properties
-parent.isHealthy -> boolean         // circuit breaker not tripped
-parent.circuitOpen -> boolean       // circuit breaker state
-parent.lastHeartbeatRttMs -> number | undefined  // last heartbeat RTT
-parent.metrics -> Metrics           // metrics collector (Python/JS)
+// Worker properties (introspection)
+worker.isHealthy -> boolean         // circuit breaker not tripped
+worker.circuitOpen -> boolean       // circuit breaker state
+worker.lastHeartbeatRttMs -> number | undefined  // last heartbeat RTT
+worker.metrics -> Metrics           // metrics collector (Python/JS)
 ```
+
+> **Pattern**: Worker holds state/config. Handle is a lightweight interface that delegates to worker's internal lifecycle. One handle type = one execution mode.
 
 ### ChildWorker
 
@@ -248,7 +251,7 @@ child.listFunctions() -> string[]
 ### Child Must
 
 - [ ] Create ROUTER socket
-- [ ] Ignore messages where `app != comlink_ipc_v3`
+- [ ] Ignore messages where `app != comlink_ipc_v4`
 - [ ] Ignore messages with mismatched `namespace`
 - [ ] Reject calls to functions starting with `_`
 - [ ] Send ERROR for missing/non-callable functions
@@ -306,7 +309,7 @@ The wire protocol is identical across implementations:
 
 | Feature | Python | JavaScript |
 |---------|--------|------------|
-| App ID | `comlink_ipc_v3` | `comlink_ipc_v3` |
+| App ID | `comlink_ipc_v4` | `comlink_ipc_v4` |
 | Core fields | app, id, type, timestamp | app, id, type, timestamp |
 | CALL fields | function, args, namespace | function, args, namespace |
 | ERROR format | message + traceback | message only |
@@ -327,11 +330,12 @@ The wire protocol is identical across implementations:
 ### Example: Python Parent, JS Child
 
 ```python
-# Python parent
+# Python parent (async)
 worker = ParentWorker.spawn("./math_worker.ts", "tsx.cmd")
-await worker.start()
-result = await worker.acall.factorial(10)
-await worker.close()
+handle = worker.handle()
+await handle.start()
+result = await handle.call.factorial(10)
+await handle.stop()
 ```
 
 ```typescript
@@ -347,9 +351,10 @@ new MathWorker().run();
 ```typescript
 // JS parent
 const worker = ParentWorker.spawn("./math_worker.py", "python");
-await worker.start();
-const result = await worker.call.factorial(10);
-await worker.stop();
+const handle = worker.handle();
+await handle.start();
+const result = await handle.call.factorial(10);
+await handle.stop();
 ```
 
 ```python
@@ -393,7 +398,7 @@ MathWorker().run()
 
 ## Versioning
 
-- App ID `comlink_ipc_v3` identifies protocol version
+- App ID `comlink_ipc_v4` identifies protocol version
 - Different app ID = hard fail (no negotiation)
 - New fields must be optional; receivers ignore unknowns
 

@@ -1,7 +1,7 @@
 # Multifrost Product Specification
 
-**Version**: 1.0  
-**Protocol ID**: `comlink_ipc_v3`  
+**Version**: 2.0  
+**Protocol ID**: `comlink_ipc_v4`  
 **Status**: Canonical
 
 This document defines what Multifrost is, what every feature does, and how it behaves. It is the authoritative specification. If code and this document disagree, this document wins.
@@ -127,12 +127,22 @@ Rules:
 | `start()` | Start the worker (bind socket, spawn child or connect) |
 | `close()` / `stop()` | Stop the worker (close socket, terminate child if spawned) |
 
+#### Handle Methods
+
+| Method | Description |
+|--------|-------------|
+| `worker.handle()` | Returns async handle (lifecycle + call interface) |
+| `worker.handle_sync()` | Returns sync handle (Python only) |
+
+The handle is a lightweight interface that delegates to the worker's internal lifecycle methods. Worker holds the state; handle provides the API shape (sync/async).
+
 #### Remote Calls
 
 | Syntax | Description |
 |--------|-------------|
-| `parent.call.methodName(...args)` | Call remote method (language-specific async/sync) |
-| `parent.call.withOptions({timeout?, namespace?}).methodName(...args)` | Call with per-call options |
+| `handle.start()` / `handle.stop()` | Lifecycle (mode: sync or async) |
+| `handle.call.methodName(...args)` | Call remote method |
+| `handle.call.withOptions({timeout?, namespace?}).methodName(...args)` | Call with per-call options |
 
 #### Properties
 
@@ -178,12 +188,22 @@ Rules:
 
 #### Remote Call Syntax
 
-| Language | Async Call | Sync Call |
-|----------|------------|-----------|
-| Python | `await worker.acall.method(args)` | `worker.sync.call.method(args)` |
-| JavaScript | `await worker.call.method(args)` | N/A (async-only) |
-| Go | `worker.Call("method", args...)` | Same (goroutines for concurrency) |
-| Rust | `worker.call("method", args...).await` | `worker.call_blocking("method", args...)` |
+| Language | Async Handle | Sync Handle | Notes |
+|----------|--------------|-------------|-------|
+| Python | `worker.handle()` | `worker.handle_sync()` | Both available |
+| JavaScript | `worker.handle()` | N/A | Async-only |
+| Go | `worker.Handle()` | N/A | Goroutines handle concurrency |
+| Rust | `worker.handle()` | N/A | Async-first, can add later |
+
+**Usage pattern (all languages):**
+
+```python
+worker = ParentWorker.spawn("script.py")  # Config
+handle = worker.handle()                   # Async handle
+await handle.start()                       # Start (mode: async)
+result = await handle.call.method(args)    # Call
+await handle.stop()                        # Stop (mode: async)
+```
 
 #### ChildWorker Definition
 
@@ -486,7 +506,7 @@ All languages use identical wire protocol:
 - **Transport**: ZeroMQ over TCP
 - **Pattern**: ROUTER (Child) <-> DEALER (Parent)
 - **Encoding**: msgpack
-- **App ID**: `comlink_ipc_v3`
+- **App ID**: `comlink_ipc_v4`
 
 See `docs/protocol.md` for full specification.
 
@@ -567,7 +587,7 @@ See `docs/msgpack_interop.md` for detailed guidance.
 The protocol is identified by the `app` field in every message:
 
 ```
-app: "comlink_ipc_v3"
+app: "comlink_ipc_v4"
 ```
 
 **Rules:**
@@ -602,21 +622,32 @@ app: "comlink_ipc_v3"
 ### 14.1 Minimal Parent (Spawn Mode)
 
 ```python
-# Python
+# Python (async)
 from multifrost import ParentWorker
 
-async with ParentWorker.spawn("worker.py") as worker:
-    result = await worker.acall.my_method(arg1, arg2)
+worker = ParentWorker.spawn("worker.py", "python")
+handle = worker.handle()
+await handle.start()
+result = await handle.call.my_method(arg1, arg2)
+await handle.stop()
+
+# Python (sync)
+worker = ParentWorker.spawn("worker.py", "python")
+handle = worker.handle_sync()
+handle.start()  # blocking
+result = handle.call.my_method(arg1, arg2)
+handle.stop()
 ```
 
 ```javascript
 // JavaScript
 import { ParentWorker } from 'multifrost';
 
-const worker = await ParentWorker.spawn('worker.ts', 'tsx');
-await worker.start();
-const result = await worker.call.myMethod(arg1, arg2);
-await worker.stop();
+const worker = ParentWorker.spawn('worker.ts', 'tsx');
+const handle = worker.handle();
+await handle.start();
+const result = await handle.call.myMethod(arg1, arg2);
+await handle.stop();
 ```
 
 ### 14.2 Minimal Child
@@ -649,8 +680,10 @@ new MyWorker().run();
 
 ```python
 # Parent connects to existing service
-worker = await ParentWorker.connect("my-service")
-result = await worker.acall.my_method()
+worker = ParentWorker.connect("my-service")
+handle = worker.handle()
+await handle.start()
+result = await handle.call.my_method()
 ```
 
 ```python

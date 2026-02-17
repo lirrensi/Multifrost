@@ -55,7 +55,7 @@ Date: 2026-02-11
 5. Core Fields
 --------------
 
-5.1 app: string, fixed to 'comlink_ipc_v3'.
+5.1 app: string, fixed to 'comlink_ipc_v4'.
 5.2 id: string, UUID v4 recommended.
 5.3 type: string, one of call|response|error|stdout|stderr|heartbeat|shutdown.
 5.4 timestamp: number, seconds since Unix epoch (float).
@@ -99,7 +99,7 @@ Date: 2026-02-11
 -----------------------------
 
 7.1 Base schema:
-7.1.1 app: string (MUST be 'comlink_ipc_v3').
+7.1.1 app: string (MUST be 'comlink_ipc_v4').
 7.1.2 id: string (MUST be unique per request/response pair).
 7.1.3 type: string (see Message Types).
 7.1.4 timestamp: number (seconds since epoch).
@@ -133,7 +133,7 @@ Date: 2026-02-11
 -----------------
 
 9.1 Child MUST create a ROUTER socket.
-9.2 Child MUST ignore messages where app != comlink_ipc_v3.
+9.2 Child MUST ignore messages where app != comlink_ipc_v4.
 9.3 Child MUST ignore messages with mismatched namespace.
 9.4 Child MUST validate function and id fields in CALL.
 9.5 Child MUST reject calls to missing or non-callable functions.
@@ -217,7 +217,7 @@ Date: 2026-02-11
 17. Compatibility Notes (Python vs JS)
 --------------------------------------
 
-17.1 App name constant is identical: comlink_ipc_v3.
+17.1 App name constant is identical: comlink_ipc_v4.
 17.2 Core fields match: app, id, type, timestamp.
 17.3 CALL fields match: function, args, namespace, client_name.
 17.4 ERROR payloads differ (Python includes traceback).
@@ -239,25 +239,25 @@ Date: 2026-02-11
 19. Versioning
 --------------
 
-19.1 This protocol corresponds to application id comlink_ipc_v3.
+19.1 This protocol corresponds to application id comlink_ipc_v4.
 19.2 Breaking wire changes MUST change app id or be negotiated out of band.
 
 20. Canonical Examples
 ----------------------
 
 20.1 CALL message (JSON-equivalent):
-20.1.1 {app:'comlink_ipc_v3', id:'<uuid>', type:'call', timestamp:1234.5, function:'add', args:[1,2], namespace:'default'}
+20.1.1 {app:'comlink_ipc_v4', id:'<uuid>', type:'call', timestamp:1234.5, function:'add', args:[1,2], namespace:'default'}
 20.2 RESPONSE message:
-20.2.1 {app:'comlink_ipc_v3', id:'<uuid>', type:'response', timestamp:1234.6, result:3}
+20.2.1 {app:'comlink_ipc_v4', id:'<uuid>', type:'response', timestamp:1234.6, result:3}
 20.3 ERROR message:
-20.3.1 {app:'comlink_ipc_v3', id:'<uuid>', type:'error', timestamp:1234.6, error:'ValueError: ...'}
+20.3.1 {app:'comlink_ipc_v4', id:'<uuid>', type:'error', timestamp:1234.6, error:'ValueError: ...'}
 
 21. Implementation Checklist (Adapters)
 ---------------------------------------
 
 21.1 Use ROUTER/DEALER with the exact multipart frames.
 21.2 Msgpack encode/decode with map top-level.
-21.3 Enforce app id == comlink_ipc_v3.
+21.3 Enforce app id == comlink_ipc_v4.
 21.4 Generate UUIDv4 ids for calls.
 21.5 Support namespace filtering.
 21.6 Reject private methods starting with '_'.
@@ -269,7 +269,7 @@ Date: 2026-02-11
 22. Field-by-Field Constraints
 ------------------------------
 
-22.1 Field=app; Type=string; Constraint=MUST equal comlink_ipc_v3
+22.1 Field=app; Type=string; Constraint=MUST equal comlink_ipc_v4
 22.2 Field=id; Type=string; Constraint=MUST be unique and non-empty
 22.3 Field=type; Type=string; Constraint=MUST be valid message type
 22.4 Field=timestamp; Type=number; Constraint=MUST be seconds since epoch
@@ -431,21 +431,23 @@ Date: 2026-02-11
 
 40.1 ParentWorker.spawn(script_path, executable=python)
 40.2 ParentWorker.connect(service_id, timeout=5.0)
-40.3 ParentWorker.start(), close()
-40.4 ParentWorker.call.<method>(*args)
-40.5 ParentWorker.acall.<method>(*args)
-40.6 ChildWorker(service_id=None)
-40.7 ChildWorker.run(), list_functions()
+40.3 worker.handle() -> async handle
+40.4 worker.handle_sync() -> sync handle
+40.5 handle.start(), handle.stop()
+40.6 handle.call.<method>(*args)
+40.7 ChildWorker(service_id=None)
+40.8 ChildWorker.run(), list_functions()
 
 41. Appendix: JS API Surface
 ----------------------------
 
 41.1 ParentWorker.spawn(scriptPath, executable='node')
 41.2 ParentWorker.connect(serviceId, timeout=5000)
-41.3 ParentWorker.start(), stop()
-41.4 ParentWorker.call.<method>(*args)
-41.5 ChildWorker(serviceId?)
-41.6 ChildWorker.run(), listFunctions()
+41.3 worker.handle() -> async handle
+41.4 handle.start(), handle.stop()
+41.5 handle.call.<method>(*args)
+41.6 ChildWorker(serviceId?)
+41.7 ChildWorker.run(), listFunctions()
 
 42. Appendix: Message Construction
 ----------------------------------

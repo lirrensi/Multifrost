@@ -16,144 +16,244 @@ Multifrost is a high-performance inter-process communication (IPC) library that 
 
 ## 💡 Common Use Cases
 
-### Bridge Two Python Environments
+### Python: Spawn a Worker
+
 ```python
-# In your main app (parent)
+# parent.py - Spawn and call a Python worker
+import asyncio
 from multifrost import ParentWorker
 
-worker = ParentWorker.spawn("worker.py")
-worker.sync.start()
+async def main():
+    # Spawn the child process
+    worker = await ParentWorker.spawn("worker.py")
+    await worker.start()
 
-# Call functions from the isolated environment
-result = worker.sync.call.process_data(json_data)
+    # Call remote functions (async API)
+    result = await worker.acall.add(5, 3)
+    print(f"5 + 3 = {result}")
+
+    await worker.close()
+
+asyncio.run(main())
 ```
 
 ```python
-# In worker.py (child)
+# worker.py - Child worker implementation
 from multifrost import ChildWorker
 
-class DataWorker(ChildWorker):
-    def process_data(self, data: dict) -> dict:
-        # Your processing logic here
-        return {"result": "processed"}
+class MathWorker(ChildWorker):
+    def add(self, a: int, b: int) -> int:
+        return a + b
 
-DataWorker().run()
+    def factorial(self, n: int) -> int:
+        import math
+        return math.factorial(n)
+
+MathWorker().run()
 ```
 
-### Call ML Apps from Node.js
+### Node.js → Python: Call ML Models
+
 ```typescript
+// Node.js parent calling a Python ML worker
 import { ParentWorker } from 'multifrost';
 
-const modelWorker = await ParentWorker.spawn('./model-service.ts', 'tsx');
+async function main() {
+    // Spawn a Python worker (e.g., PyTorch/TensorFlow model)
+    const worker = await ParentWorker.spawn('./ml_worker.py', 'python');
+    await worker.start();
 
-// Call your PyTorch/TensorFlow model
-const prediction = await modelWorker.call.predict([0.1, 0.2, 0.3]);
-console.log(prediction);
+    // Call your ML model
+    const prediction = await worker.call.predict([0.1, 0.2, 0.3]);
+    console.log('Prediction:', prediction);
+
+    await worker.stop();
+}
+
+main().catch(console.error);
 ```
 
-### Connect Two Go Microservices
+```python
+# ml_worker.py - Python ML worker
+from multifrost import ChildWorker
+import torch  # or tensorflow, sklearn, etc.
+
+class MLWorker(ChildWorker):
+    def predict(self, features: list) -> list:
+        # Your ML inference here
+        tensor = torch.tensor(features)
+        result = self.model(tensor)
+        return result.tolist()
+
+MLWorker().run()
+```
+
+### Go: Spawn a Worker
+
 ```go
 package main
 
 import (
     "context"
+    "fmt"
     "log"
+
     "github.com/multifrost/golang"
 )
 
 func main() {
-    // Spawn a Go worker
+    // Spawn a Go child worker
     worker := multifrost.Spawn("examples/math_worker", "go", "run")
     if err := worker.Start(); err != nil {
         log.Fatalf("Failed to start worker: %v", err)
     }
     defer worker.Close()
 
-    // Call remote functions
     ctx := context.Background()
 
+    // Call remote functions
     result, err := worker.ACall.Call(ctx, "Add", 5, 3)
     if err != nil {
         log.Printf("Add failed: %v", err)
     } else {
-        log.Printf("Add(5, 3) = %v\n", result)
-    }
-
-    result, err = worker.ACall.Call(ctx, "Multiply", 6, 7)
-    if err != nil {
-        log.Printf("Multiply failed: %v", err)
-    } else {
-        log.Printf("Multiply(6, 7) = %v\n", result)
+        fmt.Printf("Add(5, 3) = %v\n", result)
     }
 }
 ```
 
-### Offload Heavy Compute to Rust
+### Rust: Spawn a Compiled Worker
+
 ```rust
-use multifrost::ParentWorker;
-use serde_json::json;
+use multifrost::{ParentWorker, ParentWorkerBuilder, call};
+use std::env;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Spawn Rust worker (compiled binary for maximum performance)
-    let mut worker = ParentWorker::spawn("examples/math_worker.rs", None).await?;
+    // Rust workers are compiled binaries, not .rs files
+    let current_dir = env::current_dir()?;
+    let worker_path = current_dir
+        .join("target")
+        .join("debug")
+        .join("examples")
+        .join("math_worker");
 
-    // Call factorial computation
-    let result: u64 = worker.call("factorial", vec![
-        json!(20),
-    ]).await?;
-    println!("Factorial of 20 = {}", result);
+    let mut worker = ParentWorkerBuilder::spawn("", worker_path.to_str().unwrap())
+        .build()
+        .await?;
+
+    worker.start().await?;
+
+    // Use the call! macro for ergonomic calls
+    let result: i64 = worker.call!(add(10, 20)).await?;
+    println!("add(10, 20) = {}", result);
 
     worker.stop().await;
     Ok(())
 }
 ```
 
+---
+
+## 🔗 Connect Mode (Service Discovery)
+
+Connect to a long-running worker instead of spawning one. Multiple parents can share the same worker.
+
+### Python: Connect to a Service
+
+```python
+# Terminal 1: Start the service
+# python math_worker_service.py
+```
+
+```python
+# math_worker_service.py - Long-running worker
+from multifrost import ChildWorker
+
+class MathWorker(ChildWorker):
+    def __init__(self):
+        super().__init__(service_id="math-service")  # Register with ID
+
+    def add(self, a: int, b: int) -> int:
+        return a + b
+
+MathWorker().run()
+```
+
+```python
+# Terminal 2: Connect and call
+import asyncio
+from multifrost import ParentWorker
+
+async def main():
+    worker = await ParentWorker.connect("math-service", timeout=5.0)
+    await worker.start()
+
+    result = await worker.acall.add(5, 3)
+    print(f"5 + 3 = {result}")
+
+    await worker.close()
+
+asyncio.run(main())
+```
+
+### Node.js: Connect to a Service
+
+```typescript
+// Terminal 1: Start the service
+// npx tsx math_worker_service.ts
+```
+
+```typescript
+// math_worker_service.ts
+import { ChildWorker } from './src/multifrost.js';
+
+class MathWorker extends ChildWorker {
+    constructor() {
+        super("math-service");  // Register with ID
+    }
+
+    add(a: number, b: number): number {
+        return a + b;
+    }
+}
+
+new MathWorker().run();
+```
+
+```typescript
+// Terminal 2: Connect and call
+import { ParentWorker } from 'multifrost';
+
+const worker = await ParentWorker.connect("math-service", 5000);
+await worker.start();
+
+const result = await worker.call.add(5, 3);
+console.log(`5 + 3 = ${result}`);
+
+await worker.stop();
+```
+
+### Rust: Connect to a Service
+
 ```rust
-//! math_worker.rs - Rust worker implementation
-use multifrost::{ChildWorker, ChildWorkerContext, Result, run_worker};
-use async_trait::async_trait;
-use serde_json::Value;
+// Terminal 1: Start the service
+// cargo run --example math_worker -- --service
+```
 
-struct MathWorker;
-
-#[async_trait]
-impl ChildWorker for MathWorker {
-    async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value> {
-        match function {
-            "factorial" => {
-                let n = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
-                let result: u64 = (1..=n).product();
-                Ok(serde_json::json!(result))
-            }
-            "fibonacci" => {
-                let n = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
-                let result = fibonacci(n);
-                Ok(serde_json::json!(result))
-            }
-            _ => Err(multifrost::MultifrostError::FunctionNotFound(function.to_string()))
-        }
-    }
-}
-
-fn fibonacci(n: u64) -> u64 {
-    if n == 0 { return 0; }
-    if n == 1 { return 1; }
-
-    let (mut a, mut b) = (0u64, 1u64);
-    for _ in 2..=n {
-        let temp = a.wrapping_add(b);
-        a = b;
-        b = temp;
-    }
-    b
-}
+```rust
+// Terminal 2: Connect and call
+use multifrost::{ParentWorker, call};
 
 #[tokio::main]
-async fn main() {
-    // Spawn mode (parent will provide port via env)
-    let ctx = ChildWorkerContext::new();
-    run_worker(MathWorker, ctx).await;
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut worker = ParentWorker::connect("math-service", 5000).await?;
+    worker.start().await?;
+
+    let result: i64 = worker.call!(add(10, 20)).await?;
+    println!("add(10, 20) = {}", result);
+
+    worker.stop().await;
+    Ok(())
 }
 ```
 
