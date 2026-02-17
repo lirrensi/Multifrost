@@ -196,3 +196,45 @@ func TestParentWorker_StateManagement(t *testing.T) {
 		assert.Equal(t, 0, worker.ConsecutiveHeartbeatMisses())
 	})
 }
+
+func TestHandle_Creation(t *testing.T) {
+	t.Run("handle creation", func(t *testing.T) {
+		worker := Spawn("test_worker", "go", "run")
+		handle := worker.Handle()
+		require.NotNil(t, handle)
+	})
+
+	t.Run("handle delegates to worker", func(t *testing.T) {
+		worker := NewParentWorker(ParentWorkerConfig{
+			EnableMetrics: true,
+		})
+		worker.running = true
+
+		handle := worker.Handle()
+
+		// Handle should report same health status
+		assert.Equal(t, worker.IsHealthy(), handle.IsHealthy())
+	})
+
+	t.Run("handle returns metrics", func(t *testing.T) {
+		worker := NewParentWorker(ParentWorkerConfig{
+			EnableMetrics: true,
+		})
+
+		handle := worker.Handle()
+		metrics := handle.Metrics()
+		assert.NotNil(t, metrics)
+	})
+
+	t.Run("multiple handles from same worker", func(t *testing.T) {
+		worker := Spawn("test_worker", "go", "run")
+
+		handle1 := worker.Handle()
+		handle2 := worker.Handle()
+
+		// Both handles should delegate to the same worker
+		require.NotNil(t, handle1)
+		require.NotNil(t, handle2)
+		assert.Equal(t, handle1.IsHealthy(), handle2.IsHealthy())
+	})
+}

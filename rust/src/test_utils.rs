@@ -4,7 +4,7 @@
 
 use crate::message::Message;
 use crate::metrics::Metrics;
-use crate::logging::{StructuredLogger, LogLevel, LogEvent};
+use crate::logging::{StructuredLogger, LogLevel};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -190,5 +190,39 @@ mod tests {
         worker.set_fail(true);
         let result: crate::error::Result<serde_json::Value> = worker.handle_call("add", vec![json!(1), json!(2)]).await;
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use crate::parent::ParentWorker;
+
+    #[tokio::test]
+    async fn test_handle_takes_ownership() {
+        let handle = ParentWorker::spawn("test.py", "python").unwrap().handle();
+        // Handle now owns the worker
+        assert!(!handle.is_healthy().await);
+    }
+
+    #[tokio::test]
+    async fn test_handle_start_stop() {
+        let mut handle = ParentWorker::spawn("test.py", "python").unwrap().handle();
+        // Can call start/stop because Handle owns the worker
+        // (This will fail without a real child process, but tests the API)
+        let _ = handle.start().await;
+        handle.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_handle_delegates_metrics() {
+        let handle = ParentWorker::spawn("test.py", "python").unwrap().handle();
+        assert!(handle.metrics().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_handle_health_checks() {
+        let handle = ParentWorker::spawn("test.py", "python").unwrap().handle();
+        assert!(!handle.is_healthy().await); // Not started
+        assert!(!handle.circuit_open().await); // Circuit breaker closed
     }
 }

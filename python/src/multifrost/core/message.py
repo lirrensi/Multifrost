@@ -22,7 +22,7 @@ class MessageType(Enum):
     SHUTDOWN = "shutdown"
 
 
-APP_NAME = "comlink_ipc_v3"
+APP_NAME = "comlink_ipc_v4"
 
 
 def _sanitize_for_msgpack(obj: Any) -> Any:

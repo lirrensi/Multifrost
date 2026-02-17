@@ -5,7 +5,7 @@ import * as net from "net";
 import * as msgpack from "msgpackr";
 import { ServiceRegistry } from "./service_registry.js";
 
-const APP_NAME = "comlink_ipc_v3";
+const APP_NAME = "comlink_ipc_v4";
 
 /**
  * Sanitize values for msgpack serialization to ensure cross-language interop safety.
@@ -755,6 +755,65 @@ export class ParentWorker {
                 });
             });
         }
+    }
+
+    /**
+     * Get a handle for this worker.
+     * 
+     * The handle provides a clean API view with lifecycle (start/stop) and call interface.
+     * Multiple handles can be created from the same worker - they all delegate to the same instance.
+     * 
+     * @returns A new ParentHandle instance
+     */
+    handle(): ParentHandle {
+        return new ParentHandle(this);
+    }
+}
+
+/**
+ * ParentHandle provides a lightweight API view for ParentWorker.
+ * 
+ * Separates process definition (Worker) from runtime interface (Handle).
+ * The handle is cheap to create and delegates all operations to the worker.
+ * 
+ * Usage:
+ *   const worker = ParentWorker.spawn("script.js");
+ *   const handle = worker.handle();
+ *   await handle.start();
+ *   const result = await handle.call.myFunction(1, 2);
+ *   await handle.stop();
+ */
+export class ParentHandle {
+    private _worker: ParentWorker;
+    private _call?: AsyncRemoteProxy;
+
+    constructor(worker: ParentWorker) {
+        this._worker = worker;
+    }
+
+    /**
+     * Get the call proxy for remote method invocation.
+     * Returns an AsyncRemoteProxy for method calls like handle.call.myFunction(args)
+     */
+    get call(): AsyncRemoteProxy {
+        if (!this._call) {
+            this._call = new AsyncRemoteProxy(this._worker);
+        }
+        return this._call;
+    }
+
+    /**
+     * Start the worker (spawn process, connect ZMQ).
+     */
+    async start(): Promise<void> {
+        await this._worker.start();
+    }
+
+    /**
+     * Stop the worker (cleanup resources, terminate child).
+     */
+    async stop(): Promise<void> {
+        await this._worker.stop();
     }
 }
 

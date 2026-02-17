@@ -39,24 +39,62 @@ async def test_spawn_mode():
     print("\n=== Test: Spawn Mode ===")
 
     worker = ParentWorker.spawn(__file__)
-    await worker.start()
+    handle = worker.handle()
+    await handle.start()
 
     # Wait for child to connect
     await asyncio.sleep(0.5)
 
     try:
-        result = await worker.acall.add(5, 3)
+        result = await handle.call.add(5, 3)
         assert result == 8, f"Expected 8, got {result}"
         print(f"  add(5, 3) = {result} OK")
 
-        result = await worker.acall.async_add(10, 20)
+        result = await handle.call.async_add(10, 20)
         assert result == 30, f"Expected 30, got {result}"
         print(f"  async_add(10, 20) = {result} OK")
 
     finally:
-        await worker.close()
+        await handle.stop()
 
     print("  Spawn mode: PASSED")
+
+
+async def test_spawn_mode_context_manager():
+    """Test spawn mode with async context manager."""
+    print("\n=== Test: Spawn Mode (Context Manager) ===")
+
+    worker = ParentWorker.spawn(__file__)
+
+    async with worker.handle() as handle:
+        # Wait for child to connect
+        await asyncio.sleep(0.5)
+
+        result = await handle.call.add(100, 200)
+        assert result == 300, f"Expected 300, got {result}"
+        print(f"  add(100, 200) = {result} OK")
+
+    print("  Context manager: PASSED")
+
+
+async def test_sync_handle():
+    """Test sync handle mode."""
+    print("\n=== Test: Sync Handle Mode ===")
+
+    worker = ParentWorker.spawn(__file__)
+    handle = worker.handle_sync()
+
+    with handle:
+        # Wait for child to connect
+        import time
+
+        time.sleep(0.5)
+
+        result = handle.call.add(7, 8)
+        assert result == 15, f"Expected 15, got {result}"
+        print(f"  add(7, 8) = {result} OK")
+
+    print("  Sync handle: PASSED")
 
 
 async def test_connect_mode():
@@ -73,16 +111,17 @@ async def test_connect_mode():
     try:
         # Connect as parent
         parent = await ParentWorker.connect("test-service-v4", timeout=5.0)
-        await parent.start()
+        handle = parent.handle()
+        await handle.start()
 
         # Wait for connection
         await asyncio.sleep(0.3)
 
-        result = await parent.acall.multiply(4, 7)
+        result = await handle.call.multiply(4, 7)
         assert result == 28, f"Expected 28, got {result}"
         print(f"  multiply(4, 7) = {result} OK")
 
-        await parent.close()
+        await handle.stop()
         print("  Connect mode: PASSED")
 
     finally:
@@ -105,5 +144,7 @@ if __name__ == "__main__":
     else:
         print("Running Multifrost v4 tests...")
         asyncio.run(test_spawn_mode())
+        asyncio.run(test_spawn_mode_context_manager())
+        asyncio.run(test_sync_handle())
         asyncio.run(test_connect_mode())
         print("\nAll tests passed!")

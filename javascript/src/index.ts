@@ -5,6 +5,7 @@ import {
     MessageType,
     RemoteCallError,
     CircuitOpenError,
+    ParentHandle,
 } from "./multifrost.js";
 import { ServiceRegistry } from "./service_registry.js";
 import { Metrics } from "./metrics.js";
@@ -20,6 +21,7 @@ import type { LogEntry, LogHandler } from "./logging.js";
 
 export default {
     ParentWorker,
+    ParentHandle,
     ChildWorker,
     ComlinkMessage,
     MessageType,
@@ -36,6 +38,7 @@ export default {
 
 export {
     ParentWorker,
+    ParentHandle,
     ChildWorker,
     ComlinkMessage,
     MessageType,

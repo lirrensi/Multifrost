@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn test_args_extractor_take() {
         let args = ArgsExtractor::new(vec![json!(10), json!(20)]);
-        let a: i64 = args.take(0).unwrap();
+        let a: i64 = args.clone().take(0).unwrap();
         let b: i64 = args.take(0).unwrap(); // Now at index 0
         assert_eq!(a, 10);
         assert_eq!(b, 20);
@@ -379,7 +379,9 @@ mod tests {
 
     #[test]
     fn test_call_args_tuples() {
-        assert_eq!(().to_json_args(), vec![]);
+        let empty: () = ();
+        let result: Vec<Value> = CallArgs::to_json_args(empty);
+        assert_eq!(result, Vec::<Value>::new());
         assert_eq!((1i64,).to_json_args(), vec![json!(1)]);
         assert_eq!((1i64, 2i64).to_json_args(), vec![json!(1), json!(2)]);
         assert_eq!((1i64, 2i64, 3i64).to_json_args(), vec![json!(1), json!(2), json!(3)]);

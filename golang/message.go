@@ -9,7 +9,7 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-const AppName = "comlink_ipc_v3"
+const AppName = "comlink_ipc_v4"
 
 // MessageType represents the type of IPC message
 type MessageType string

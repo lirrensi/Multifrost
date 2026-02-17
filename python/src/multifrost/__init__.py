@@ -113,6 +113,7 @@ from .core.async_worker import ParentWorker, RemoteCallError, CircuitOpenError
 from .core.child import ChildWorker
 from .core.message import MessageType, ComlinkMessage
 from .core.service_registry import ServiceRegistry
+from .core.sync_wrapper import ParentHandle, ParentHandleSync
 from .core.metrics import Metrics, MetricsSnapshot, RequestMetrics
 from .core.logging import (
     StructuredLogger,
@@ -124,7 +125,7 @@ from .core.logging import (
     default_pretty_handler,
 )
 
-__version__ = "3.0.0"
+__version__ = "4.0.0"
 __all__ = [
     # Core
     "ParentWorker",
@@ -132,6 +133,9 @@ __all__ = [
     "MessageType",
     "ComlinkMessage",
     "ServiceRegistry",
+    # Handle classes (v4 API)
+    "ParentHandle",
+    "ParentHandleSync",
     # Errors
     "RemoteCallError",
     "CircuitOpenError",

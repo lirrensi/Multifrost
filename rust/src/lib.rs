@@ -86,7 +86,7 @@ pub use error::{MultifrostError, Result};
 pub use message::{Message, MessageType};
 pub use registry::ServiceRegistry;
 pub use child::{ChildWorker, ChildWorkerContext, run_worker, run_worker_sync, SyncChildWorker};
-pub use parent::{ParentWorker, ParentWorkerBuilder, SpawnOptions, ConnectOptions};
+pub use parent::{ParentWorker, ParentWorkerBuilder, SpawnOptions, ConnectOptions, Handle};
 pub use metrics::{Metrics, MetricsSnapshot, RequestMetrics};
 pub use logging::{
     StructuredLogger, LogEntry, LogEvent, LogLevel, LogHandler,

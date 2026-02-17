@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use uuid::Uuid;
 
-const APP_NAME: &str = "comlink_ipc_v3";
-const PROTOCOL_VERSION: &str = "3.0.0";
+const APP_NAME: &str = "comlink_ipc_v4";
+const PROTOCOL_VERSION: &str = "4.0.0";
 
 /// Validate that all map keys in a serde_json::Value are strings
 fn validate_string_keys(value: &serde_json::Value) -> Result<()> {

@@ -409,6 +409,112 @@ impl ParentWorker {
             let _ = child.wait();
         }
     }
+
+    /// Convert this worker into a handle that takes ownership.
+    ///
+    /// The handle provides a clean API view with lifecycle (start/stop) and call interface.
+    /// This consumes the worker - the handle now owns it.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use multifrost::ParentWorker;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let handle = ParentWorker::spawn("worker.py", "python")?.handle();
+    ///     handle.start().await?;
+    ///     let result: i32 = handle.call("add", vec![1.into(), 2.into()]).await?;
+    ///     handle.stop().await;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn handle(self) -> Handle {
+        Handle { worker: self }
+    }
+}
+
+/// Handle owns a ParentWorker and provides a clean API view.
+///
+/// Separates process definition (Worker) from runtime interface (Handle).
+/// The handle owns the worker and has full control over lifecycle.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use multifrost::ParentWorker;
+///
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let handle = ParentWorker::spawn("worker.py", "python")?.handle();
+///     handle.start().await?;
+///     let result: i32 = handle.call("add", vec![1.into(), 2.into()]).await?;
+///     handle.stop().await;
+///     Ok(())
+/// }
+/// ```
+pub struct Handle {
+    worker: ParentWorker,
+}
+
+impl Handle {
+    /// Start the worker (spawn process, connect ZMQ).
+    pub async fn start(&mut self) -> Result<()> {
+        self.worker.start().await
+    }
+
+    /// Stop the worker (cleanup resources, terminate child).
+    pub async fn stop(&mut self) {
+        self.worker.stop().await
+    }
+
+    /// Call a remote function with typed result.
+    pub async fn call<T: serde::de::DeserializeOwned>(
+        &self,
+        function: &str,
+        args: Vec<serde_json::Value>,
+    ) -> Result<T> {
+        self.worker.call(function, args).await
+    }
+
+    /// Call a remote function returning raw JSON Value.
+    pub async fn call_raw(
+        &self,
+        function: &str,
+        args: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        self.worker.call_raw(function, args).await
+    }
+
+    /// Call a remote function with timeout.
+    pub async fn call_with_timeout(
+        &self,
+        function: &str,
+        args: Vec<serde_json::Value>,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value> {
+        self.worker.call_with_timeout(function, args, Some(timeout)).await
+    }
+
+    /// Check if the worker is healthy.
+    pub async fn is_healthy(&self) -> bool {
+        self.worker.is_healthy().await
+    }
+
+    /// Check if circuit breaker is open.
+    pub async fn circuit_open(&self) -> bool {
+        self.worker.circuit_open().await
+    }
+
+    /// Get the last heartbeat round-trip time in milliseconds.
+    pub async fn last_heartbeat_rtt_ms(&self) -> Option<f64> {
+        self.worker.last_heartbeat_rtt_ms().await
+    }
+
+    /// Get the metrics collector.
+    pub fn metrics(&self) -> Option<&Metrics> {
+        self.worker.metrics()
+    }
 }
 
 /// Options for spawning a ParentWorker.

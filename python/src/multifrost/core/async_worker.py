@@ -265,6 +265,8 @@ class ParentWorker:
         """
         Asynchronous proxy interface.
 
+        Deprecated: Use worker.handle().call instead.
+
         Usage:
             await worker.start()
             result = await worker.acall.my_function(1, 2)
@@ -273,6 +275,56 @@ class ParentWorker:
         if self._async_proxy is None:
             self._async_proxy = AsyncProxy(self)
         return self._async_proxy
+
+    def handle(self) -> "ParentHandle":
+        """
+        Get an async handle for this worker.
+
+        The handle provides lifecycle (start/stop) and call interface.
+        This is the recommended way to use ParentWorker.
+
+        Returns:
+            ParentHandle instance for async operations
+
+        Usage:
+            worker = ParentWorker.spawn("script.py")
+            handle = worker.handle()
+            await handle.start()
+            result = await handle.call.my_function(1, 2)
+            await handle.stop()
+
+            # Or with context manager:
+            async with worker.handle() as h:
+                result = await h.call.my_function(1, 2)
+        """
+        from .sync_wrapper import ParentHandle
+
+        return ParentHandle(self)
+
+    def handle_sync(self) -> "ParentHandleSync":
+        """
+        Get a sync handle for this worker.
+
+        The handle provides lifecycle (start/stop) and call interface.
+        This is the recommended way to use ParentWorker in sync code.
+
+        Returns:
+            ParentHandleSync instance for synchronous operations
+
+        Usage:
+            worker = ParentWorker.spawn("script.py")
+            handle = worker.handle_sync()
+            handle.start()
+            result = handle.call.my_function(1, 2)
+            handle.stop()
+
+            # Or with context manager:
+            with worker.handle_sync() as h:
+                result = h.call.my_function(1, 2)
+        """
+        from .sync_wrapper import ParentHandleSync
+
+        return ParentHandleSync(self)
 
     def _find_free_port(self) -> int:
         """Find a free port for ZeroMQ communication."""

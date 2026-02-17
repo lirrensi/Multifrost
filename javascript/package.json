@@ -1,6 +1,6 @@
 {
     "name": "multifrost",
-    "version": "3.0.0",
+    "version": "4.0.0",
     "description": "Simple IPC library for Python and Node.js inspired by comlink.js",
     "license": "MIT",
     "author": "lirrensi",

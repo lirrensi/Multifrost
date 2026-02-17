@@ -758,3 +758,66 @@ func (p *AsyncProxy) CallWithTimeout(functionName string, timeout time.Duration,
 	defer cancel()
 	return p.worker.CallFunction(ctx, functionName, args...)
 }
+
+// Handle provides a lightweight API view for ParentWorker.
+// Separates process definition (Worker) from runtime interface (Handle).
+// The handle is cheap to create and delegates all operations to the worker.
+//
+// Usage:
+//
+//	worker := Spawn("worker.go")
+//	handle := worker.Handle()
+//	err := handle.Start()
+//	result, err := handle.Call("myFunction", 1, 2)
+//	err = handle.Stop()
+type Handle struct {
+	worker *ParentWorker
+	call   *SyncProxy
+}
+
+// Handle returns a new Handle for this worker.
+// The handle provides a clean API view with lifecycle (Start/Stop) and call interface.
+// Multiple handles can be created from the same worker - they all delegate to the same instance.
+func (pw *ParentWorker) Handle() *Handle {
+	return &Handle{
+		worker: pw,
+		call:   pw.Call,
+	}
+}
+
+// Start starts the worker (spawn process, connect ZMQ).
+func (h *Handle) Start() error {
+	return h.worker.Start()
+}
+
+// Stop stops the worker (cleanup resources, terminate child).
+func (h *Handle) Stop() error {
+	return h.worker.Close()
+}
+
+// Call calls a function on the remote worker.
+func (h *Handle) Call(functionName string, args ...any) (any, error) {
+	return h.worker.CallFunction(context.Background(), functionName, args...)
+}
+
+// CallWithTimeout calls a function with a specific timeout.
+func (h *Handle) CallWithTimeout(functionName string, timeout time.Duration, args ...any) (any, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return h.worker.CallFunction(ctx, functionName, args...)
+}
+
+// CallWithContext calls a function with a context for cancellation.
+func (h *Handle) CallWithContext(ctx context.Context, functionName string, args ...any) (any, error) {
+	return h.worker.CallFunction(ctx, functionName, args...)
+}
+
+// IsHealthy returns whether the worker is healthy.
+func (h *Handle) IsHealthy() bool {
+	return h.worker.IsHealthy()
+}
+
+// Metrics returns the metrics collector.
+func (h *Handle) Metrics() *Metrics {
+	return h.worker.Metrics()
+}

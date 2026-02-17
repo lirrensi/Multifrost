@@ -3,7 +3,7 @@
  * Run with: npx tsx tests/test.test.ts
  */
 
-import { ParentWorker, ChildWorker, ServiceRegistry } from "../src/index.js";
+import { ParentWorker, ChildWorker, ServiceRegistry, ParentHandle } from "../src/index.js";
 import { spawn, ChildProcess } from "child_process";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
@@ -42,13 +42,14 @@ if (process.argv.includes("--worker")) {
     (async () => {
         console.log("Running Multifrost v4 JavaScript tests...");
         await testSpawnMode();
+        await testSpawnModeWithHandle();
         await testConnectMode();
         console.log("\nAll tests passed!");
     })().catch(console.error);
 }
 
 async function testSpawnMode(): Promise<void> {
-    console.log("\n=== Test: Spawn Mode ===");
+    console.log("\n=== Test: Spawn Mode (Direct Worker) ===");
 
     // Spawn ourselves with --worker flag
     const worker = ParentWorker.spawn(`${__filename} --worker`, "npx tsx");
@@ -69,7 +70,33 @@ async function testSpawnMode(): Promise<void> {
         await worker.stop();
     }
 
-    console.log("  Spawn mode: PASSED");
+    console.log("  Spawn mode (direct): PASSED");
+}
+
+async function testSpawnModeWithHandle(): Promise<void> {
+    console.log("\n=== Test: Spawn Mode (Handle API) ===");
+
+    // Spawn ourselves with --worker flag
+    const worker = ParentWorker.spawn(`${__filename} --worker`, "npx tsx");
+    const handle = worker.handle();
+    await handle.start();
+
+    // Wait for connection
+    await new Promise(r => setTimeout(r, 500));
+
+    try {
+        const result = await handle.call.add(100, 200);
+        console.assert(result === 300, `Expected 300, got ${result}`);
+        console.log(`  add(100, 200) = ${result} OK`);
+
+        const result2 = await handle.call.asyncAdd(7, 8);
+        console.assert(result2 === 15, `Expected 15, got ${result2}`);
+        console.log(`  asyncAdd(7, 8) = ${result2} OK`);
+    } finally {
+        await handle.stop();
+    }
+
+    console.log("  Spawn mode (handle): PASSED");
 }
 
 async function testConnectMode(): Promise<void> {
@@ -86,16 +113,17 @@ async function testConnectMode(): Promise<void> {
 
     try {
         const parent = await ParentWorker.connect("test-service-v4-js", 5000);
-        await parent.start();
+        const handle = parent.handle();
+        await handle.start();
 
         // Wait for connection
         await new Promise(r => setTimeout(r, 300));
 
-        const result = await parent.call.multiply(4, 7);
+        const result = await handle.call.multiply(4, 7);
         console.assert(result === 28, `Expected 28, got ${result}`);
         console.log(`  multiply(4, 7) = ${result} OK`);
 
-        await parent.stop();
+        await handle.stop();
         console.log("  Connect mode: PASSED");
     } finally {
         serviceProcess.kill();
