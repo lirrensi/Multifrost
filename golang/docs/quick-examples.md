@@ -74,31 +74,33 @@ import (
 
 func main() {
     // Spawn the child worker
-    worker, err := multifrost.Spawn("./math_worker.go")
-    if err != nil {
-        log.Fatalf("Failed to spawn worker: %v", err)
-    }
+    worker := multifrost.Spawn("./math_worker.go", "go", "run")
+
+    // Get a handle (v4 pattern)
+    handle := worker.Handle()
 
     // Start the worker
-    if err := worker.Start(); err != nil {
+    if err := handle.Start(); err != nil {
         log.Fatalf("Failed to start worker: %v", err)
     }
-    defer worker.Close()
+    defer handle.Stop()
 
-    // Call methods synchronously
-    result1, err := worker.CallFunction(context.Background(), "Add", 5, 3)
+    ctx := context.Background()
+
+    // Call methods via the handle
+    result1, err := handle.Call(ctx, "Add", 5, 3)
     if err != nil {
         log.Fatalf("Add failed: %v", err)
     }
     fmt.Printf("5 + 3 = %d\n", result1.(int))
 
-    result2, err := worker.CallFunction(context.Background(), "Multiply", 4, 7)
+    result2, err := handle.Call(ctx, "Multiply", 4, 7)
     if err != nil {
         log.Fatalf("Multiply failed: %v", err)
     }
     fmt.Printf("4 * 7 = %d\n", result2.(int))
 
-    result3, err := worker.CallFunction(context.Background(), "Fibonacci", 10)
+    result3, err := handle.Call(ctx, "Fibonacci", 10)
     if err != nil {
         log.Fatalf("Fibonacci failed: %v", err)
     }
@@ -116,6 +118,46 @@ go run math_worker.go
 go run parent.go
 ```
 
+## Worker → Handle Pattern (v4)
+
+Starting with v4, the API separates process definition (Worker) from runtime interface (Handle):
+
+```
+Worker = config/state (holds socket, process, registry internally)
+Handle = lightweight API view (lifecycle + call interface)
+```
+
+### Handle Usage (Recommended)
+
+```go
+worker := multifrost.Spawn("./worker.go", "go", "run")
+handle := worker.Handle()
+
+if err := handle.Start(); err != nil {
+    log.Fatal(err)
+}
+defer handle.Stop()
+
+result, err := handle.Call(ctx, "MethodName", arg1, arg2)
+```
+
+### Legacy API (still available)
+
+```go
+// OLD (v3) - still works
+worker := multifrost.Spawn("./worker.go", "go", "run")
+worker.Start()
+result, err := worker.CallFunction(ctx, "MethodName", arg1, arg2)
+worker.Close()
+
+// NEW (v4) - recommended
+worker := multifrost.Spawn("./worker.go", "go", "run")
+handle := worker.Handle()
+handle.Start()
+result, err := handle.Call(ctx, "MethodName", arg1, arg2)
+handle.Stop()
+```
+
 ## Sync API (Idiomatic Go)
 
 Go uses synchronous calls with goroutines for concurrency - there's no async/await.
@@ -131,14 +173,16 @@ import (
 )
 
 func main() {
-    worker, err := multifrost.Spawn("./worker.go")
-    if err != nil {
-        log.Fatalf("Failed to spawn worker: %v", err)
+    worker := multifrost.Spawn("./worker.go", "go", "run")
+    handle := worker.Handle()
+    
+    if err := handle.Start(); err != nil {
+        log.Fatal(err)
     }
-    defer worker.Close()
+    defer handle.Stop()
 
     // Synchronous calls
-    result, err := worker.CallFunction(context.Background(), "MethodName", arg1, arg2)
+    result, err := handle.Call(context.Background(), "MethodName", arg1, arg2)
     if err != nil {
         log.Fatalf("Call failed: %v", err)
     }
@@ -182,23 +226,26 @@ import (
     "context"
     "fmt"
     "log"
+    "time"
     "github.com/yourusername/multifrost-go/multifrost"
 )
 
 func main() {
-    // Connect to existing service
     ctx := context.Background()
+    
+    // Connect to existing service
     worker, err := multifrost.Connect(ctx, "math-service", 5*time.Second)
     if err != nil {
         log.Fatalf("Failed to connect: %v", err)
     }
 
-    if err := worker.Start(); err != nil {
+    handle := worker.Handle()
+    if err := handle.Start(); err != nil {
         log.Fatalf("Failed to start worker: %v", err)
     }
-    defer worker.Close()
+    defer handle.Stop()
 
-    result, err := worker.CallFunction(ctx, "Add", 5, 3)
+    result, err := handle.Call(ctx, "Add", 5, 3)
     if err != nil {
         log.Fatalf("Add failed: %v", err)
     }
@@ -222,14 +269,16 @@ import (
 )
 
 func main() {
-    worker, err := multifrost.Spawn("./worker.go")
-    if err != nil {
-        log.Fatalf("Failed to spawn worker: %v", err)
+    worker := multifrost.Spawn("./worker.go", "go", "run")
+    handle := worker.Handle()
+    
+    if err := handle.Start(); err != nil {
+        log.Fatal(err)
     }
-    defer worker.Close()
+    defer handle.Stop()
 
     // Explicit error handling
-    result, err := worker.CallFunction(context.Background(), "Add", 1, 2)
+    result, err := handle.Call(context.Background(), "Add", 1, 2)
     if err != nil {
         // Check for specific error types
         if circuitErr, ok := err.(*multifrost.CircuitOpenError); ok {
@@ -251,7 +300,7 @@ func main() {
 ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 defer cancel()
 
-result, err := worker.CallFunctionWithTimeout(ctx, "MethodName", 10*time.Second, arg1, arg2)
+result, err := handle.CallWithTimeout(ctx, "MethodName", 10*time.Second, arg1, arg2)
 if err != nil {
     log.Printf("Call with timeout failed: %v", err)
 }
@@ -263,18 +312,19 @@ if err != nil {
 package main
 
 import (
-    "context"
     "fmt"
     "log"
     "github.com/yourusername/multifrost-go/multifrost"
 )
 
 func main() {
-    worker, err := multifrost.Spawn("./worker.go")
-    if err != nil {
-        log.Fatalf("Failed to spawn worker: %v", err)
+    worker := multifrost.Spawn("./worker.go", "go", "run")
+    handle := worker.Handle()
+    
+    if err := handle.Start(); err != nil {
+        log.Fatal(err)
     }
-    defer worker.Close()
+    defer handle.Stop()
 
     // List methods on the child
     methods := worker.ListFunctions()
@@ -288,20 +338,21 @@ func main() {
 package main
 
 import (
-    "context"
     "fmt"
     "log"
     "github.com/yourusername/multifrost-go/multifrost"
 )
 
 func main() {
-    worker, err := multifrost.Spawn("./worker.go")
-    if err != nil {
-        log.Fatalf("Failed to spawn worker: %v", err)
+    worker := multifrost.Spawn("./worker.go", "go", "run")
+    handle := worker.Handle()
+    
+    if err := handle.Start(); err != nil {
+        log.Fatal(err)
     }
-    defer worker.Close()
+    defer handle.Stop()
 
-    // Get metrics snapshot
+    // Get metrics snapshot (introspection on worker)
     metrics := worker.Metrics()
     snapshot := metrics.Snapshot()
 
@@ -338,20 +389,21 @@ func calculateAverage(latencies []float64) float64 {
 package main
 
 import (
-    "context"
     "fmt"
     "log"
     "github.com/yourusername/multifrost-go/multifrost"
 )
 
 func main() {
-    worker, err := multifrost.Spawn("./worker.go")
-    if err != nil {
-        log.Fatalf("Failed to spawn worker: %v", err)
+    worker := multifrost.Spawn("./worker.go", "go", "run")
+    handle := worker.Handle()
+    
+    if err := handle.Start(); err != nil {
+        log.Fatal(err)
     }
-    defer worker.Close()
+    defer handle.Stop()
 
-    // Check if worker is healthy
+    // Check if worker is healthy (introspection on worker)
     fmt.Printf("Healthy: %v\n", worker.IsHealthy())
     fmt.Printf("Circuit open: %v\n", worker.CircuitOpen())
     fmt.Printf("Last heartbeat RTT: %.2fms\n", worker.LastHeartbeatRttMs())
@@ -369,16 +421,13 @@ func main() {
 package main
 
 import (
-    "context"
     "log"
+    "time"
     "github.com/yourusername/multifrost-go/multifrost"
 )
 
 func main() {
-    worker, err := multifrost.Spawn("./worker.go")
-    if err != nil {
-        log.Fatalf("Failed to spawn worker: %v", err)
-    }
+    worker := multifrost.Spawn("./worker.go", "go", "run")
 
     // Configure auto-restart
     worker.Config.AutoRestart = true
@@ -389,10 +438,11 @@ func main() {
     worker.Config.HeartbeatMaxMisses = 3
     worker.Config.EnableMetrics = true
 
-    if err := worker.Start(); err != nil {
+    handle := worker.Handle()
+    if err := handle.Start(); err != nil {
         log.Fatalf("Failed to start worker: %v", err)
     }
-    defer worker.Close()
+    defer handle.Stop()
 
     // Worker will automatically restart on crash up to max attempts
     // ... usage
@@ -402,14 +452,15 @@ func main() {
 ## Key Concepts
 
 ### ParentWorker
-
 - **Purpose**: Initiates calls and manages child lifecycle
 - **Modes**: `Spawn()` (creates new process) or `Connect()` (connects to existing service)
-- **API**: Synchronous calls via `CallFunction()`
-- **Concurrency**: Goroutines handle background tasks (heartbeat, metrics)
+- **Introspection**: `IsHealthy()`, `CircuitOpen()`, `Metrics()`, `LastHeartbeatRttMs()`
+
+### Handle
+- **Purpose**: Lightweight API view for lifecycle and calls
+- **Methods**: `Start()`, `Stop()`, `Call()`, `CallWithTimeout()`, `CallWithContext()`
 
 ### ChildWorker
-
 - **Purpose**: Exposes callable methods and handles requests
 - **Methods**: Must be exported (capitalized) to be callable
 - **Modes**: Can register with `ServiceID` for connect mode
@@ -464,9 +515,9 @@ func (w *ChildWorker) handleFunctionCall(msg *ComlinkMessage, senderID []byte) {
 
 ```go
 // Check before making calls
-func (pw *ParentWorker) CallFunction(ctx context.Context, functionName string, args ...any) (any, error) {
-    if pw.circuitOpen {
-        return nil, &CircuitOpenError{ConsecutiveFailures: pw.consecutiveFailures}
+func (h *Handle) Call(ctx context.Context, functionName string, args ...any) (any, error) {
+    if h.worker.circuitOpen {
+        return nil, &CircuitOpenError{ConsecutiveFailures: h.worker.consecutiveFailures}
     }
     // ... proceed with call
 }
@@ -488,7 +539,7 @@ Use `context.Context` for cancellation:
 ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 defer cancel()
 
-result, err := worker.CallFunction(ctx, "MethodName", arg1, arg2)
+result, err := handle.Call(ctx, "MethodName", arg1, arg2)
 ```
 
 ## Go-Specific Implementation Details
@@ -516,7 +567,7 @@ Go requires explicit error handling:
 
 ```go
 // Always check errors
-result, err := worker.CallFunction(ctx, "MethodName", arg1)
+result, err := handle.Call(ctx, "MethodName", arg1)
 if err != nil {
     // Handle error
 }
@@ -557,7 +608,7 @@ func (pw *ParentWorker) recordFailure() {
 Use `defer` for cleanup:
 
 ```go
-func (pw *ParentWorker) Start() error {
+func (h *Handle) Start() error {
     defer func() {
         // Cleanup happens automatically
     }()
@@ -584,18 +635,16 @@ import (
 
 func main() {
     // Spawn Python worker
-    worker, err := multifrost.Spawn("./math_worker.py", "python")
-    if err != nil {
-        log.Fatalf("Failed to spawn worker: %v", err)
-    }
+    worker := multifrost.Spawn("./math_worker.py", "python")
+    handle := worker.Handle()
 
-    if err := worker.Start(); err != nil {
+    if err := handle.Start(); err != nil {
         log.Fatalf("Failed to start worker: %v", err)
     }
-    defer worker.Close()
+    defer handle.Stop()
 
     // Call Python method
-    result, err := worker.CallFunction(context.Background(), "factorial", 10)
+    result, err := handle.Call(context.Background(), "factorial", 10)
     if err != nil {
         log.Fatalf("Call failed: %v", err)
     }
@@ -649,12 +698,13 @@ import { ParentWorker } from "./src/multifrost";
 
 async function main() {
   const worker = ParentWorker.spawn("./child.go", "go");
-  await worker.start();
+  const handle = worker.handle();
+  await handle.start();
 
-  const result = await worker.call.add(5, 3);
+  const result = await handle.call.add(5, 3);
   console.log(`5 + 3 = ${result}`);
 
-  await worker.close();
+  await handle.stop();
 }
 
 main();
@@ -681,7 +731,7 @@ main();
 
 **Timeouts:**
 - Check `DefaultTimeout` configuration
-- Use `CallFunctionWithTimeout()` for custom timeouts
+- Use `CallWithTimeout()` for custom timeouts
 - Verify child can handle the request within timeout
 
 **Port conflicts:**

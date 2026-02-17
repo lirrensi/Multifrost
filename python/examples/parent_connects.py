@@ -29,15 +29,15 @@ async def parent_task(parent_id: int):
 
     try:
         worker = await ParentWorker.connect("math-service", timeout=5.0)
-        await worker.start()
+        handle = await worker.handle()
         print(f"Parent {parent_id}: Connected!")
 
         for i in range(3):
-            result = await worker.acall.add(parent_id * 10, i)
+            result = await handle.call.add(parent_id * 10, i)
             print(f"Parent {parent_id}: {parent_id * 10} + {i} = {result}")
             await asyncio.sleep(0.5)
 
-        await worker.close()
+        await handle.stop()
         print(f"Parent {parent_id}: Done")
     except Exception as e:
         print(f"Parent {parent_id}: Error - {e}")

@@ -46,18 +46,21 @@ async def main():
     # Spawn the child worker
     worker = ParentWorker.spawn("./math_worker.py")
 
-    # Start the worker
-    await worker.start()
+    # Get a handle (async mode)
+    handle = worker.handle()
 
-    # Call methods asynchronously
-    result1 = await worker.acall.add(5, 3)
+    # Start the worker
+    await handle.start()
+
+    # Call methods via the handle
+    result1 = await handle.call.add(5, 3)
     print(f"5 + 3 = {result1}")
 
-    result2 = await worker.acall.multiply(4, 7)
+    result2 = await handle.call.multiply(4, 7)
     print(f"4 * 7 = {result2}")
 
     # Clean up
-    await worker.close()
+    await handle.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -73,38 +76,58 @@ python math_worker.py
 python parent.py
 ```
 
-## Async vs Sync API
+## Worker → Handle Pattern (v4)
 
-### Async API (Recommended)
+Starting with v4, the API separates process definition (Worker) from runtime interface (Handle):
 
-For modern Python with `asyncio`:
+```
+Worker = config/state (holds socket, process, registry internally)
+Handle = lightweight API view (lifecycle + call interface)
+```
+
+### Async Handle (Recommended)
 
 ```python
 from multifrost import ParentWorker
 
 async def main():
-    async with ParentWorker.spawn("./worker.py") as worker:
-        result = await worker.acall.factorial(10)
-        print(f"Factorial: {result}")
+    worker = ParentWorker.spawn("./worker.py")
+    handle = worker.handle()  # Async handle
+
+    await handle.start()
+    result = await handle.call.add(1, 2)
+    await handle.stop()
 ```
 
-### Sync API (For non-async code)
-
-For codebases not yet ready for async/await:
+### Sync Handle
 
 ```python
 from multifrost import ParentWorker
 
 worker = ParentWorker.spawn("./worker.py")
-worker.sync.start()
+handle = worker.handle_sync()  # Sync handle
 
-result = worker.sync.call.add(1, 2)
-print(f"1 + 2 = {result}")
-
-worker.sync.close()
+handle.start()  # Blocking
+result = handle.call.add(1, 2)  # No await
+handle.stop()
 ```
 
-The sync wrapper runs an event loop in a background thread for you.
+### Context Manager Support
+
+```python
+# Async context manager
+async def main():
+    worker = ParentWorker.spawn("./worker.py")
+    async with worker.handle() as h:
+        result = await h.call.add(1, 2)
+    # Automatic cleanup
+
+# Sync context manager
+worker = ParentWorker.spawn("./worker.py")
+with worker.handle_sync() as h:
+    result = h.call.add(1, 2)
+# Automatic cleanup
+```
 
 ## Connect Mode
 
@@ -134,12 +157,13 @@ from multifrost import ParentWorker
 async def main():
     # Connect to the existing service
     worker = await ParentWorker.connect("math-service", timeout=5)
-    await worker.start()
+    handle = worker.handle()
+    await handle.start()
 
-    result = await worker.acall.add(5, 3)
+    result = await handle.call.add(5, 3)
     print(f"5 + 3 = {result}")
 
-    await worker.close()
+    await handle.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -152,25 +176,26 @@ if __name__ == "__main__":
 ```python
 async def main():
     worker = ParentWorker.spawn("./worker.py")
-    await worker.start()
+    handle = worker.handle()
+    await handle.start()
 
     try:
-        result = await worker.acall.add(1, 2)
+        result = await handle.call.add(1, 2)
         print(f"Result: {result}")
     except Exception as e:
         print(f"Error: {e}")
 
-    await worker.close()
+    await handle.stop()
 ```
 
 ### Method with Options
 
 ```python
 # Call with custom timeout and namespace
-result = await worker.withOptions({
+result = await handle.call.with_options(
     timeout=5000,
     namespace="my-namespace"
-}).add(1, 2)
+).add(1, 2)
 ```
 
 ### List Available Methods
@@ -178,13 +203,14 @@ result = await worker.withOptions({
 ```python
 async def main():
     worker = ParentWorker.spawn("./worker.py")
-    await worker.start()
+    handle = worker.handle()
+    await handle.start()
 
     # List methods on the child
-    methods = worker.call.list_functions()
+    methods = handle.call.list_functions()
     print(f"Available methods: {methods}")
 
-    await worker.close()
+    await handle.stop()
 ```
 
 ### Async Methods in Child
@@ -211,14 +237,15 @@ if __name__ == "__main__":
 ```python
 async def main():
     worker = ParentWorker.spawn("./worker.py")
-    await worker.start()
+    handle = worker.handle()
+    await handle.start()
 
-    # Get metrics
+    # Get metrics from worker (introspection)
     metrics = worker.metrics
     print(f"Total requests: {metrics.requests_total}")
     print(f"Success rate: {metrics.requests_success / metrics.requests_total if metrics.requests_total > 0 else 0}")
 
-    await worker.close()
+    await handle.stop()
 ```
 
 ### Health Checks
@@ -226,14 +253,15 @@ async def main():
 ```python
 async def main():
     worker = ParentWorker.spawn("./worker.py")
-    await worker.start()
+    handle = worker.handle()
+    await handle.start()
 
-    # Check if worker is healthy
+    # Check if worker is healthy (introspection on worker)
     print(f"Healthy: {worker.is_healthy}")
     print(f"Circuit open: {worker.circuit_open}")
     print(f"Last RTT: {worker.last_heartbeat_rtt_ms}")
 
-    await worker.close()
+    await handle.stop()
 ```
 
 ## Key Concepts
@@ -241,7 +269,12 @@ async def main():
 ### ParentWorker
 - **Purpose**: Initiates calls and manages child lifecycle
 - **Modes**: `spawn()` (creates new process) or `connect()` (connects to existing service)
-- **API**: Async (`acall.*`) or Sync (`call.*`)
+- **Introspection**: `is_healthy`, `circuit_open`, `metrics`, `last_heartbeat_rtt_ms`
+
+### ParentHandle / ParentHandleSync
+- **Purpose**: Lightweight API view for lifecycle and calls
+- **Methods**: `start()`, `stop()`, `call.*`
+- **Context manager**: `async with worker.handle() as h:` or `with worker.handle_sync() as h:`
 
 ### ChildWorker
 - **Purpose**: Exposes callable methods and handles requests
@@ -270,13 +303,14 @@ from multifrost import ParentWorker
 async def main():
     # Spawn JavaScript worker
     worker = ParentWorker.spawn("./math_worker.js", "node")
-    await worker.start()
+    handle = worker.handle()
+    await handle.start()
 
     # Call JavaScript method
-    result = await worker.acall.factorial(10)
+    result = await handle.call.factorial(10)
     print(f"Factorial: {result}")
 
-    await worker.close()
+    await handle.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())

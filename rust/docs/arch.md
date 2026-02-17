@@ -1175,6 +1175,72 @@ let socket = DealerSocket::bind("tcp://127.0.0.1:5555")?;
 | Memory Safety | GC | Ownership |
 | Zero-Copy | No | Yes (partial) |
 | Unsafe Code | No | No |
+| Handle Pattern | Yes (async + sync) | Yes (async only) |
+
+## Worker → Handle Pattern (v4)
+
+Starting with v4, the API separates process definition (Worker) from runtime interface (Handle):
+
+```rust
+// v4 recommended pattern
+let worker = ParentWorker::spawn("./worker", None, SpawnOptions::default()).await?;
+let handle = worker.handle();
+
+handle.start().await?;
+let result = handle.call("add", &[1.into(), 2.into()], None).await?;
+handle.stop().await?;
+```
+
+**Key concepts:**
+- **Worker** = config/state (holds socket, process, registry internally)
+- **Handle** = lightweight API view (call interface only)
+- Handle is cheap to create — multiple handles from same worker is fine
+- Rust's ownership model: `start()`/`stop()` must be called directly on worker (requires mutable access)
+
+**Rust-specific note:**
+
+In Rust, the Handle provides the call interface, but lifecycle methods (`start()`/`stop()`) remain on the worker due to Rust's ownership model requiring mutable access:
+
+```rust
+// Lifecycle on worker (requires mutable access)
+let mut worker = ParentWorker::spawn(...).await?;
+worker.start().await?;
+
+// Call interface via handle (borrows worker)
+let handle = worker.handle();
+let result = handle.call("add", &[1.into(), 2.into()], None).await?;
+
+// Cleanup on worker
+worker.stop().await;
+```
+
+### Handle Struct
+
+```rust
+pub struct Handle<'a> {
+    worker: &'a ParentWorker,
+}
+
+impl Handle<'_> {
+    /// Call a remote method
+    pub async fn call(&self, function: &str, args: Vec<Value>, options: Option<CallOptions>) -> Result<Value, ComlinkError>;
+    
+    /// Call with raw values
+    pub async fn call_raw(&self, function: &str, args: Vec<Value>) -> Result<Value, ComlinkError>;
+    
+    /// Call with timeout
+    pub async fn call_with_timeout(&self, function: &str, args: Vec<Value>, timeout: Duration) -> Result<Value, ComlinkError>;
+    
+    /// Check if worker is healthy
+    pub fn is_healthy(&self) -> bool;
+    
+    /// Check if circuit breaker is open
+    pub fn circuit_open(&self) -> bool;
+    
+    /// Get metrics snapshot
+    pub fn metrics(&self) -> MetricsSnapshot;
+}
+```
 
 ## Future Enhancements
 

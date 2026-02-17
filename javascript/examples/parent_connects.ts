@@ -21,16 +21,16 @@ async function parentTask(parentId: number): Promise<void> {
 
     try {
         const worker = await ParentWorker.connect("math-service", 5000);
-        await worker.start();
+        const handle = await worker.handle();
         console.log(`Parent ${parentId}: Connected!`);
 
         for (let i = 0; i < 3; i++) {
-            const result = await worker.call.add(parentId * 10, i);
+            const result = await handle.call.add(parentId * 10, i);
             console.log(`Parent ${parentId}: ${parentId * 10} + ${i} = ${result}`);
             await new Promise(resolve => setTimeout(resolve, 500));
         }
 
-        await worker.stop();
+        await handle.stop();
         console.log(`Parent ${parentId}: Done`);
     } catch (e) {
         console.error(`Parent ${parentId}: Error - ${e}`);

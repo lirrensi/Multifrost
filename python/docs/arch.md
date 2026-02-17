@@ -16,25 +16,58 @@ The Python implementation is built around Python's `asyncio` event loop:
 - **ChildWorker**: Manages a dedicated event loop in a daemon thread for async method handlers
 - **No blocking I/O**: All ZeroMQ operations are async; no explicit threading required for parent
 
+### Worker → Handle Pattern (v4)
+
+Starting with v4, the API separates process definition (Worker) from runtime interface (Handle):
+
 ```python
 # Async usage (recommended)
-async with ParentWorker.spawn("worker.py") as worker:
-    result = await worker.acall.factorial(10)
-```
+worker = ParentWorker.spawn("worker.py")  # Config (no process yet)
+handle = worker.handle()                   # Async handle
+await handle.start()                       # Spawn process, connect ZMQ
+result = await handle.call.add(1, 2)      # Remote calls
+await handle.stop()                        # Cleanup
 
-### Synchronous Wrapper
-
-For codebases not yet ready for async/await, Python provides a synchronous wrapper layer:
-
-```python
 # Sync usage
 worker = ParentWorker.spawn("worker.py")
-worker.sync.start()
-result = worker.sync.call.factorial(10)
-worker.sync.close()
+handle = worker.handle_sync()              # Sync handle
+handle.start()                             # Blocking start
+result = handle.call.add(1, 2)             # No await needed
+handle.stop()
+
+# Context manager support (async)
+async with worker.handle() as h:
+    result = await h.call.add(1, 2)
+
+# Context manager support (sync)
+with worker.handle_sync() as h:
+    result = h.call.add(1, 2)
 ```
 
-The wrapper internally manages an event loop in a background thread.
+**Key concepts:**
+- **Worker** = config/state (holds socket, process, registry internally)
+- **Handle** = lightweight API view (lifecycle + call interface)
+- Handle is cheap to create — multiple handles from same worker is fine
+- Handle mode is chosen once at creation, not per-call
+
+### Legacy API (deprecated but still available)
+
+For backwards compatibility, the old API is still available:
+
+```python
+# OLD (v3) - deprecated
+worker = ParentWorker.spawn("worker.py")
+await worker.start()
+result = await worker.acall.add(1, 2)  # confusing naming
+await worker.stop()
+
+# NEW (v4) - recommended
+worker = ParentWorker.spawn("worker.py")
+handle = worker.handle()
+await handle.start()
+result = await handle.call.add(1, 2)  # clean!
+await handle.stop()
+```
 
 ### Async Method Support
 
@@ -70,13 +103,13 @@ multifrost/
 ├── __init__.py          # Public API exports
 └── core/
     ├── __init__.py      # Core module exports
-    ├── async_worker.py  # ParentWorker implementation
+    ├── parent.py        # ParentWorker, ParentHandle, ParentHandleSync
     ├── child.py         # ChildWorker implementation
     ├── message.py       # Message serialization/parsing
     ├── service_registry.py  # Service discovery with locking
     ├── metrics.py       # Request tracking & statistics
     ├── logging.py       # Structured JSON logging
-    └── sync_wrapper.py  # Sync API over async core
+    └── sync_wrapper.py  # Legacy sync API over async core
 ```
 
 ### Core Components
@@ -239,7 +272,7 @@ else:
 **Message schema:**
 
 All messages have:
-- `app`: `"comlink_ipc_v3"`
+- `app`: `"comlink_ipc_v4"`
 - `id`: UUID v4 string
 - `type`: One of CALL, RESPONSE, ERROR, STDOUT, STDERR, HEARTBEAT, SHUTDOWN
 - `timestamp`: Unix epoch seconds (float)
@@ -267,6 +300,69 @@ Handles edge cases for cross-language interop:
 - `SyncWrapper`: Manages event loop and runs async calls
 - `SyncProxy`: Proxy object with method access (`worker.sync.method()`)
 - `AsyncProxy`: Proxy object with async method access (`worker.call.method()`)
+
+**Note:** In v4, prefer using `worker.handle_sync()` instead of `worker.sync.*`:
+
+```python
+# v4 recommended
+handle = worker.handle_sync()
+handle.start()
+result = handle.call.add(1, 2)
+handle.stop()
+
+# Legacy (still works)
+worker.sync.start()
+result = worker.sync.call.add(1, 2)
+worker.sync.close()
+```
+
+#### ParentHandle (`parent.py`)
+
+**Responsibilities:**
+
+- Provides async lifecycle and call interface
+- Delegates to ParentWorker's internal methods
+- Supports async context manager protocol
+
+**Key methods:**
+
+```python
+class ParentHandle:
+    def __init__(self, worker: ParentWorker):
+        self._worker = worker
+        self.call = CallProxy(worker)  # Remote call proxy
+    
+    async def start(self) -> None: ...
+    async def stop(self) -> None: ...
+    
+    # Context manager support
+    async def __aenter__(self) -> ParentHandle: ...
+    async def __aexit__(self, *args) -> None: ...
+```
+
+#### ParentHandleSync (`parent.py`)
+
+**Responsibilities:**
+
+- Provides synchronous lifecycle and call interface
+- Wraps async operations with blocking calls
+- Supports sync context manager protocol
+
+**Key methods:**
+
+```python
+class ParentHandleSync:
+    def __init__(self, worker: ParentWorker):
+        self._worker = worker
+        self.call = CallProxy(worker)  # Remote call proxy
+    
+    def start(self) -> None: ...  # Blocking
+    def stop(self) -> None: ...   # Blocking
+    
+    # Context manager support
+    def __enter__(self) -> ParentHandleSync: ...
+    def __exit__(self, *args) -> None: ...
+```
 
 **Event loop management:**
 
@@ -569,6 +665,43 @@ Located in `python/tests/`:
 
 ## Migration Guide
 
+### From v3 to v4 (Worker → Handle Pattern)
+
+The v4 API separates process definition (Worker) from runtime interface (Handle):
+
+```python
+# OLD (v3)
+worker = ParentWorker.spawn("worker.py")
+await worker.start()
+result = await worker.acall.add(1, 2)  # confusing naming!
+await worker.stop()
+
+# NEW (v4) - Async
+worker = ParentWorker.spawn("worker.py")
+handle = worker.handle()
+await handle.start()
+result = await handle.call.add(1, 2)  # clean!
+await handle.stop()
+
+# NEW (v4) - Sync
+worker = ParentWorker.spawn("worker.py")
+handle = worker.handle_sync()
+handle.start()
+result = handle.call.add(1, 2)
+handle.stop()
+
+# NEW (v4) - Context manager
+async with worker.handle() as h:
+    result = await h.call.add(1, 2)
+```
+
+**Key changes:**
+- `worker.acall.*` → `handle.call.*` (async handle)
+- `worker.sync.call.*` → `handle.call.*` (sync handle)
+- `worker.start()` → `handle.start()`
+- `worker.stop()` → `handle.stop()`
+- Context manager support on handle, not worker
+
 ### From JavaScript to Python
 
 If you have a JavaScript parent calling Python child:
@@ -578,17 +711,21 @@ If you have a JavaScript parent calling Python child:
    ```python
    from multifrost import ParentWorker
 
-   async with ParentWorker.spawn("worker.py") as worker:
-       result = await worker.acall.myFunction(arg1, arg2)
+   worker = ParentWorker.spawn("worker.py")
+   handle = worker.handle()
+   await handle.start()
+   result = await handle.call.myFunction(arg1, arg2)
+   await handle.stop()
    ```
-3. Or use sync wrapper:
+3. Or use sync handle:
    ```python
    from multifrost import ParentWorker
 
    worker = ParentWorker.spawn("worker.py")
-   worker.sync.start()
-   result = worker.sync.call.myFunction(arg1, arg2)
-   worker.sync.close()
+   handle = worker.handle_sync()
+   handle.start()
+   result = handle.call.myFunction(arg1, arg2)
+   handle.stop()
    ```
 
 ### From Python to JavaScript

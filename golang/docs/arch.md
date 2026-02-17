@@ -618,23 +618,69 @@ func NewParentWorker(config ParentWorkerConfig) *ParentWorker
     EnableMetrics      bool
 }
 
-// Lifecycle
+// Lifecycle (on worker - for process management)
 func (pw *ParentWorker) Start() error
 func (pw *ParentWorker) Close() error
 
-// Remote calls (synchronous)
-func (pw *ParentWorker) CallFunction(ctx context.Context, functionName string, args ...any) (any, error)
-func (pw *ParentWorker) CallFunctionWithTimeout(ctx context.Context, functionName string, timeout time.Duration, args ...any) (any, error)
+// Handle method (v4)
+func (pw *ParentWorker) Handle() *Handle
 
-// Proxy interfaces
-worker.Call.MethodName(args...)  // SyncProxy
-worker.ACall.MethodName(args...) // AsyncProxy (same as Call in Go)
-
-// Health & metrics
+// Health & metrics (introspection on worker)
 func (pw *ParentWorker) IsHealthy() bool
 func (pw *ParentWorker) CircuitOpen() bool
 func (pw *ParentWorker) LastHeartbeatRttMs() float64
 func (pw *ParentWorker) Metrics() *Metrics
+```
+
+### Handle (v4)
+
+The Handle provides a clean interface for lifecycle and calls:
+
+```go
+type Handle struct {
+    worker *ParentWorker
+    call   *CallProxy
+}
+
+// Lifecycle
+func (h *Handle) Start() error
+func (h *Handle) Stop() error
+
+// Remote calls
+func (h *Handle) Call(ctx context.Context, functionName string, args ...any) (any, error)
+func (h *Handle) CallWithTimeout(ctx context.Context, functionName string, timeout time.Duration, args ...any) (any, error)
+func (h *Handle) CallWithContext(ctx context.Context, functionName string, args ...any) (any, error)
+```
+
+**Usage:**
+
+```go
+worker := multifrost.Spawn("./math_worker.go", "go", "run")
+handle := worker.Handle()
+
+if err := handle.Start(); err != nil {
+    log.Fatal(err)
+}
+defer handle.Stop()
+
+result, err := handle.Call(ctx, "Add", 5, 3)
+```
+
+### Legacy API (still available)
+
+```go
+// OLD (v3) - still works
+worker := multifrost.Spawn("./math_worker.go", "go", "run")
+worker.Start()
+result, err := worker.CallFunction(ctx, "Add", 5, 3)
+worker.Close()
+
+// NEW (v4) - recommended
+worker := multifrost.Spawn("./math_worker.go", "go", "run")
+handle := worker.Handle()
+handle.Start()
+result, err := handle.Call(ctx, "Add", 5, 3)
+handle.Stop()
 ```
 
 ### ChildWorker
@@ -747,7 +793,7 @@ func TestMetrics_RequestTracking(t *testing.T) {
 
 | Feature | Go | Python | JavaScript |
 |---------|-----|--------|------------|
-| App ID | `comlink_ipc_v3` | `comlink_ipc_v3` | `comlink_ipc_v3` |
+| App ID | `comlink_ipc_v4` | `comlink_ipc_v4` | `comlink_ipc_v4` |
 | Socket types | DEALER/ROUTER | DEALER/ROUTER | DEALER/ROUTER |
 | Concurrency | Goroutines | Asyncio | Promises/async-await |
 | Method dispatch | Reflection | `getattr()` | Direct call |

@@ -110,7 +110,7 @@ export interface ComlinkMessageData {
 }
 
 export class ComlinkMessage {
-    public app: string = "comlink_ipc_v3";
+    public app: string = "comlink_ipc_v4";
     public id: string;
     public type: string;
     // ... more fields with typed accessors
@@ -153,10 +153,11 @@ Unlike Python, JavaScript has no synchronous IPC API:
 
 ```typescript
 // JavaScript is async-only
-const worker = await ParentWorker.spawn("./worker.js");
-await worker.start();
-const result = await worker.call.factorial(10);  // Promise-based
-await worker.stop();
+const worker = ParentWorker.spawn("./worker.js");
+const handle = worker.handle();
+await handle.start();
+const result = await handle.call.factorial(10);  // Promise-based
+await handle.stop();
 ```
 
 **Why no sync API?**
@@ -164,6 +165,43 @@ await worker.stop();
 - Node.js is single-threaded; blocking I/O would freeze the entire process
 - All async operations use the event loop efficiently
 - Blocking synchronous calls would defeat the purpose of async I/O
+
+### Worker → Handle Pattern (v4)
+
+Starting with v4, the API separates process definition (Worker) from runtime interface (Handle):
+
+```typescript
+// v4 recommended pattern
+const worker = ParentWorker.spawn("./worker.ts", "tsx");
+const handle = worker.handle();
+
+await handle.start();
+const result = await handle.call.add(1, 2);
+await handle.stop();
+```
+
+**Key concepts:**
+- **Worker** = config/state (holds socket, process, registry internally)
+- **Handle** = lightweight API view (lifecycle + call interface)
+- Handle is cheap to create — multiple handles from same worker is fine
+- JavaScript only has async handles (no sync variant)
+
+### Legacy API (still available for backwards compatibility)
+
+```typescript
+// OLD (v3) - still works
+const worker = ParentWorker.spawn("./worker.ts", "tsx");
+await worker.start();
+const result = await worker.call.add(1, 2);
+await worker.stop();
+
+// NEW (v4) - recommended
+const worker = ParentWorker.spawn("./worker.ts", "tsx");
+const handle = worker.handle();
+await handle.start();
+const result = await handle.call.add(1, 2);
+await handle.stop();
+```
 
 ### Child Process Management
 
@@ -529,20 +567,55 @@ static spawn(
         heartbeatTimeout?: number;
         heartbeatMaxMisses?: number;
     }
-): ParentWorker {
-    const port = ParentWorker.findFreePort();
-    return new ParentWorker({
-        scriptPath,
-        executable,
-        port,
-        autoRestart: options?.autoRestart,
-        maxRestartAttempts: options?.maxRestartAttempts,
-        defaultTimeout: options?.defaultTimeout,
-        heartbeatInterval: options?.heartbeatInterval,
-        heartbeatTimeout: options?.heartbeatTimeout,
-        heartbeatMaxMisses: options?.heartbeatMaxMisses,
-    });
+): ParentWorker
+```
+
+**Connect mode:**
+
+```typescript
+static async connect(serviceId: string, timeout: number = 5000): Promise<ParentWorker>
+```
+
+### Handle Methods
+
+```typescript
+// Get async handle (JavaScript only has async handles)
+worker.handle(): ParentHandle
+
+// Handle lifecycle
+handle.start(): Promise<void>
+handle.stop(): Promise<void>
+
+// Handle remote calls
+handle.call.methodName(...args): Promise<T>
+handle.call.withOptions({timeout?, namespace?}).methodName(...args): Promise<T>
+```
+
+### ParentHandle Class
+
+The Handle provides a clean interface for lifecycle and calls:
+
+```typescript
+class ParentHandle {
+    private worker: ParentWorker;
+    call: CallProxy;  // Proxy for remote method calls
+    
+    constructor(worker: ParentWorker) { ... }
+    
+    async start(): Promise<void> { ... }
+    async stop(): Promise<void> { ... }
 }
+```
+
+**Usage:**
+
+```typescript
+const worker = ParentWorker.spawn("./worker.ts", "tsx");
+const handle = worker.handle();
+
+await handle.start();
+const result = await handle.call.add(1, 2);
+await handle.stop();
 ```
 
 **Connect mode:**

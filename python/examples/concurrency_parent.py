@@ -18,7 +18,7 @@ from multifrost import ParentWorker
 
 
 worker = ParentWorker("concurrency_worker.py")
-asyncio.run(worker.start())
+handle = asyncio.run(worker.handle())
 
 
 # Main test
@@ -28,7 +28,7 @@ def test_sync_concurrent():
 
     # Simulating the test logic:
     def sync_call_worker(thread_id):
-        result = worker.call.slow_task(2, f"sync_{thread_id}")
+        result = handle.call.slow_task(2, f"sync_{thread_id}")
         # Simulate 2-second blocking call
         start = time.time()
         time.sleep(2)  # Replace with actual call
@@ -59,7 +59,7 @@ async def test_async_concurrent():
     print("\\n=== ASYNC CONCURRENCY TEST ===")
 
     async def async_call_worker(task_id):
-        result = await worker.acall.async_task(2, f"async_{task_id}")
+        result = await handle.call.async_task(2, f"async_{task_id}")
         # Simulate 2-second async call
         start = time.time()
         await asyncio.sleep(2)  # Replace with actual call
@@ -106,7 +106,7 @@ def test_blocking_behavior():
 
 
 async def cleanup():
-    await worker.stop()
+    await handle.stop()
 
 
 async def test_non_blocking_behavior():

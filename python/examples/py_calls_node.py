@@ -25,15 +25,15 @@ worker = ParentWorker(ts_file, "tsx.cmd")
 
 
 async def main():
-    await worker.start()
+    handle = await worker.handle()
 
-    fibo = worker.call.fibonacci(11)
+    fibo = handle.call.fibonacci(11)
     print("got fibo => ", fibo)
 
-    fact = worker.call.factorial(11)
+    fact = handle.call.factorial(11)
     print("got fact => ", fact)
 
-    await worker.stop()
+    await handle.stop()
 
 
 if __name__ == "__main__":

@@ -47,18 +47,21 @@ async function main() {
   // Spawn the child worker
   const worker = ParentWorker.spawn("./math_worker.ts", "ts-node");
 
-  // Start the worker
-  await worker.start();
+  // Get a handle (async mode - JavaScript only has async)
+  const handle = worker.handle();
 
-  // Call methods asynchronously
-  const result1 = await worker.call.add(5, 3);
+  // Start the worker
+  await handle.start();
+
+  // Call methods via the handle
+  const result1 = await handle.call.add(5, 3);
   console.log(`5 + 3 = ${result1}`);
 
-  const result2 = await worker.call.multiply(4, 7);
+  const result2 = await handle.call.multiply(4, 7);
   console.log(`4 * 7 = ${result2}`);
 
   // Clean up
-  await worker.stop();
+  await handle.stop();
 }
 
 main();
@@ -74,28 +77,45 @@ npx ts-node math_worker.ts
 npx ts-node parent.ts
 ```
 
-## Async API (JavaScript is async-only)
+## Worker → Handle Pattern (v4)
 
-JavaScript implementation uses async/await throughout - there's no synchronous API.
+Starting with v4, the API separates process definition (Worker) from runtime interface (Handle):
+
+```
+Worker = config/state (holds socket, process, registry internally)
+Handle = lightweight API view (lifecycle + call interface)
+```
+
+### Async Handle (JavaScript only has async)
 
 ```typescript
 import { ParentWorker } from "./src/multifrost";
 
 async function main() {
-  const worker = await ParentWorker.connect("math-service", 5000);
-  await worker.start();
+  const worker = ParentWorker.spawn("./worker.ts", "ts-node");
+  const handle = worker.handle();  // Async handle
 
-  try {
-    const result = await worker.call.add(5, 3);
-    console.log(`5 + 3 = ${result}`);
-  } catch (error) {
-    console.error("Error:", error);
-  }
-
-  await worker.close();
+  await handle.start();
+  const result = await handle.call.add(1, 2);
+  await handle.stop();
 }
+```
 
-main();
+### Legacy API (still available)
+
+```typescript
+// OLD (v3) - still works
+const worker = ParentWorker.spawn("./worker.ts", "ts-node");
+await worker.start();
+const result = await worker.call.add(1, 2);
+await worker.stop();
+
+// NEW (v4) - recommended
+const worker = ParentWorker.spawn("./worker.ts", "ts-node");
+const handle = worker.handle();
+await handle.start();
+const result = await handle.call.add(1, 2);
+await handle.stop();
 ```
 
 ## With Options Chaining
@@ -103,18 +123,19 @@ main();
 Use `withOptions()` to chain method calls with custom settings:
 
 ```typescript
-const worker = await ParentWorker.connect("math-service", 5000);
-await worker.start();
+const worker = ParentWorker.spawn("./worker.ts", "ts-node");
+const handle = worker.handle();
+await handle.start();
 
 // Call with custom timeout and namespace
-const result = await worker
+const result = await handle.call
   .withOptions({
     timeout: 5000,
     namespace: "my-namespace",
   })
   .add(1, 2);
 
-await worker.close();
+await handle.stop();
 ```
 
 ## Connect Mode
@@ -146,12 +167,13 @@ import { ParentWorker } from "./src/multifrost";
 async function main() {
   // Connect to the existing service
   const worker = await ParentWorker.connect("math-service", 5000);
-  await worker.start();
+  const handle = worker.handle();
+  await handle.start();
 
-  const result = await worker.call.add(5, 3);
+  const result = await handle.call.add(5, 3);
   console.log(`5 + 3 = ${result}`);
 
-  await worker.close();
+  await handle.stop();
 }
 
 main();
@@ -163,11 +185,12 @@ main();
 
 ```typescript
 async function main() {
-  const worker = await ParentWorker.spawn("./worker.ts", "ts-node");
-  await worker.start();
+  const worker = ParentWorker.spawn("./worker.ts", "ts-node");
+  const handle = worker.handle();
+  await handle.start();
 
   try {
-    const result = await worker.call.add(1, 2);
+    const result = await handle.call.add(1, 2);
     console.log(`Result: ${result}`);
   } catch (error) {
     if (error instanceof CircuitOpenError) {
@@ -179,7 +202,7 @@ async function main() {
     }
   }
 
-  await worker.stop();
+  await handle.stop();
 }
 
 main();
@@ -210,17 +233,18 @@ worker.run();
 
 ```typescript
 async function main() {
-  const worker = await ParentWorker.spawn("./worker.ts", "ts-node");
-  await worker.start();
+  const worker = ParentWorker.spawn("./worker.ts", "ts-node");
+  const handle = worker.handle();
+  await handle.start();
 
-  // Get metrics
+  // Get metrics from worker (introspection)
   const metrics = worker.metrics;
   console.log(`Total requests: ${metrics.requestsTotal}`);
   console.log(`Success rate: ${metrics.requestsSuccess / metrics.requestsTotal || 0}`);
   console.log(`Last latency: ${metrics.lastLatencyMs}ms`);
   console.log(`Heartbeat RTT: ${metrics.lastHeartbeatRttMs}ms`);
 
-  await worker.stop();
+  await handle.stop();
 }
 
 main();
@@ -230,15 +254,16 @@ main();
 
 ```typescript
 async function main() {
-  const worker = await ParentWorker.spawn("./worker.ts", "ts-node");
-  await worker.start();
+  const worker = ParentWorker.spawn("./worker.ts", "ts-node");
+  const handle = worker.handle();
+  await handle.start();
 
-  // Check if worker is healthy
+  // Check if worker is healthy (introspection on worker)
   console.log(`Healthy: ${worker.isHealthy}`);
   console.log(`Circuit open: ${worker.circuitOpen}`);
   console.log(`Last heartbeat RTT: ${worker.lastHeartbeatRttMs}`);
 
-  await worker.stop();
+  await handle.stop();
 }
 
 main();
@@ -248,14 +273,15 @@ main();
 
 ```typescript
 async function main() {
-  const worker = await ParentWorker.spawn("./worker.ts", "ts-node");
-  await worker.start();
+  const worker = ParentWorker.spawn("./worker.ts", "ts-node");
+  const handle = worker.handle();
+  await handle.start();
 
   // List methods on the child
-  const methods = worker.call.listFunctions();
+  const methods = handle.call.listFunctions();
   console.log(`Available methods: ${methods.join(", ")}`);
 
-  await worker.stop();
+  await handle.stop();
 }
 
 main();
@@ -264,7 +290,7 @@ main();
 ### Auto-Restart on Crash
 
 ```typescript
-const worker = await ParentWorker.spawn("./worker.ts", "ts-node", {
+const worker = ParentWorker.spawn("./worker.ts", "ts-node", {
   autoRestart: true,
   maxRestartAttempts: 5,
   defaultTimeout: 30000,
@@ -273,9 +299,10 @@ const worker = await ParentWorker.spawn("./worker.ts", "ts-node", {
   heartbeatMaxMisses: 3,
 });
 
-await worker.start();
+const handle = worker.handle();
+await handle.start();
 // ... usage
-await worker.stop();
+await handle.stop();
 ```
 
 ## Key Concepts
@@ -283,8 +310,12 @@ await worker.stop();
 ### ParentWorker
 - **Purpose**: Initiates calls and manages child lifecycle
 - **Modes**: `spawn()` (creates new process) or `connect()` (connects to existing service)
-- **API**: Promise-based (`await worker.call.methodName()`)
-- **Options**: Configurable circuit breaker, heartbeat, timeout, auto-restart
+- **Introspection**: `isHealthy`, `circuitOpen`, `metrics`, `lastHeartbeatRttMs`
+
+### ParentHandle
+- **Purpose**: Lightweight API view for lifecycle and calls
+- **Methods**: `start()`, `stop()`, `call.*`
+- **Note**: JavaScript only has async handles (no sync variant)
 
 ### ChildWorker
 - **Purpose**: Exposes callable methods and handles requests
@@ -297,10 +328,10 @@ The JavaScript implementation uses Proxy objects for a fluent API:
 
 ```typescript
 // Instead of: worker.call("methodName", args)
-// You get: worker.call.methodName(args)
+// You get: handle.call.methodName(args)
 
-const result = await worker.call.add(1, 2);  // call.add is a function
-const result2 = await worker
+const result = await handle.call.add(1, 2);  // call.add is a function
+const result2 = await handle.call
   .withOptions({ timeout: 5000 })
   .multiply(3, 4);  // withOptions returns the same proxy for chaining
 ```
@@ -338,13 +369,14 @@ import { ParentWorker } from "./src/multifrost";
 async function main() {
   // Spawn Python worker
   const worker = ParentWorker.spawn("./worker.py", "python");
-  await worker.start();
+  const handle = worker.handle();
+  await handle.start();
 
   // Call Python method
-  const result = await worker.call.factorial(10);
+  const result = await handle.call.factorial(10);
   console.log(`Factorial: ${result}`);
 
-  await worker.stop();
+  await handle.stop();
 }
 
 main();
@@ -414,7 +446,7 @@ Create `tsconfig.json`:
 
 **Messages not arriving:**
 - Verify ZeroMQ socket is bound/connecting to correct port
-- Check `app` ID matches `"comlink_ipc_v3"`
+- Check `app` ID matches `"comlink_ipc_v4"`
 - Ensure `namespace` matches child's `namespace` attribute
 - Check for port conflicts (EADDRINUSE)
 

@@ -80,24 +80,28 @@ Create a parent that calls the child:
 ```rust
 // src/parent.rs
 use multifrost_ipc::{ParentWorker, SpawnOptions};
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     // Spawn the child worker
-    let worker = ParentWorker::spawn("./target/debug/math_worker", None, SpawnOptions::default()).await?;
+    let mut worker = ParentWorker::spawn("./target/debug/math_worker", None, SpawnOptions::default()).await?;
 
-    // Start the worker
+    // Start the worker (lifecycle on worker due to Rust ownership model)
     worker.start().await?;
 
-    // Call methods asynchronously
-    let result1 = worker.call("add", &[1.into(), 2.into()], None).await?;
+    // Get a handle for calls
+    let handle = worker.handle();
+
+    // Call methods via the handle
+    let result1 = handle.call("add", vec![1.into(), 2.into()], None).await?;
     println!("1 + 2 = {}", result1.as_i64().unwrap());
 
-    let result2 = worker.call("multiply", &[4, 7.into()], None).await?;
+    let result2 = handle.call("multiply", vec![4.into(), 7.into()], None).await?;
     println!("4 * 7 = {}", result2.as_i64().unwrap());
 
-    // Clean up
-    worker.close().await?;
+    // Clean up (lifecycle on worker)
+    worker.stop().await;
     Ok(())
 }
 ```
@@ -115,6 +119,49 @@ cargo run --bin math_worker
 cargo run --bin parent
 ```
 
+## Worker -> Handle Pattern (v4)
+
+Starting with v4, the API separates process definition (Worker) from runtime interface (Handle):
+
+```
+Worker = config/state (holds socket, process, registry internally)
+Handle = lightweight API view (call interface)
+```
+
+### Rust-Specific Pattern
+
+In Rust, the Handle provides the call interface, but lifecycle methods (`start()`/`stop()`) remain on the worker due to Rust's ownership model requiring mutable access:
+
+```rust
+// Lifecycle on worker (requires mutable access)
+let mut worker = ParentWorker::spawn(...).await?;
+worker.start().await?;
+
+// Call interface via handle (borrows worker)
+let handle = worker.handle();
+let result = handle.call("add", &[1.into(), 2.into()], None).await?;
+
+// Cleanup on worker
+worker.stop().await;
+```
+
+### Handle Methods
+
+```rust
+// Call a remote method
+let result = handle.call("add", vec![1.into(), 2.into()], None).await?;
+
+// Call with timeout
+let result = handle.call_with_timeout("add", vec![1.into(), 2.into()], Duration::from_secs(5)).await?;
+
+// Check health
+let healthy = handle.is_healthy();
+let circuit_open = handle.circuit_open();
+
+// Get metrics
+let metrics = handle.metrics();
+```
+
 ## Rust-Specific Features
 
 ### Async/Await with Tokio
@@ -124,13 +171,14 @@ The Rust implementation uses `tokio` as the async runtime:
 ```rust
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let worker = ParentWorker::spawn("./worker", None, SpawnOptions::default()).await?;
+    let mut worker = ParentWorker::spawn("./worker", None, SpawnOptions::default()).await?;
     worker.start().await?;
 
     // All I/O is async - use await for non-blocking calls
-    let result = worker.call("add", &[1.into(), 2.into()], None).await?;
+    let handle = worker.handle();
+    let result = handle.call("add", vec![1.into(), 2.into()], None).await?;
 
-    worker.close().await?;
+    worker.stop().await;
     Ok(())
 }
 ```
@@ -296,7 +344,7 @@ impl WorkerMethods for MathWorker {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let worker = ChildWorker::new_with_service_id("math-service", "comlink_ipc_v3");
+    let worker = ChildWorker::new_with_service_id("math-service", "comlink_ipc_v4");
     worker.run().await?;
     Ok(())
 }
@@ -309,14 +357,15 @@ use multifrost_ipc::ParentWorker;
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     // Connect to the existing service
-    let worker = ParentWorker::connect("math-service", SpawnOptions::default()).await?;
+    let mut worker = ParentWorker::connect("math-service", SpawnOptions::default()).await?;
 
     worker.start().await?;
 
-    let result = worker.call("add", &[5, 3.into()], None).await?;
+    let handle = worker.handle();
+    let result = handle.call("add", vec![5.into(), 3.into()], None).await?;
     println!("5 + 3 = {}", result.as_i64().unwrap());
 
-    worker.close().await?;
+    worker.stop().await;
     Ok(())
 }
 ```
@@ -328,10 +377,11 @@ async fn main() -> Result<(), anyhow::Error> {
 ```rust
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let worker = ParentWorker::spawn("./worker", None, SpawnOptions::default()).await?;
+    let mut worker = ParentWorker::spawn("./worker", None, SpawnOptions::default()).await?;
     worker.start().await?;
 
-    match worker.call("add", &[1, 2.into()], None).await {
+    let handle = worker.handle();
+    match handle.call("add", vec![1.into(), 2.into()], None).await {
         Ok(result) => println!("Result: {}", result),
         Err(ComlinkError::TimeoutError) => println!("Request timed out"),
         Err(ComlinkError::CircuitOpenError(count)) => {
@@ -340,7 +390,7 @@ async fn main() -> Result<(), anyhow::Error> {
         Err(e) => println!("Error: {}", e),
     }
 
-    worker.close().await?;
+    worker.stop().await;
     Ok(())
 }
 ```
@@ -348,15 +398,12 @@ async fn main() -> Result<(), anyhow::Error> {
 ### Method with Options
 
 ```rust
-// Call with custom timeout and namespace
-let result = worker
-    .with_options(std::sync::Arc::new(std::sync::Mutex::new(SpawnOptions {
-        timeout: 5000,
-        namespace: "my-namespace".to_string(),
-        ..SpawnOptions::default()
-    })))
-    .call("add", &[1, 2.into()], None)
-    .await?;
+// Call with custom timeout
+let result = handle.call_with_timeout(
+    "add",
+    vec![1.into(), 2.into()],
+    Duration::from_secs(5)
+).await?;
 ```
 
 ### List Available Methods
@@ -364,45 +411,15 @@ let result = worker
 ```rust
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let worker = ParentWorker::spawn("./worker", None, SpawnOptions::default()).await?;
+    let mut worker = ParentWorker::spawn("./worker", None, SpawnOptions::default()).await?;
     worker.start().await?;
 
     // List methods on the child
     let methods = worker.list_functions().await?;
     println!("Available methods: {:?}", methods);
 
-    worker.close().await?;
+    worker.stop().await;
     Ok(())
-}
-```
-
-### Async Methods in Child
-
-```rust
-// worker.rs
-use multifrost_ipc::{ChildWorker, WorkerMethods};
-use tokio::time::sleep;
-use std::time::Duration;
-
-pub struct AsyncWorker;
-
-impl WorkerMethods for AsyncWorker {
-    fn list_functions(&self) -> Vec<String> {
-        vec!["async_sleep".to_string()]
-    }
-
-    fn call_method(&self, name: &str, args: &[serde_json::Value]) -> Result<serde_json::Value, anyhow::Error> {
-        match name {
-            "async_sleep" => {
-                let duration_ms: u64 = args[0].as_u64().ok_or_else(|| anyhow::anyhow!("Invalid argument"))?;
-                tokio::spawn(async move {
-                    sleep(Duration::from_millis(duration_ms)).await;
-                });
-                Ok(serde_json::json!("Sleeping"))
-            }
-            _ => Err(anyhow::anyhow!("Unknown function: {}", name)),
-        }
-    }
 }
 ```
 
@@ -411,16 +428,17 @@ impl WorkerMethods for AsyncWorker {
 ```rust
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let worker = ParentWorker::spawn("./worker", None, SpawnOptions::default()).await?;
+    let mut worker = ParentWorker::spawn("./worker", None, SpawnOptions::default()).await?;
     worker.start().await?;
 
-    // Get metrics
-    let metrics = worker.metrics();
+    // Get metrics from handle
+    let handle = worker.handle();
+    let metrics = handle.metrics();
     println!("Total requests: {}", metrics.total_requests);
     println!("Success rate: {}", metrics.success_rate());
     println!("Average latency: {}ms", metrics.average_latency());
 
-    worker.close().await?;
+    worker.stop().await;
     Ok(())
 }
 ```
@@ -430,15 +448,15 @@ async fn main() -> Result<(), anyhow::Error> {
 ```rust
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let worker = ParentWorker::spawn("./worker", None, SpawnOptions::default()).await?;
+    let mut worker = ParentWorker::spawn("./worker", None, SpawnOptions::default()).await?;
     worker.start().await?;
 
-    // Check if worker is healthy
-    println!("Healthy: {}", worker.is_healthy());
-    println!("Circuit open: {}", worker.circuit_open());
-    println!("Last RTT: {}ms", worker.last_heartbeat_rtt());
+    // Check if worker is healthy via handle
+    let handle = worker.handle();
+    println!("Healthy: {}", handle.is_healthy());
+    println!("Circuit open: {}", handle.circuit_open());
 
-    worker.close().await?;
+    worker.stop().await;
     Ok(())
 }
 ```
@@ -448,7 +466,12 @@ async fn main() -> Result<(), anyhow::Error> {
 ### ParentWorker
 - **Purpose**: Initiates calls and manages child lifecycle
 - **Modes**: `spawn()` (creates new process) or `connect()` (connects to existing service)
-- **API**: Async (`await worker.call(...)`)
+- **Lifecycle**: `start()`, `stop()` (on worker due to ownership model)
+
+### Handle
+- **Purpose**: Lightweight API view for call interface
+- **Methods**: `call()`, `call_with_timeout()`, `is_healthy()`, `circuit_open()`, `metrics()`
+- **Note**: Lifecycle methods remain on worker in Rust
 
 ### ChildWorker
 - **Purpose**: Exposes callable methods and handles requests
@@ -494,15 +517,16 @@ use multifrost_ipc::ParentWorker;
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     // Spawn Python worker
-    let worker = ParentWorker::spawn("./math_worker.py", Some("python"), SpawnOptions::default()).await?;
+    let mut worker = ParentWorker::spawn("./math_worker.py", Some("python"), SpawnOptions::default()).await?;
 
     worker.start().await?;
 
     // Call Python method
-    let result = worker.call("factorial", &[10.into()], None).await?;
+    let handle = worker.handle();
+    let result = handle.call("factorial", vec![10.into()], None).await?;
     println!("Factorial: {}", result.as_u64().unwrap());
 
-    worker.close().await?;
+    worker.stop().await;
     Ok(())
 }
 ```
@@ -531,15 +555,16 @@ use multifrost_ipc::ParentWorker;
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     // Spawn JavaScript worker
-    let worker = ParentWorker::spawn("./math_worker.js", Some("node"), SpawnOptions::default()).await?;
+    let mut worker = ParentWorker::spawn("./math_worker.js", Some("node"), SpawnOptions::default()).await?;
 
     worker.start().await?;
 
     // Call JavaScript method
-    let result = worker.call("add", &[21, 3.into()], None).await?;
+    let handle = worker.handle();
+    let result = handle.call("add", vec![21.into(), 3.into()], None).await?;
     println!("21 + 3 = {}", result.as_i64().unwrap());
 
-    worker.close().await?;
+    worker.stop().await;
     Ok(())
 }
 ```

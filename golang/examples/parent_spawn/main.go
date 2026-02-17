@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
 	"time"
@@ -13,19 +12,17 @@ func main() {
 	// Spawn a Go child worker
 	worker := multifrost.Spawn("examples/math_worker", "go", "run")
 
-	if err := worker.Start(); err != nil {
+	handle := worker.Handle()
+	if err := handle.Start(); err != nil {
 		log.Fatalf("Failed to start worker: %v", err)
 	}
-	defer worker.Close()
+	defer handle.Stop()
 
 	// Wait for worker to be ready
 	time.Sleep(1 * time.Second)
 
-	// Call remote functions
-	ctx := context.Background()
-
 	// Add
-	result, err := worker.ACall.Call(ctx, "Add", 5, 3)
+	result, err := handle.Call("Add", 5, 3)
 	if err != nil {
 		log.Printf("Add failed: %v", err)
 	} else {
@@ -33,7 +30,7 @@ func main() {
 	}
 
 	// Subtract
-	result, err = worker.ACall.Call(ctx, "Subtract", 10, 4)
+	result, err = handle.Call("Subtract", 10, 4)
 	if err != nil {
 		log.Printf("Subtract failed: %v", err)
 	} else {
@@ -41,7 +38,7 @@ func main() {
 	}
 
 	// Multiply
-	result, err = worker.ACall.Call(ctx, "Multiply", 6, 7)
+	result, err = handle.Call("Multiply", 6, 7)
 	if err != nil {
 		log.Printf("Multiply failed: %v", err)
 	} else {
@@ -49,7 +46,7 @@ func main() {
 	}
 
 	// Greet
-	result, err = worker.ACall.Call(ctx, "Greet", "World")
+	result, err = handle.Call("Greet", "World")
 	if err != nil {
 		log.Printf("Greet failed: %v", err)
 	} else {
