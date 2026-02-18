@@ -1,13 +1,17 @@
 {
     "name": "multifrost",
     "version": "4.0.0",
-    "description": "Simple IPC library for Python and Node.js inspired by comlink.js",
+    "description": "Cross-language IPC library for Python, Node.js, Go, and Rust",
     "license": "MIT",
     "author": "lirrensi",
     "type": "module",
     "main": "index.ts",
     "scripts": {
-        "test": "echo \"Error: no test specified\" && exit 1"
+        "test": "npx tsx tests/test.test.ts",
+        "lint": "eslint src/",
+        "format": "prettier --write \"src/**/*.ts\"",
+        "format:check": "prettier --check \"src/**/*.ts\"",
+        "typecheck": "tsc --noEmit"
     },
     "dependencies": {
         "msgpackr": "^1.11.8",
@@ -19,6 +23,9 @@
         "@types/node": "^22.19.11",
         "@types/pidusage": "^2.0.5",
         "@types/proper-lockfile": "^4.1.4",
-        "typescript": "^5.9.3"
+        "typescript": "^5.9.3",
+        "prettier": "^3.0.0",
+        "eslint": "^9.0.0",
+        "typescript-eslint": "^8.0.0"
     }
 }
