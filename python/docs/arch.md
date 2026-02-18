@@ -808,6 +808,6 @@ async with ParentWorker.spawn("worker.py") as worker:
 ### Messages not arriving
 
 - Verify ZeroMQ socket is bound/connecting to correct port
-- Check `app` ID matches `"comlink_ipc_v3"`
+- Check `app` ID matches `"comlink_ipc_v4"`
 - Ensure `namespace` matches child's `namespace` attribute
 - Check for port conflicts (EADDRINUSE)

@@ -1383,7 +1383,7 @@ static async unregister(serviceId: string): Promise<void> {
 
 | Feature | JavaScript | Python | Go | Rust |
 |---------|------------|--------|-----|------|
-| App ID | `comlink_ipc_v3` | `comlink_ipc_v3` | `comlink_ipc_v3` | `comlink_ipc_v3` |
+| App ID | `comlink_ipc_v4` | `comlink_ipc_v4` | `comlink_ipc_v4` | `comlink_ipc_v4` |
 | Socket types | DEALER/ROUTER | DEALER/ROUTER | DEALER/ROUTER | DEALER/ROUTER |
 | Concurrency | async/await | asyncio | Goroutines | tokio |
 | Method dispatch | Direct call | getattr() | Reflection | Trait-based |
@@ -1618,7 +1618,7 @@ try {
 ### Messages not arriving
 
 - Verify ZeroMQ socket is bound/connecting to correct port
-- Check `app` ID matches `"comlink_ipc_v3"`
+- Check `app` ID matches `"comlink_ipc_v4"`
 - Ensure `namespace` matches child's `namespace` attribute
 - Check for port conflicts (EADDRINUSE)
 

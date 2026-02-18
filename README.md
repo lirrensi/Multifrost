@@ -1,6 +1,6 @@
 # Multifrost 🌈🏳️‍🌈🏳️‍🌈🏳️‍🌈🏳️‍🌈🏳️‍🌈🏳️‍🌈🏳️‍🌈🏳️‍🌈
 
-> **"Bifrost but more powerful!"** - A rainbow bridge for your environments across spaces. Microservices made easy. Ditch making REST API connectors everywhere!
+> A rainbow bridge for your environments across spaces. Microservices made easy. Ditch making REST API connectors everywhere!
 
 Multifrost is a high-performance inter-process communication (IPC) library that enables seamless communication between processes written in different languages. Think of it as a language-agnostic bridge that lets Python talk to Node.js, Go talk to Rust, and everything in between—without writing a single REST API or gRPC endpoint.
 
@@ -24,15 +24,16 @@ import asyncio
 from multifrost import ParentWorker
 
 async def main():
-    # Spawn the child process
-    worker = await ParentWorker.spawn("worker.py")
-    await worker.start()
+    # Spawn the child process (v4 API)
+    worker = ParentWorker.spawn("worker.py")
+    handle = worker.handle()
+    await handle.start()
 
-    # Call remote functions (async API)
-    result = await worker.acall.add(5, 3)
+    # Call remote functions
+    result = await handle.call.add(5, 3)
     print(f"5 + 3 = {result}")
 
-    await worker.close()
+    await handle.stop()
 
 asyncio.run(main())
 ```
@@ -60,14 +61,15 @@ import { ParentWorker } from 'multifrost';
 
 async function main() {
     // Spawn a Python worker (e.g., PyTorch/TensorFlow model)
-    const worker = await ParentWorker.spawn('./ml_worker.py', 'python');
-    await worker.start();
+    const worker = ParentWorker.spawn('./ml_worker.py', 'python');
+    const handle = worker.handle();
+    await handle.start();
 
     // Call your ML model
-    const prediction = await worker.call.predict([0.1, 0.2, 0.3]);
+    const prediction = await handle.call.predict([0.1, 0.2, 0.3]);
     console.log('Prediction:', prediction);
 
-    await worker.stop();
+    await handle.stop();
 }
 
 main().catch(console.error);
@@ -104,15 +106,17 @@ import (
 func main() {
     // Spawn a Go child worker
     worker := multifrost.Spawn("examples/math_worker", "go", "run")
-    if err := worker.Start(); err != nil {
+    handle := worker.Handle()
+
+    if err := handle.Start(); err != nil {
         log.Fatalf("Failed to start worker: %v", err)
     }
-    defer worker.Close()
+    defer handle.Stop()
 
     ctx := context.Background()
 
     // Call remote functions
-    result, err := worker.ACall.Call(ctx, "Add", 5, 3)
+    result, err := handle.Call(ctx, "Add", 5, 3)
     if err != nil {
         log.Printf("Add failed: %v", err)
     } else {
@@ -137,17 +141,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join("examples")
         .join("math_worker");
 
-    let mut worker = ParentWorkerBuilder::spawn("", worker_path.to_str().unwrap())
+    let worker = ParentWorkerBuilder::spawn("", worker_path.to_str().unwrap())
         .build()
         .await?;
 
-    worker.start().await?;
+    let handle = worker.handle();
+    handle.start().await?;
 
     // Use the call! macro for ergonomic calls
-    let result: i64 = worker.call!(add(10, 20)).await?;
+    let result: i64 = handle.call!(add(10, 20)).await?;
     println!("add(10, 20) = {}", result);
 
-    worker.stop().await;
+    handle.stop().await;
     Ok(())
 }
 ```
@@ -185,13 +190,14 @@ import asyncio
 from multifrost import ParentWorker
 
 async def main():
-    worker = await ParentWorker.connect("math-service", timeout=5.0)
-    await worker.start()
+    worker = ParentWorker.connect("math-service", timeout=5.0)
+    handle = worker.handle()
+    await handle.start()
 
-    result = await worker.acall.add(5, 3)
+    result = await handle.call.add(5, 3)
     print(f"5 + 3 = {result}")
 
-    await worker.close()
+    await handle.stop()
 
 asyncio.run(main())
 ```
@@ -224,13 +230,14 @@ new MathWorker().run();
 // Terminal 2: Connect and call
 import { ParentWorker } from 'multifrost';
 
-const worker = await ParentWorker.connect("math-service", 5000);
-await worker.start();
+const worker = ParentWorker.connect("math-service", 5000);
+const handle = worker.handle();
+await handle.start();
 
-const result = await worker.call.add(5, 3);
+const result = await handle.call.add(5, 3);
 console.log(`5 + 3 = ${result}`);
 
-await worker.stop();
+await handle.stop();
 ```
 
 ### Rust: Connect to a Service
@@ -246,13 +253,14 @@ use multifrost::{ParentWorker, call};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut worker = ParentWorker::connect("math-service", 5000).await?;
-    worker.start().await?;
+    let worker = ParentWorker::connect("math-service", 5000).await?;
+    let handle = worker.handle();
+    handle.start().await?;
 
-    let result: i64 = worker.call!(add(10, 20)).await?;
+    let result: i64 = handle.call!(add(10, 20)).await?;
     println!("add(10, 20) = {}", result);
 
-    worker.stop().await;
+    handle.stop().await;
     Ok(())
 }
 ```
@@ -325,7 +333,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     - CALL → RESPONSE (success) or ERROR (failure)
     - Full bidirectional communication
 
-4. **Protocol Version**: Uses `comlink_ipc_v3` app ID for version negotiation
+4. **Protocol Version**: Uses `comlink_ipc_v4` app ID for version negotiation
 
 ## 🎯 Features
 
