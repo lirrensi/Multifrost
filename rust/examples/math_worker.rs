@@ -15,22 +15,28 @@ impl ChildWorker for MathWorker {
     async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value> {
         match function {
             "add" => {
-                let a = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
-                let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+                let a = args.get(0).and_then(|v| v.as_i64())
+                    .ok_or_else(|| MultifrostError::InvalidMessage("arg[0] must be an integer".into()))?;
+                let b = args.get(1).and_then(|v| v.as_i64())
+                    .ok_or_else(|| MultifrostError::InvalidMessage("arg[1] must be an integer".into()))?;
                 Ok(serde_json::json!(a + b))
             }
             "multiply" => {
-                let a = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
-                let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
+                let a = args.get(0).and_then(|v| v.as_i64())
+                    .ok_or_else(|| MultifrostError::InvalidMessage("arg[0] must be an integer".into()))?;
+                let b = args.get(1).and_then(|v| v.as_i64())
+                    .ok_or_else(|| MultifrostError::InvalidMessage("arg[1] must be an integer".into()))?;
                 Ok(serde_json::json!(a * b))
             }
             "factorial" => {
-                let n = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+                let n = args.get(0).and_then(|v| v.as_u64())
+                    .ok_or_else(|| MultifrostError::InvalidMessage("arg[0] must be a non-negative integer".into()))?;
                 let result: u64 = (1..=n).product();
                 Ok(serde_json::json!(result))
             }
             "fibonacci" => {
-                let n = args.get(0).and_then(|v| v.as_u64()).unwrap_or(0);
+                let n = args.get(0).and_then(|v| v.as_u64())
+                    .ok_or_else(|| MultifrostError::InvalidMessage("arg[0] must be a non-negative integer".into()))?;
                 let result = fibonacci(n);
                 Ok(serde_json::json!(result))
             }

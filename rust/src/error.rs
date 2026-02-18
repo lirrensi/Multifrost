@@ -46,6 +46,9 @@ pub enum MultifrostError {
 
     #[error("msgpack size limit exceeded: {0}")]
     MsgpackSizeLimit(String),
+
+    #[error("Configuration error: {0}")]
+    ConfigError(String),
 }
 
 pub type Result<T> = std::result::Result<T, MultifrostError>;

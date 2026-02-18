@@ -7,7 +7,7 @@
 //!
 //! ## Child Worker
 //! ```rust,no_run
-//! use multifrost::{ChildWorker, ChildWorkerContext, run_worker, Result};
+//! use multifrost::{ChildWorker, ChildWorkerContext, run_worker, Result, MultifrostError};
 //! use async_trait::async_trait;
 //! use serde_json::Value;
 //!
@@ -18,11 +18,16 @@
 //!     async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value> {
 //!         match function {
 //!             "add" => {
-//!                 let a = args[0].as_i64().unwrap();
-//!                 let b = args[1].as_i64().unwrap();
+//!                 // Use ArgsExtractor for safe argument extraction with clear error messages
+//!                 use multifrost::ArgsExtractor;
+//!                 let mut args = ArgsExtractor::new(args);
+//!                 let a = args.take_i64()?.ok_or_else(|| 
+//!                     MultifrostError::InvalidMessage("arg[0] must be an integer".into()))?;
+//!                 let b = args.take_i64()?.ok_or_else(|| 
+//!                     MultifrostError::InvalidMessage("arg[1] must be an integer".into()))?;
 //!                 Ok(serde_json::json!(a + b))
 //!             }
-//!             _ => Err(multifrost::MultifrostError::FunctionNotFound(function.to_string()))
+//!             _ => Err(MultifrostError::FunctionNotFound(function.to_string()))
 //!         }
 //!     }
 //! }

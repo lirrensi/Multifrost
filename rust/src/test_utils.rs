@@ -23,7 +23,7 @@ impl TestWorker {
     }
 
     pub fn set_fail(&self, fail: bool) {
-        *self.should_fail.lock().unwrap() = fail;
+        *self.should_fail.lock().expect("should_fail mutex poisoned - another thread panicked") = fail;
     }
 }
 
@@ -36,7 +36,7 @@ impl Default for TestWorker {
 #[async_trait::async_trait]
 impl crate::child::ChildWorker for TestWorker {
     async fn handle_call(&self, function: &str, args: Vec<serde_json::Value>) -> crate::error::Result<serde_json::Value> {
-        if *self.should_fail.lock().unwrap() {
+        if *self.should_fail.lock().expect("should_fail mutex poisoned - another thread panicked") {
             return Err(crate::error::MultifrostError::RemoteCallError("Test worker set to fail".to_string()));
         }
 
@@ -105,7 +105,7 @@ pub fn create_test_logger() -> (StructuredLogger, Arc<Mutex<Vec<String>>>) {
     let logs_clone = Arc::clone(&logs);
 
     let handler = Arc::new(move |entry: &crate::logging::LogEntry| {
-        logs_clone.lock().unwrap().push(entry.to_json());
+        logs_clone.lock().expect("logs mutex poisoned in test logger").push(entry.to_json());
     });
 
     let logger = StructuredLogger::new(
@@ -138,10 +138,13 @@ where
 }
 
 /// Helper to get a free port for testing.
+/// 
+/// # Panics
+/// Panics if no free port can be allocated (extremely rare).
 pub fn get_test_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr().map(|a| a.port()))
-        .unwrap_or(5555)
+        .expect("Failed to allocate free port for testing")
 }
 
 #[cfg(test)]

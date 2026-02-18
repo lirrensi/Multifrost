@@ -22,10 +22,24 @@ pub struct ServiceRegistry;
 
 impl ServiceRegistry {
     fn registry_path() -> PathBuf {
-        dirs::home_dir()
+        Self::get_home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".multifrost")
             .join("services.json")
+    }
+
+    /// Get the user's home directory in a cross-platform way.
+    /// Falls back to the current directory if not found.
+    fn get_home_dir() -> Option<PathBuf> {
+        // Try dirs crate first (handles platform-specific edge cases)
+        dirs::home_dir().or_else(|| {
+            // Fallback to environment variables for cross-platform support
+            if cfg!(target_os = "windows") {
+                std::env::var("USERPROFILE").ok().map(PathBuf::from)
+            } else {
+                std::env::var("HOME").ok().map(PathBuf::from)
+            }
+        })
     }
 
     async fn ensure_registry_dir() -> Result<()> {

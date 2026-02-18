@@ -70,7 +70,7 @@ pub struct ParentWorker {
 impl ParentWorker {
     /// Create a ParentWorker in spawn mode (owns the child process).
     pub fn spawn(script_path: &str, executable: &str) -> Result<Self> {
-        let port = find_free_port_sync();
+        let port = find_free_port_sync()?;
         Ok(Self::with_config(ParentWorkerConfig {
             script_path: Some(script_path.to_string()),
             executable: executable.to_string(),
@@ -86,7 +86,7 @@ impl ParentWorker {
         executable: &str,
         options: SpawnOptions,
     ) -> Result<Self> {
-        let port = find_free_port_sync();
+        let port = find_free_port_sync()?;
         Ok(Self::with_config(ParentWorkerConfig {
             script_path: Some(script_path.to_string()),
             executable: executable.to_string(),
@@ -173,15 +173,17 @@ impl ParentWorker {
 
     /// Start the worker.
     pub async fn start(&mut self) -> Result<()> {
+        let port = self.config.port.ok_or_else(|| 
+            MultifrostError::ConfigError("Port is required but not set".to_string()))?;
         let mut socket = DealerSocket::new();
 
         if self.config.is_spawn_mode {
-            socket.bind(&format!("tcp://0.0.0.0:{}", self.config.port.unwrap()))
+            socket.bind(&format!("tcp://0.0.0.0:{}", port))
                 .await
                 .map_err(|e| MultifrostError::ZmqError(e.to_string()))?;
             self.start_child_process()?;
         } else {
-            socket.connect(&format!("tcp://127.0.0.1:{}", self.config.port.unwrap()))
+            socket.connect(&format!("tcp://127.0.0.1:{}", port))
                 .await
                 .map_err(|e| MultifrostError::ZmqError(e.to_string()))?;
         }
@@ -209,7 +211,6 @@ impl ParentWorker {
         let restart_count = Arc::clone(&self.restart_count);
         let script_path = self.config.script_path.clone();
         let executable = self.config.executable.clone();
-        let port = self.config.port.unwrap();
 
         tokio::spawn(async move {
             message_loop(
@@ -233,6 +234,8 @@ impl ParentWorker {
     }
 
     fn start_child_process(&mut self) -> Result<()> {
+        let port = self.config.port.ok_or_else(|| 
+            MultifrostError::ConfigError("Port is required but not set".to_string()))?;
         let mut cmd = if cfg!(target_os = "windows") {
             let mut c = Command::new("cmd");
             if let Some(ref script) = self.config.script_path {
@@ -249,7 +252,7 @@ impl ParentWorker {
             c
         };
 
-        cmd.env("COMLINK_ZMQ_PORT", self.config.port.unwrap().to_string())
+        cmd.env("COMLINK_ZMQ_PORT", port.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
@@ -685,10 +688,10 @@ impl ParentWorkerBuilder {
     }
 }
 
-fn find_free_port_sync() -> u16 {
+fn find_free_port_sync() -> Result<u16> {
     TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr().map(|a| a.port()))
-        .unwrap_or(5555)
+        .map_err(|e| MultifrostError::IoError(e))
 }
 
 async fn message_loop(
