@@ -30,8 +30,18 @@ export class ServiceRegistry {
         await fs.mkdir(dir, { recursive: true });
     }
 
-    private static async readRegistry(): Promise<Registry> {
+    private static async ensureRegistryFile(): Promise<void> {
         await ServiceRegistry.ensureRegistryDir();
+        try {
+            await fs.access(ServiceRegistry.REGISTRY_PATH);
+        } catch {
+            // File doesn't exist, create empty registry
+            await fs.writeFile(ServiceRegistry.REGISTRY_PATH, '{}');
+        }
+    }
+
+    private static async readRegistry(): Promise<Registry> {
+        await ServiceRegistry.ensureRegistryFile();
         try {
             const data = await fs.readFile(ServiceRegistry.REGISTRY_PATH, 'utf-8');
             return JSON.parse(data);
@@ -45,9 +55,8 @@ export class ServiceRegistry {
 
     private static async writeRegistry(data: Registry): Promise<void> {
         await ServiceRegistry.ensureRegistryDir();
-        const tempPath = ServiceRegistry.REGISTRY_PATH + '.tmp';
-        await fs.writeFile(tempPath, JSON.stringify(data, null, 2));
-        await fs.rename(tempPath, ServiceRegistry.REGISTRY_PATH);
+        // Write directly to the file (not temp + rename) to avoid lockfile issues
+        await fs.writeFile(ServiceRegistry.REGISTRY_PATH, JSON.stringify(data, null, 2));
     }
 
     private static async isProcessAlive(pid: number): Promise<boolean> {
@@ -66,6 +75,8 @@ export class ServiceRegistry {
      * @throws Error if service_id already running
      */
     static async register(serviceId: string): Promise<number> {
+        // Ensure directory and file exist before locking
+        await ServiceRegistry.ensureRegistryFile();
         const release = await lockfile.lock(ServiceRegistry.REGISTRY_PATH);
         try {
             const registry = await ServiceRegistry.readRegistry();
@@ -110,6 +121,8 @@ export class ServiceRegistry {
         const deadline = Date.now() + timeout;
 
         while (Date.now() < deadline) {
+            // Ensure directory and file exist before locking
+            await ServiceRegistry.ensureRegistryFile();
             const release = await lockfile.lock(ServiceRegistry.REGISTRY_PATH);
             try {
                 const registry = await ServiceRegistry.readRegistry();
@@ -133,6 +146,8 @@ export class ServiceRegistry {
      * @param serviceId The service identifier to unregister
      */
     static async unregister(serviceId: string): Promise<void> {
+        // Ensure directory and file exist before locking
+        await ServiceRegistry.ensureRegistryFile();
         const release = await lockfile.lock(ServiceRegistry.REGISTRY_PATH);
         try {
             const registry = await ServiceRegistry.readRegistry();
