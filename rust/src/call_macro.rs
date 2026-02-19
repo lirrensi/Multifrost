@@ -19,13 +19,15 @@
 //! ```
 
 use crate::error::{MultifrostError, Result};
-use serde::{Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use std::future::Future;
 
 /// Trait for extracting typed arguments from JSON values
 pub trait ExtractArgs {
-    fn new(args: Vec<Value>) -> Self where Self: Sized;
+    fn new(args: Vec<Value>) -> Self
+    where
+        Self: Sized;
     fn get<T: DeserializeOwned>(&self, index: usize) -> Result<T>;
     fn take<T: DeserializeOwned>(self, index: usize) -> Result<T>;
 }
@@ -44,22 +46,24 @@ impl ArgsExtractor {
 
     /// Get argument at index with type conversion
     pub fn get<T: DeserializeOwned>(&self, index: usize) -> Result<T> {
-        self.args.get(index)
-            .ok_or_else(|| MultifrostError::InvalidMessage(format!("Missing argument at index {}", index)))
-            .and_then(|v| {
-                serde_json::from_value(v.clone())
-                    .map_err(MultifrostError::JsonError)
+        self.args
+            .get(index)
+            .ok_or_else(|| {
+                MultifrostError::InvalidMessage(format!("Missing argument at index {}", index))
             })
+            .and_then(|v| serde_json::from_value(v.clone()).map_err(MultifrostError::JsonError))
     }
 
     /// Take (consume) argument at index with type conversion
     pub fn take<T: DeserializeOwned>(mut self, index: usize) -> Result<T> {
         if index >= self.args.len() {
-            return Err(MultifrostError::InvalidMessage(format!("Missing argument at index {}", index)));
+            return Err(MultifrostError::InvalidMessage(format!(
+                "Missing argument at index {}",
+                index
+            )));
         }
         let value = self.args.remove(index);
-        serde_json::from_value(value)
-            .map_err(MultifrostError::JsonError)
+        serde_json::from_value(value).map_err(MultifrostError::JsonError)
     }
 
     /// Get remaining arguments as a Vec
@@ -323,19 +327,41 @@ impl<A: ToJsonArg, B: ToJsonArg, C: ToJsonArg> CallArgs for (A, B, C) {
 
 impl<A: ToJsonArg, B: ToJsonArg, C: ToJsonArg, D: ToJsonArg> CallArgs for (A, B, C, D) {
     fn to_json_args(self) -> Vec<Value> {
-        vec![self.0.to_json(), self.1.to_json(), self.2.to_json(), self.3.to_json()]
+        vec![
+            self.0.to_json(),
+            self.1.to_json(),
+            self.2.to_json(),
+            self.3.to_json(),
+        ]
     }
 }
 
-impl<A: ToJsonArg, B: ToJsonArg, C: ToJsonArg, D: ToJsonArg, E: ToJsonArg> CallArgs for (A, B, C, D, E) {
+impl<A: ToJsonArg, B: ToJsonArg, C: ToJsonArg, D: ToJsonArg, E: ToJsonArg> CallArgs
+    for (A, B, C, D, E)
+{
     fn to_json_args(self) -> Vec<Value> {
-        vec![self.0.to_json(), self.1.to_json(), self.2.to_json(), self.3.to_json(), self.4.to_json()]
+        vec![
+            self.0.to_json(),
+            self.1.to_json(),
+            self.2.to_json(),
+            self.3.to_json(),
+            self.4.to_json(),
+        ]
     }
 }
 
-impl<A: ToJsonArg, B: ToJsonArg, C: ToJsonArg, D: ToJsonArg, E: ToJsonArg, F: ToJsonArg> CallArgs for (A, B, C, D, E, F) {
+impl<A: ToJsonArg, B: ToJsonArg, C: ToJsonArg, D: ToJsonArg, E: ToJsonArg, F: ToJsonArg> CallArgs
+    for (A, B, C, D, E, F)
+{
     fn to_json_args(self) -> Vec<Value> {
-        vec![self.0.to_json(), self.1.to_json(), self.2.to_json(), self.3.to_json(), self.4.to_json(), self.5.to_json()]
+        vec![
+            self.0.to_json(),
+            self.1.to_json(),
+            self.2.to_json(),
+            self.3.to_json(),
+            self.4.to_json(),
+            self.5.to_json(),
+        ]
     }
 }
 
@@ -356,10 +382,15 @@ mod tests {
     #[test]
     fn test_args_extractor_take() {
         let args = ArgsExtractor::new(vec![json!(10), json!(20)]);
-        let a: i64 = args.clone().take(0).unwrap();
-        let b: i64 = args.take(0).unwrap(); // Now at index 0
+        // Take consumes the extractor and removes the element at the given index
+        // After taking index 0, we get 10 and the remaining is [20]
+        let a: i64 = args.take(0).unwrap();
         assert_eq!(a, 10);
-        assert_eq!(b, 20);
+
+        // Test sequential takes with fresh extractors
+        let args2 = ArgsExtractor::new(vec![json!(30), json!(40)]);
+        let b: i64 = args2.take(1).unwrap(); // Take index 1 (which is 40)
+        assert_eq!(b, 40);
     }
 
     #[test]
@@ -384,7 +415,10 @@ mod tests {
         assert_eq!(result, Vec::<Value>::new());
         assert_eq!((1i64,).to_json_args(), vec![json!(1)]);
         assert_eq!((1i64, 2i64).to_json_args(), vec![json!(1), json!(2)]);
-        assert_eq!((1i64, 2i64, 3i64).to_json_args(), vec![json!(1), json!(2), json!(3)]);
+        assert_eq!(
+            (1i64, 2i64, 3i64).to_json_args(),
+            vec![json!(1), json!(2), json!(3)]
+        );
     }
 
     #[test]
