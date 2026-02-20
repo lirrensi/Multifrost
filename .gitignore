@@ -330,6 +330,12 @@ dist
 .yarn/install-state.gz
 .pnp.*
 
+# E2E test artifacts
+e2e/workers/*.exe
+e2e/workers/*.dll
+e2e/__pycache__/
+e2e/.venv/
+
 private/
 .tmp
 plans/
