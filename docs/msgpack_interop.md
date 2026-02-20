@@ -15,7 +15,7 @@ Quick reference for cross-language MessagePack serialization. Covers Python, Jav
 
 ---
 
-## Top 8 Gotchas
+## Top 9 Gotchas
 
 1. **String vs Binary** — Python `bytes` without `use_bin_type=True` serialize as strings → Go/Rust crash on UTF-8 decode
 2. **Integer Overflow** — Python arbitrary precision (`2**100`) → crashes Go/Rust `int64`
@@ -25,6 +25,7 @@ Quick reference for cross-language MessagePack serialization. Covers Python, Jav
 6. **Unknown Fields** — Rust errors by default; add `#[serde(default)]` or `#[serde(deny_unknown_fields)]`
 7. **Timestamps** — Use Ext type -1 (native), not ISO strings
 8. **Size/Depth Limits** — Set `max_*_len` in Python; prevent DoS and stack overflow
+9. **interface{} Boxing** — msgpack decodes arrays as `[]interface{}` and maps as `map[string]interface{}` in Go → requires unwrapping in typed method parameters
 
 ---
 
@@ -58,6 +59,7 @@ Quick reference for cross-language MessagePack serialization. Covers Python, Jav
 | Non-string key | → stringify |
 | Circular ref / depth >100 | → **ERROR** (hard limit) |
 | Collection >100k items | → **ERROR** (DoS protection) |
+| interface{} boxing (arrays/maps) | → unwrap underlying values automatically |
 
 ---
 
@@ -121,6 +123,92 @@ let decoded: Config = rmp_serde::from_slice(&data)?;
 | Unknown Fields | Ignore them | Ignore them | Ignore by default | `#[serde(default)]` |
 | NaN/Infinity | Avoid or use `null` | Convert to `null` | Handle as `null` | Handle as `None` |
 | Timestamps | `datetime=True` | Manual encoding | Use `time.Time` | Use `chrono` crate |
+| Array/Map Boxing | N/A (native) | N/A (native) | Use `unwrapInterface()` helper | Use `Option<T>` for nullable |
+| Float for Integer | Avoid | Avoid | Automatic conversion | Avoid |
+
+---
+
+## Interface{} Boxing in Go (Critical for Cross-Language IPC)
+
+When msgpack decodes data in Go, it uses `interface{}` (or `any`) as the default type for dynamic collections:
+
+```go
+// Python sends: [1, 2, 3]
+// Go msgpack decodes to: []interface{} containing int64 values
+// Each element is: interface{}(int64(1)), not int64(1) directly
+
+// Python sends: {"a": 1, "b": 2}
+// Go msgpack decodes to: map[string]interface{}{
+//     "a": interface{}(int64(1)),
+//     "b": interface{}(int64(2)),
+// }
+```
+
+**This causes problems when Go methods expect typed collections:**
+
+```go
+// ❌ Won't work - Go panics when trying to set interface{} into int
+func (w *Worker) Sum(arr []int) int {  // Expects []int
+    sum := 0
+    for _, v := range arr {  // v is interface{}, not int
+        sum += v  // panic: interface {} is not int
+    }
+    return sum
+}
+
+// ✅ Works - uses interface{} for dynamic input
+func (w *Worker) Sum(arr []interface{}) int {
+    sum := 0
+    for _, v := range arr {
+        sum += int(v.(int64))  // Type assertion needed
+    }
+    return sum
+}
+```
+
+### The Fix: Automatic Unwrapping
+
+Go implementations should unwrap `interface{}` values before type conversion:
+
+```go
+// Helper to unwrap interface{} values from msgpack
+func unwrapInterface(value reflect.Value) reflect.Value {
+    if value.Kind() == reflect.Interface && value.Elem().IsValid() {
+        return value.Elem()
+    }
+    return value
+}
+
+// Use in convertArg, convertSlice, and convertMap
+```
+
+This allows typed method parameters to work correctly:
+
+```go
+// Now works! The conversion helper unwraps interface{} → int64 → int
+func (w *Worker) Sum(arr []int) int {
+    sum := 0
+    for _, v := range arr {
+        sum += v  // Works: v is int
+    }
+    return sum
+}
+```
+
+### Summary: What Works Across Languages
+
+| Go Method Parameter | Python Sends | Works? | Notes |
+|---------------------|--------------|--------|-------|
+| `int` | `42` | ✅ | int64 → int conversion |
+| `int64` | `42` | ✅ | Direct match |
+| `float64` | `3.14` | ✅ | Direct match |
+| `string` | `"hello"` | ✅ | Direct match |
+| `bool` | `true` | ✅ | Direct match |
+| `interface{}` | `42` | ✅ | Returns int64 |
+| `[]int` | `[1, 2, 3]` | ✅ | Now works with unwrap |
+| `[]string` | `["a", "b"]` | ✅ | Now works with unwrap |
+| `map[string]int` | `{"a": 1}` | ✅ | Now works with unwrap |
+| `map[string]any` | `{"a": 1}` | ✅ | Best for dynamic data |
 
 ---
 

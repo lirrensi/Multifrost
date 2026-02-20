@@ -163,27 +163,11 @@ async fn run_worker_async<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) ->
         ctx_guard.running = true;
     }
 
-    // Send ready message in spawn mode
-    if is_spawn_mode {
-        let ready_msg = Message::create_ready();
-        let packed = ready_msg.pack()?;
-
-        // ROUTER sends: [empty, message] when connecting to parent's DEALER
-        let zmq_msg: ZmqMessage = vec![
-            Bytes::from(vec![]), // Empty frame for DEALER
-            Bytes::from(packed),
-        ]
-        .try_into()
-        .map_err(|_| MultifrostError::InvalidMessage("Empty message".to_string()))?;
-
-        let mut ctx_guard = ctx.write().await;
-        if let Some(ref mut socket) = ctx_guard.socket {
-            socket
-                .send(zmq_msg)
-                .await
-                .map_err(|e| MultifrostError::ZmqError(e.to_string()))?;
-        }
-    }
+    // Note: We don't send a ready message here because:
+    // 1. In the DEALER(bind)/ROUTER(connect) pattern, the ROUTER needs to receive
+    //    a message first to learn the DEALER's identity before it can send.
+    // 2. The Python parent doesn't expect a ready message - it just starts sending.
+    // 3. Go and Python children don't send ready messages either.
 
     // Message loop
     let worker = Arc::new(worker);

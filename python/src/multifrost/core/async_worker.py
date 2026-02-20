@@ -418,8 +418,20 @@ class ParentWorker:
         env["COMLINK_ZMQ_PORT"] = str(self._port)
         env["COMLINK_WORKER_MODE"] = "1"
 
+        # Detect if this is a compiled binary (executable == script_path or ends with .exe)
+        is_compiled_binary = self._executable == self._script_path or (
+            self._script_path and self._script_path.lower().endswith((".exe", ".dll"))
+        )
+
+        if is_compiled_binary:
+            # Compiled binary: just run the executable directly
+            cmd = [self._script_path]
+        else:
+            # Script: run with interpreter
+            cmd = [self._executable, self._script_path, "--worker"]
+
         self.process = subprocess.Popen(
-            [self._executable, self._script_path, "--worker"],
+            cmd,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

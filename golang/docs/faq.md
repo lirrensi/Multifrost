@@ -1090,6 +1090,59 @@ func (w *Worker) Add(a, b int) int { ... }
 func (w *worker) add(a, b int) int { ... } // Private
 ```
 
+### Q: Why do typed slices and maps cause panics when called from Python?
+
+**A:** This is due to how msgpack decodes data in Go. When Python sends an array like `[1, 2, 3]`, Go's msgpack decodes it as `[]interface{}` where each element is wrapped in `interface{}`:
+
+```go
+// Python: worker.Sum([1, 2, 3])
+// Go sees: []interface{}{interface{}(int64(1)), interface{}(int64(2)), ...}
+
+// Go method expecting []int would panic:
+func (w *Worker) Sum(arr []int) int {
+    sum := 0
+    for _, v := range arr {  // v is interface{}, not int!
+        sum += v  // panic: interface{} is not int
+    }
+    return sum
+}
+```
+
+**The fix:** The Go implementation includes automatic unwrapping in `convertArg`, `convertSlice`, and `convertMap` functions. This converts:
+
+1. `interface{}` → underlying value (e.g., `int64`)
+2. `int64` → target type (e.g., `int`)
+
+Now this works:
+
+```go
+// ✅ Works - conversion helper unwraps interface{} and converts types
+func (w *Worker) Sum(arr []int) int {
+    sum := 0
+    for _, v := range arr {  // v is int!
+        sum += v
+    }
+    return sum
+}
+```
+
+### Q: What data types work best for cross-language calls?
+
+**A:** Use these for maximum compatibility:
+
+| Parameter Type | Works from Python | Works from JavaScript | Notes |
+|----------------|-------------------|----------------------|-------|
+| `int` | ✅ | ✅ | Auto-converts from int64 |
+| `int64` | ✅ | ✅ | Direct match |
+| `float64` | ✅ | ✅ | Direct match |
+| `string` | ✅ | ✅ | Direct match |
+| `bool` | ✅ | ✅ | Direct match |
+| `interface{}` / `any` | ✅ | ✅ | Returns Python int64 |
+| `[]int` | ✅ | ✅ | With unwrap helper |
+| `[]string` | ✅ | ✅ | With unwrap helper |
+| `map[string]int` | ✅ | ✅ | With unwrap helper |
+| `map[string]any` | ✅ | ✅ | Best for dynamic data |
+
 ---
 
 ## Additional Resources

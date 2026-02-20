@@ -35,5 +35,6 @@ func main() {
 	worker := &MathWorker{
 		ChildWorker: multifrost.NewChildWorker(),
 	}
+	worker.SetSelf(worker) // Enable method discovery for embedded struct
 	worker.Run()
 }

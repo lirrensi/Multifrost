@@ -102,6 +102,43 @@ func (w *ChildWorker) handleFunctionCall(msg *ComlinkMessage, senderID []byte) {
 - No support for async/await patterns (Go doesn't have async/await)
 - Method signatures are checked at runtime, not compile time
 
+### Automatic Type Conversion for Cross-Language IPC
+
+The ChildWorker includes automatic type conversion to handle msgpack differences between languages:
+
+```go
+// convertArg handles type conversion from msgpack-decoded values
+func convertArg(value reflect.Value, target reflect.Type) reflect.Value {
+    // Unwrap interface{} from msgpack decoding
+    value = unwrapInterface(value)
+    
+    // Handle int64 -> int conversion (Python sends int64)
+    if isIntegerKind(srcKind) && isIntegerKind(target.Kind()) {
+        return reflect.ValueOf(value.Int()).Convert(target)
+    }
+    
+    // Handle slice/array conversion with element unwrapping
+    // Handle map conversion with key/value unwrapping
+    // ...
+}
+
+// unwrapInterface handles the msgpack "boxing" issue
+func unwrapInterface(value reflect.Value) reflect.Value {
+    if value.Kind() == reflect.Interface && value.Elem().IsValid() {
+        return value.Elem()
+    }
+    return value
+}
+```
+
+**Why this is needed:**
+- Python sends integers as int64 via msgpack
+- msgpack decodes arrays as `[]interface{}` with each element being the actual type wrapped
+- Go methods expecting `[]int` would panic without unwrapping
+- The conversion helper unwraps interface{} → extracts underlying value → converts to target type
+
+This allows Go methods with typed parameters to work correctly when called from Python, JavaScript, or Rust:
+
 ## Wire Protocol Implementation
 
 ### ZMQ Socket Handling

@@ -20,6 +20,9 @@ type ChildWorker struct {
 	Namespace string
 	ServiceID string
 
+	// self holds a reference to the outer struct (for method dispatch)
+	self any
+
 	// Internal state
 	running bool
 	socket  zmq.Socket
@@ -48,6 +51,20 @@ func NewChildWorkerWithService(serviceID string) *ChildWorker {
 	worker := NewChildWorker()
 	worker.ServiceID = serviceID
 	return worker
+}
+
+// SetSelf sets a reference to the outer struct for method dispatch.
+// This must be called before Run() when embedding ChildWorker.
+// Example:
+//
+//	type MyWorker struct {
+//	    *multifrost.ChildWorker
+//	}
+//	worker := &MyWorker{ChildWorker: multifrost.NewChildWorker()}
+//	worker.SetSelf(worker)  // Enable method discovery
+//	worker.Run()
+func (w *ChildWorker) SetSelf(self any) {
+	w.self = self
 }
 
 // Start begins the worker message loop
@@ -269,6 +286,125 @@ func (w *ChildWorker) handleHeartbeat(msg *ComlinkMessage, senderID []byte) {
 	}
 }
 
+// unwrapInterface unwraps an interface{} value to get the underlying value.
+// This handles msgpack decoding where all values are decoded as interface{}.
+func unwrapInterface(value reflect.Value) reflect.Value {
+	// Only unwrap if it's an interface with a valid underlying value
+	if value.Kind() == reflect.Interface && value.Elem().IsValid() {
+		return value.Elem()
+	}
+	return value
+}
+
+// convertArg converts a reflect.Value to match the expected target type.
+// This handles msgpack type differences between languages (e.g., int64 from Python -> int in Go).
+func convertArg(value reflect.Value, target reflect.Type) reflect.Value {
+	// If already the right type, return as-is
+	if value.Type() == target {
+		return value
+	}
+
+	// Handle nil/invalid
+	if !value.IsValid() {
+		return reflect.Zero(target)
+	}
+
+	// Unwrap interface{} values from msgpack decoding
+	value = unwrapInterface(value)
+
+	srcKind := value.Kind()
+
+	// Handle integer conversions (msgpack sends int64, Go methods may expect int/int32/etc)
+	if isIntegerKind(srcKind) && isIntegerKind(target.Kind()) {
+		srcInt := value.Int()
+		return reflect.ValueOf(srcInt).Convert(target)
+	}
+
+	// Handle float->int conversion (msgpack may send floats for small integers)
+	if srcKind == reflect.Float64 || srcKind == reflect.Float32 {
+		if isIntegerKind(target.Kind()) {
+			srcFloat := value.Float()
+			return reflect.ValueOf(int64(srcFloat)).Convert(target)
+		}
+	}
+
+	// Handle int->float conversion
+	if isIntegerKind(srcKind) && (target.Kind() == reflect.Float64 || target.Kind() == reflect.Float32) {
+		srcInt := value.Int()
+		return reflect.ValueOf(float64(srcInt)).Convert(target)
+	}
+
+	// Handle interface{} / any - just return the value
+	if target == reflect.TypeOf((*any)(nil)).Elem() {
+		return value
+	}
+
+	// Handle slices/arrays
+	if target.Kind() == reflect.Slice || target.Kind() == reflect.Array {
+		if srcKind == reflect.Slice || srcKind == reflect.Array {
+			return convertSlice(value, target)
+		}
+	}
+
+	// Handle maps
+	if target.Kind() == reflect.Map && srcKind == reflect.Map {
+		return convertMap(value, target)
+	}
+
+	// Try direct conversion if possible
+	if value.CanConvert(target) {
+		return value.Convert(target)
+	}
+
+	// Fallback: return as-is and let the call fail with a clear error
+	return value
+}
+
+// isIntegerKind checks if a kind is an integer type
+func isIntegerKind(k reflect.Kind) bool {
+	return k == reflect.Int || k == reflect.Int8 || k == reflect.Int16 ||
+		k == reflect.Int32 || k == reflect.Int64 ||
+		k == reflect.Uint || k == reflect.Uint8 || k == reflect.Uint16 ||
+		k == reflect.Uint32 || k == reflect.Uint64
+}
+
+// convertSlice converts a slice/array to the target slice type
+func convertSlice(value reflect.Value, target reflect.Type) reflect.Value {
+	length := value.Len()
+	targetElemType := target.Elem()
+	result := reflect.MakeSlice(target, length, length)
+
+	for i := 0; i < length; i++ {
+		elem := value.Index(i)
+		// Unwrap interface{} from msgpack decoding before conversion
+		elem = unwrapInterface(elem)
+		converted := convertArg(elem, targetElemType)
+		result.Index(i).Set(converted)
+	}
+
+	return result
+}
+
+// convertMap converts a map to the target map type
+func convertMap(value reflect.Value, target reflect.Type) reflect.Value {
+	targetKeyType := target.Key()
+	targetValueType := target.Elem()
+	result := reflect.MakeMap(target)
+
+	for _, key := range value.MapKeys() {
+		// Unwrap interface{} from msgpack decoding before conversion
+		key = unwrapInterface(key)
+		convertedKey := convertArg(key, targetKeyType)
+
+		value := value.MapIndex(key)
+		value = unwrapInterface(value)
+		convertedValue := convertArg(value, targetValueType)
+		result.SetMapIndex(convertedKey, convertedValue)
+	}
+
+	return result
+}
+
 // handleFunctionCall processes a function call message
 func (w *ChildWorker) handleFunctionCall(msg *ComlinkMessage, senderID []byte) {
 	var response *ComlinkMessage
@@ -287,18 +423,31 @@ func (w *ChildWorker) handleFunctionCall(msg *ComlinkMessage, senderID []byte) {
 		return
 	}
 
+	// Determine target for method lookup: use self if set (for embedded structs), else use w
+	target := any(w)
+	if w.self != nil {
+		target = w.self
+	}
+
 	// Find and call the method using reflection
-	method := reflect.ValueOf(w).MethodByName(msg.Function)
+	method := reflect.ValueOf(target).MethodByName(msg.Function)
 	if !method.IsValid() {
 		response = CreateError(fmt.Sprintf("Function '%s' not found", msg.Function), msg.ID)
 		w.sendResponse(response, senderID)
 		return
 	}
 
-	// Prepare arguments
+	// Prepare arguments with type conversion
+	methodType := method.Type()
 	args := make([]reflect.Value, len(msg.Args))
+
 	for i, arg := range msg.Args {
-		args[i] = reflect.ValueOf(arg)
+		if i < methodType.NumIn() {
+			// Convert argument to match expected parameter type
+			args[i] = convertArg(reflect.ValueOf(arg), methodType.In(i))
+		} else {
+			args[i] = reflect.ValueOf(arg)
+		}
 	}
 
 	// Call the method
@@ -308,7 +457,13 @@ func (w *ChildWorker) handleFunctionCall(msg *ComlinkMessage, senderID []byte) {
 	if len(results) == 0 {
 		response = CreateResponse(nil, msg.ID)
 	} else if len(results) == 1 {
-		response = CreateResponse(results[0].Interface(), msg.ID)
+		// Single return value - check if it's an error
+		result := results[0].Interface()
+		if err, ok := result.(error); ok && err != nil {
+			response = CreateError(err.Error(), msg.ID)
+		} else {
+			response = CreateResponse(result, msg.ID)
+		}
 	} else if len(results) == 2 {
 		// Common Go pattern: (result, error)
 		if err, ok := results[1].Interface().(error); ok && err != nil {

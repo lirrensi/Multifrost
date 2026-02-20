@@ -39,3 +39,7 @@ path = "examples/spawn.rs"
 [[example]]
 name = "connect"
 path = "examples/connect.rs"
+
+[[example]]
+name = "e2e_math_worker"
+path = "examples/e2e_math_worker.rs"
