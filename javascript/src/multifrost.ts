@@ -62,6 +62,7 @@ export interface ComlinkMessageData {
     error?: string;
     output?: string;
     clientName?: string;
+    metadata?: Record<string, unknown>;
 }
 
 export class ComlinkMessage {
@@ -76,6 +77,7 @@ export class ComlinkMessage {
     public error?: string;
     public output?: string;
     public clientName?: string;
+    public metadata?: Record<string, unknown>;
 
     constructor(data: Partial<ComlinkMessageData> = {}) {
         this.id = data.id || randomUUID();
@@ -140,6 +142,7 @@ static createCall(
         if (this.error !== undefined) result.error = this.error;
         if (this.output !== undefined) result.output = this.output;
         if (this.clientName !== undefined) result.clientName = this.clientName;
+        if (this.metadata !== undefined) result.metadata = this.metadata;
 
         return result;
     }
@@ -434,10 +437,10 @@ export class ParentWorker {
             if (heartbeat) {
                 this._pendingHeartbeats.delete(message.id);
 
-                // Calculate RTT from timestamp in args if present
-                if (message.args && message.args.length > 0) {
-                    const sentTime = message.args[0] as number;
-                    this._lastHeartbeatRttMs = Date.now() - sentTime * 1000;
+                // Calculate RTT from timestamp in metadata (cross-language compatible)
+                if (message.metadata && typeof message.metadata.hb_timestamp === "number") {
+                    const sentTime = message.metadata.hb_timestamp;
+                    this._lastHeartbeatRttMs = (Date.now() / 1000 - sentTime) * 1000;
                 }
 
                 // Reset consecutive misses on successful response
@@ -593,7 +596,7 @@ export class ParentWorker {
                 const heartbeat = new ComlinkMessage({
                     type: MessageType.HEARTBEAT,
                     id: heartbeatId,
-                    args: [Date.now()], // Send timestamp for RTT calculation
+                    metadata: { hb_timestamp: Date.now() / 1000 }, // Unix seconds, matching other languages
                 });
 
                 // Create promise for response
@@ -854,7 +857,7 @@ export abstract class ChildWorker {
     private running: boolean = true;
     private socket?: zmq.Router;
     private port?: number;
-    private _lastSenderId?: Buffer;
+    private _connectedParentIds: Set<Buffer> = new Set();
 
     constructor(serviceId?: string) {
         this.serviceId = serviceId;
@@ -927,25 +930,28 @@ export abstract class ChildWorker {
             console.warn("Cannot send output: socket not initialized");
             return;
         }
-        
-        if (!this._lastSenderId) {
-            // Buffer is undefined or empty - parent not connected yet
+
+        if (this._connectedParentIds.size === 0) {
+            // No parents connected yet
             return;
         }
 
         const message = ComlinkMessage.createOutput(output, msgType);
 
-        for (let attempt = 0; attempt < retries; attempt++) {
-            try {
-                await this.socket.send([this._lastSenderId, Buffer.alloc(0), message.pack()]);
-                return;
-            } catch (error) {
-                const errorMessage = error instanceof Error ? error.message : String(error);
-                if (attempt < retries - 1) {
-                    await new Promise(resolve => setTimeout(resolve, 1));
-                    continue;
+        // Broadcast to all connected parents
+        for (const parentId of this._connectedParentIds) {
+            for (let attempt = 0; attempt < retries; attempt++) {
+                try {
+                    await this.socket.send([parentId, Buffer.alloc(0), message.pack()]);
+                    break; // Success, move to next parent
+                } catch (error) {
+                    const errorMessage = error instanceof Error ? error.message : String(error);
+                    if (attempt < retries - 1) {
+                        await new Promise(resolve => setTimeout(resolve, 1));
+                        continue;
+                    }
+                    console.warn(`Warning: Failed to send output to parent: ${errorMessage}`);
                 }
-                console.warn(`Warning: Failed to send output: ${errorMessage}`);
             }
         }
     }
@@ -967,8 +973,8 @@ export abstract class ChildWorker {
         for await (const [senderId, empty, messageData] of this.socket) {
             if (!this.running) break;
 
-            // Track sender for output forwarding
-            this._lastSenderId = senderId as Buffer;
+            // Track all connected parents for output forwarding
+            this._connectedParentIds.add(senderId as Buffer);
 
             try {
                 const message = ComlinkMessage.unpack(messageData as Buffer);
@@ -1042,11 +1048,11 @@ export abstract class ChildWorker {
     }
 
     private async handleHeartbeat(message: ComlinkMessage, senderId: Buffer): Promise<void> {
-        // Echo back the heartbeat with the same ID and args (for RTT calculation)
+        // Echo back the heartbeat with the same ID and metadata (for RTT calculation)
         const response = new ComlinkMessage({
             type: MessageType.HEARTBEAT,
             id: message.id,
-            args: message.args, // Preserve timestamp for RTT calculation
+            metadata: message.metadata, // Preserve timestamp for RTT calculation
         });
 
         try {

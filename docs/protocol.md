@@ -91,7 +91,11 @@ Date: 2026-02-11
 6.5.2 Parent SHOULD log to stderr with worker name context.
 
 6.6 HEARTBEAT
-6.6.1 Reserved for future; no behavioral contract in current canon.
+6.6.1 Parent sends HEARTBEAT with `metadata.hb_timestamp` (Unix seconds, float).
+6.6.2 Child echoes the HEARTBEAT back unchanged.
+6.6.3 Parent calculates RTT: `(current_timestamp - hb_timestamp) * 1000` milliseconds.
+6.6.4 Used for connection health monitoring in spawn mode.
+6.6.5 Cross-language compatible: all implementations use `metadata.hb_timestamp`.
 6.7 SHUTDOWN
 6.7.1 Child SHOULD stop processing when receiving shutdown.
 
@@ -114,6 +118,9 @@ Date: 2026-02-11
 7.4.1 error: string (MUST be present).
 7.5 OUTPUT fields:
 7.5.1 output: string (MUST be present).
+7.6 HEARTBEAT fields:
+7.6.1 metadata: map (MUST contain hb_timestamp for RTT calculation).
+7.6.2 hb_timestamp: number (Unix seconds, float).
 
 8. Parent Behavior
 ------------------
@@ -160,15 +167,18 @@ Date: 2026-02-11
 --------------------
 
 11.1 Registry path: ~/.multifrost/services.json.
-11.2 Lock path: ~/.multifrost/registry.lock (Python).
+11.2 Lock path: ~/.multifrost/services.lock (consistent across all languages).
 11.3 Registry is JSON map: service_id -> {port, pid, started}.
 11.4 Registration checks if existing PID is alive.
 11.5 If alive, registration fails with error.
 11.6 If not alive, entry is overwritten.
 11.7 Unregister removes entry only if PID matches.
-11.8 Python uses file locking (fcntl/msvcrt).
-11.9 JS uses proper-lockfile for locking.
-11.10 JS PID check uses pidusage; Python uses psutil if installed else os.kill(0).
+11.8 All implementations use atomic file locking via `O_CREAT | O_EXCL` pattern.
+11.9 Stale locks (older than 10 seconds) are automatically removed.
+11.10 Lock timeout is 10 seconds maximum.
+11.11 Windows uses msvcrt.locking (Python) or tasklist (Go); Unix uses fcntl (Python) or signal(0) (Go).
+11.12 Rust uses std::fs::OpenOptions::create_new for atomic lock acquisition.
+11.13 PID check: Python uses psutil or os.kill(0); Go uses signal(0) on Unix, tasklist on Windows; Rust uses kill -0 on Unix, tasklist on Windows.
 
 12. Timeouts and Retries
 ------------------------
@@ -212,7 +222,7 @@ Date: 2026-02-11
 16.1 Parent may issue concurrent calls; pending requests are keyed by id.
 16.2 Responses may be received out of order; id matching resolves them.
 16.3 Child processes one message at a time in its loop.
-16.4 Child is single-threaded in JS; Python uses blocking loop with sleeps.
+16.4 Child is single-threaded in JS; Python uses blocking recv with RCVTIMEO (no busy-wait).
 
 17. Compatibility Notes (Python vs JS)
 --------------------------------------
@@ -280,6 +290,8 @@ Date: 2026-02-11
 22.9 Field=result; Type=any; Constraint=MUST be present for RESPONSE
 22.10 Field=error; Type=string; Constraint=MUST be present for ERROR
 22.11 Field=output; Type=string; Constraint=MUST be present for STDOUT/STDERR
+22.12 Field=metadata; Type=map; Constraint=OPTIONAL; used for hb_timestamp in HEARTBEAT
+22.13 Field=hb_timestamp; Type=number; Constraint=MUST be present in HEARTBEAT metadata
 
 23. Detailed Flow (Spawn Mode)
 ------------------------------
@@ -352,7 +364,7 @@ Date: 2026-02-11
 31. Socket Options
 ------------------
 
-31.1 Python Child sets LINGER=1000 and SNDTIMEO=100.
+31.1 Python Child sets LINGER=1000, SNDTIMEO=100, and RCVTIMEO=100.
 31.2 Python Parent sets RCVTIMEO=100 and SNDTIMEO=100.
 31.3 JS implementations rely on defaults.
 
@@ -413,7 +425,7 @@ Date: 2026-02-11
 38. Suggested Extensions (Non-normative)
 ----------------------------------------
 
-38.1 Implement heartbeat to detect stale connections.
+38.1 Heartbeat is implemented: Parent sends periodic HEARTBEAT, child echoes, parent calculates RTT.
 38.2 Add request cancellation support.
 38.3 Add streaming responses.
 38.4 Add authentication layer.

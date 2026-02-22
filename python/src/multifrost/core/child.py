@@ -101,6 +101,7 @@ class ChildWorker:
                 self.socket = self.context.socket(zmq.ROUTER)
                 self.socket.setsockopt(zmq.LINGER, 1000)
                 self.socket.setsockopt(zmq.SNDTIMEO, 100)
+                self.socket.setsockopt(zmq.RCVTIMEO, 100)
 
                 endpoint = f"tcp://localhost:{self.port}"
                 self.socket.connect(endpoint)
@@ -119,6 +120,7 @@ class ChildWorker:
                 self.socket = self.context.socket(zmq.ROUTER)
                 self.socket.setsockopt(zmq.LINGER, 1000)
                 self.socket.setsockopt(zmq.SNDTIMEO, 100)
+                self.socket.setsockopt(zmq.RCVTIMEO, 100)
 
                 endpoint = f"tcp://*:{self.port}"
                 self.socket.bind(endpoint)
@@ -197,18 +199,16 @@ class ChildWorker:
             try:
                 # ROUTER socket receives: [sender_id, empty_frame, message_data]
                 try:
-                    frames = self.socket.recv_multipart(zmq.NOBLOCK)
+                    # Blocking receive with RCVTIMEO (100ms) - no busy-waiting
+                    frames = self.socket.recv_multipart()
                     if len(frames) >= 3:
                         sender_id = frames[0]
                         empty = frames[1]  # Should be empty
                         message_data = frames[2]
                         self._handle_message(message_data, sender_id)
                 except zmq.Again:
-                    # No message available, continue
+                    # Timeout - no message available, continue loop
                     pass
-
-                # Small sleep to prevent tight loop
-                time.sleep(0.01)
 
             except Exception as e:
                 print(f"ERROR: Error in message loop: {e}", file=sys.stderr)

@@ -28,6 +28,58 @@ impl ServiceRegistry {
             .join("services.json")
     }
 
+    fn lock_path() -> PathBuf {
+        Self::get_home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".multifrost")
+            .join("services.lock")
+    }
+
+    async fn acquire_lock() -> Result<std::fs::File> {
+        let lock_path = Self::lock_path();
+        Self::ensure_registry_dir().await?;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+        loop {
+            // Try atomic file creation (O_CREAT | O_EXCL)
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&lock_path)
+            {
+                Ok(file) => return Ok(file),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Lock held by another process, check if stale
+                    if let Ok(metadata) = std::fs::metadata(&lock_path) {
+                        if let Ok(modified) = metadata.modified() {
+                            if modified.elapsed().unwrap_or_default() > Duration::from_secs(10) {
+                                // Stale lock, try to remove
+                                let _ = std::fs::remove_file(&lock_path);
+                            }
+                        }
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(MultifrostError::IoError(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "Lock acquisition timeout",
+                        )));
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(e) => return Err(MultifrostError::IoError(e)),
+            }
+        }
+    }
+
+    fn release_lock(_lock_file: std::fs::File) -> Result<()> {
+        let lock_path = Self::lock_path();
+        // File is closed when dropped, then remove lock file
+        drop(_lock_file);
+        let _ = std::fs::remove_file(lock_path);
+        Ok(())
+    }
+
     /// Get the user's home directory in a cross-platform way.
     /// Falls back to the current directory if not found.
     fn get_home_dir() -> Option<PathBuf> {
@@ -122,6 +174,13 @@ impl ServiceRegistry {
     }
 
     pub async fn register(service_id: &str) -> Result<u16> {
+        let lock_file = Self::acquire_lock().await?;
+        let result = Self::register_internal(service_id).await;
+        let _ = Self::release_lock(lock_file);
+        result
+    }
+
+    async fn register_internal(service_id: &str) -> Result<u16> {
         let mut registry = Self::read_registry().await?;
 
         // Check if service already running
@@ -153,23 +212,43 @@ impl ServiceRegistry {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
 
         loop {
-            let registry = Self::read_registry().await?;
+            let lock_file = Self::acquire_lock().await?;
+            let result = Self::discover_internal(service_id).await;
+            let _ = Self::release_lock(lock_file);
 
-            if let Some(reg) = registry.get(service_id) {
-                if Self::is_process_alive(reg.pid) {
-                    return Ok(reg.port);
+            match result {
+                Ok(port) => return Ok(port),
+                Err(MultifrostError::ServiceNotFound(_)) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(MultifrostError::ServiceNotFound(service_id.to_string()));
+                    }
+                    sleep(Duration::from_millis(100)).await;
                 }
+                Err(e) => return Err(e),
             }
-
-            if tokio::time::Instant::now() >= deadline {
-                return Err(MultifrostError::ServiceNotFound(service_id.to_string()));
-            }
-
-            sleep(Duration::from_millis(100)).await;
         }
     }
 
+    async fn discover_internal(service_id: &str) -> Result<u16> {
+        let registry = Self::read_registry().await?;
+
+        if let Some(reg) = registry.get(service_id) {
+            if Self::is_process_alive(reg.pid) {
+                return Ok(reg.port);
+            }
+        }
+
+        Err(MultifrostError::ServiceNotFound(service_id.to_string()))
+    }
+
     pub async fn unregister(service_id: &str) -> Result<()> {
+        let lock_file = Self::acquire_lock().await?;
+        let result = Self::unregister_internal(service_id).await;
+        let _ = Self::release_lock(lock_file);
+        result
+    }
+
+    async fn unregister_internal(service_id: &str) -> Result<()> {
         let mut registry = Self::read_registry().await?;
         let current_pid = process::id();
 

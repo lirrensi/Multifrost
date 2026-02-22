@@ -632,16 +632,16 @@ class ParentWorker:
         """Pure async event loop for handling ZMQ messages."""
         while self.running:
             try:
-                # Try to receive message (now truly async, no executor needed)
+                # Blocking async receive with RCVTIMEO (100ms) - yields to event loop
                 # DEALER socket receives: [empty_frame, message_data]
                 try:
-                    frames = await self.socket.recv_multipart(zmq.NOBLOCK)
+                    frames = await self.socket.recv_multipart()
                     if len(frames) >= 2:
                         _empty = frames[0]  # Should be empty
                         message_data = frames[1]
                         await self._handle_message(message_data)
                 except zmq.Again:
-                    # No message available
+                    # Timeout - no message available, continue loop
                     pass
 
                 # Check child process health (spawn mode only)
@@ -652,9 +652,6 @@ class ParentWorker:
                 ):
                     await self._handle_child_exit()
                     break
-
-                # Small sleep to prevent tight loop
-                await asyncio.sleep(0.01)
 
             except Exception as e:
                 if self.running:
@@ -857,8 +854,19 @@ class ParentWorker:
             env = os.environ.copy()
             env["COMLINK_ZMQ_PORT"] = str(self._port)
 
+            # Detect if this is a compiled binary (same logic as _start_child_process)
+            is_compiled_binary = self._executable == self._script_path or (
+                self._script_path
+                and self._script_path.lower().endswith((".exe", ".dll"))
+            )
+
+            if is_compiled_binary:
+                cmd = [self._script_path]
+            else:
+                cmd = [self._executable, self._script_path, "--worker"]
+
             self.process = subprocess.Popen(
-                [self._executable, self._script_path],
+                cmd,
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

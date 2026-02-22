@@ -1,6 +1,6 @@
 {
     "name": "multifrost",
-    "version": "4.0.0",
+    "version": "4.1.0",
     "description": "Cross-language IPC library for Python, Node.js, Go, and Rust",
     "license": "MIT",
     "author": "lirrensi",

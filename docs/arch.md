@@ -122,11 +122,14 @@ All messages share core fields:
   "app": "comlink_ipc_v4",
   "id": "<uuid>",
   "type": "heartbeat",
-  "timestamp": 1234.5
+  "timestamp": 1234.5,
+  "metadata": {
+    "hb_timestamp": 1234.5
+  }
 }
 ```
 
-- **HEARTBEAT**: Reserved for future use (connection health monitoring)
+- **HEARTBEAT**: Used for connection health monitoring. Parent sends with `hb_timestamp`, child echoes back with same timestamp. Parent calculates RTT from the difference.
 - **SHUTDOWN**: Child should stop processing when received
 
 ## Lifecycle Flows

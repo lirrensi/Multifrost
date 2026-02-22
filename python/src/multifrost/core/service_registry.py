@@ -26,7 +26,7 @@ class ServiceRegistry:
     """File-based service registry with locking for concurrent access."""
 
     REGISTRY_PATH = Path.home() / ".multifrost" / "services.json"
-    LOCK_PATH = Path.home() / ".multifrost" / "registry.lock"
+    LOCK_PATH = Path.home() / ".multifrost" / "services.lock"
     _lock_file = None
 
     @staticmethod

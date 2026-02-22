@@ -1,13 +1,16 @@
 package multifrost
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -307,13 +310,25 @@ func isProcessAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
+
+	if runtime.GOOS == "windows" {
+		// On Windows, os.FindProcess always succeeds, so we use tasklist
+		cmd := exec.Command("tasklist", "/NH", "/FI", fmt.Sprintf("PID eq %d", pid))
+		output, err := cmd.Output()
+		if err != nil {
+			return false
+		}
+		// tasklist returns "INFO: No tasks are running..." if PID not found
+		return !bytes.Contains(output, []byte("No tasks are running"))
+	}
+
+	// On Unix, sending signal 0 checks if process exists without killing it
 	proc, err := os.FindProcess(pid)
 	if err != nil {
 		return false
 	}
-	// On Windows, FindProcess always succeeds, so we need to check differently
-	// On Unix, sending signal 0 checks if process exists
-	return proc != nil
+	err = proc.Signal(syscall.Signal(0))
+	return err == nil
 }
 
 // List returns all registered services
