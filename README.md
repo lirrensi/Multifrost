@@ -1,6 +1,6 @@
-# Multifrost 🌈🏳️‍🌈🏳️‍🌈🏳️‍🌈🏳️‍🌈🏳️‍🌈🏳️‍🌈🏳️‍🌈🏳️‍🌈
+# Multifrost 🌈
 
-> A rainbow bridge for your environments across spaces. Microservices made easy. Ditch making REST API connectors everywhere!
+> Cross-language IPC over ZeroMQ and MessagePack. Call worker methods across Python, JavaScript, Go, and Rust without building REST or gRPC glue.
 
 Multifrost is a high-performance inter-process communication (IPC) library that enables seamless communication between processes written in different languages. Think of it as a language-agnostic bridge that lets Python talk to Node.js, Go talk to Rust, and everything in between—without writing a single REST API or gRPC endpoint.
 
@@ -13,6 +13,28 @@ Multifrost is a high-performance inter-process communication (IPC) library that 
 - **Two Modes**: Spawn (create workers) or Connect (service discovery)
 - **Battle-Tested**: Built on ZeroMQ and msgpack for maximum performance
 - **Async-Native**: Modern async/sync APIs in all languages
+
+## ✅ What Works Well Today
+
+- **4 runtimes, 12 language pairs**: Python, JavaScript/TypeScript, Go, and Rust share the same wire protocol and are designed to interoperate with one another
+- **One protocol contract**: DEALER/ROUTER over ZeroMQ, MessagePack payloads, and the same core message types across runtimes
+- **Shared lifecycle model**: `.spawn()` / `.connect()` on the parent side and `.handle().start()` / `.handle().stop()` for runtime control
+- **Broader interop coverage**: Recent e2e work focused on registry behavior, heartbeat consistency, restart handling, and numeric round-trips across languages
+
+## ⚠️ Interop Rules You Should Know
+
+- **Portable numbers**: Treat signed int64 integers and finite floats as the safe cross-language numeric subset
+- **Precision-sensitive values**: Encode huge integers, decimals, money, tensors, and exact float-bit payloads explicitly at the application layer
+- **String-keyed objects only**: Non-string map keys are not portable across all runtimes
+- **Source of truth**: See `docs/msgpack_interop.md` for wire-value rules and `docs/support_matrix.md` for current parity notes
+
+## 🚀 Release Highlights
+
+- **More cross-language tests**: Added larger e2e coverage across the runtime matrix, including JavaScript numeric boundary checks against Python workers
+- **Better registry and heartbeat alignment**: Runtime behavior now matches more closely across Python, JavaScript, Go, and Rust
+- **Clearer docs for real-world interop**: The README, protocol docs, and MessagePack guide now call out the supported subset instead of implying every edge case is identical
+
+For the running release log, see `CHANGELOG.md`.
 
 ## 💡 Common Use Cases
 
@@ -355,38 +377,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 🔧 Installation
 
-### Python
+Multifrost is a monorepo. Each runtime lives in its own subdirectory:
+
+- `python/` - Python package
+- `javascript/` - JavaScript / TypeScript package
+- `golang/` - Go module
+- `rust/` - Rust crate
+
+That means installation depends on which runtime you want to use. If you only need one language, you work from that language's folder rather than treating the repo root as a single universal package.
+
+### Python (`python/`)
+
+Install the Python package directly from the Python subdirectory:
+
 ```bash
-# Using pip
-pip install git+https://github.com/lirrensi/Multifrost.git
+# From a local clone
+pip install ./python
 
-# Using uv
-uv pip install git+https://github.com/lirrensi/Multifrost.git
-
-# Using pipx
-pipx install git+https://github.com/lirrensi/Multifrost.git
-
-# Using uvx (direct run)
-uvx --from git+https://github.com/lirrensi/Multifrost.git
+# Or from Git
+pip install "git+https://github.com/lirrensi/Multifrost.git#subdirectory=python"
+uv pip install "git+https://github.com/lirrensi/Multifrost.git#subdirectory=python"
 ```
 
-### JavaScript / TypeScript
-```bash
-npm install git+https://github.com/lirrensi/Multifrost.git
+### JavaScript / TypeScript (`javascript/`)
 
-# Or use with tsx for TypeScript files
-npx tsx worker.ts
+The JavaScript implementation has its own `package.json` inside `javascript/`.
+
+If you are working from this repository:
+
+```bash
+cd javascript
+npm install
 ```
 
-### Go
+If you want to use the checked-out package from another local project, point npm at that folder:
+
 ```bash
-go get https://github.com/lirrensi/Multifrost.git
+npm install ../Multifrost/javascript
 ```
 
-### Rust
+Current package name: `multifrost`
+
+### Go (`golang/`)
+
+The Go implementation is a Go module rooted in `golang/` with module path `github.com/multifrost/golang`.
+
+If you are using this repo checkout directly:
+
 ```bash
-cargo install --git https://github.com/lirrensi/Multifrost.git
+cd golang
+go build ./...
+go test ./...
 ```
+
+In Go code, import the module path declared by `golang/go.mod`:
+
+```go
+import multifrost "github.com/multifrost/golang"
+```
+
+### Rust (`rust/`)
+
+The Rust implementation is a crate rooted in `rust/`.
+
+If you are working from this repo checkout:
+
+```bash
+cd rust
+cargo build
+cargo test
+```
+
+To use it from another local Rust project during development, add a path dependency:
+
+```toml
+[dependencies]
+multifrost = { path = "../Multifrost/rust" }
+```
+
+### Why not one root install command?
+
+Because this repository contains multiple language-specific packages, not one package manager format shared by every ecosystem. Python packaging, npm packaging, Go modules, and Rust crates each expect their own manifest in their own directory.
+
+- Python resolves `python/pyproject.toml`
+- npm resolves `javascript/package.json`
+- Go resolves `golang/go.mod`
+- Cargo resolves `rust/Cargo.toml`
+
+So if you only want one implementation, you do not need the whole repo layout in your build tool - just the subdirectory for that language, or a local clone that points at it.
 
 ### Development
 ```bash
