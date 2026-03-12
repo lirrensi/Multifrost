@@ -34,6 +34,18 @@ function describe(name: string, fn: () => void): void {
     }
 }
 
+function assertThrowsRangeError(action: () => void, message: string, expectedText?: string): void {
+    try {
+        action();
+        assert(false, message);
+    } catch (e) {
+        assert(e instanceof RangeError, `${message} should throw RangeError`);
+        if (expectedText) {
+            assert((e as Error).message.includes(expectedText), `${message} should mention ${expectedText}`);
+        }
+    }
+}
+
 // ============================================================================
 // TESTS: ComlinkMessage Construction
 // ============================================================================
@@ -170,7 +182,7 @@ describe("ComlinkMessage: Pack/Unpack with Complex Args", () => {
     
     assert(Array.isArray(unpacked.args), "Args should be array");
     assert(unpacked.args?.length === complexArgs.length, "Args length should match");
-    assert(unpacked.args?.[0]?.name === "test", "Nested object should match");
+    assert((unpacked.args?.[0] as { name?: string } | undefined)?.name === "test", "Nested object should match");
 });
 
 describe("ComlinkMessage: Pack/Unpack Response", () => {
@@ -180,7 +192,7 @@ describe("ComlinkMessage: Pack/Unpack Response", () => {
     
     assert(unpacked.type === MessageType.RESPONSE, "Type should be RESPONSE");
     assert(unpacked.id === "req-789", "ID should match");
-    assert(unpacked.result?.nested?.deep?.value === 42, "Nested result should match");
+    assert((unpacked.result as { nested?: { deep?: { value?: number } } } | undefined)?.nested?.deep?.value === 42, "Nested result should match");
 });
 
 describe("ComlinkMessage: Pack/Unpack Error", () => {
@@ -189,6 +201,44 @@ describe("ComlinkMessage: Pack/Unpack Error", () => {
     
     assert(unpacked.type === MessageType.ERROR, "Type should be ERROR");
     assert(unpacked.error === "Something went wrong", "Error should match");
+});
+
+describe("ComlinkMessage: Max int64 bigint roundtrip", () => {
+    const original = ComlinkMessage.createCall("echo", [9223372036854775807n], "math");
+    const unpacked = ComlinkMessage.unpack(original.pack());
+
+    assert(unpacked.args?.[0] === 9223372036854775807n, "Max int64 bigint should survive roundtrip");
+});
+
+describe("ComlinkMessage: Min int64 bigint roundtrip", () => {
+    const original = ComlinkMessage.createCall("echo", [-9223372036854775808n], "math");
+    const unpacked = ComlinkMessage.unpack(original.pack());
+
+    assert(unpacked.args?.[0] === -9223372036854775808n, "Min int64 bigint should survive roundtrip");
+});
+
+describe("ComlinkMessage: Safe integers stay numbers", () => {
+    const original = ComlinkMessage.createCall("echo", [42], "math");
+    const unpacked = ComlinkMessage.unpack(original.pack());
+
+    assert(typeof unpacked.args?.[0] === "number", "Safe integers should unpack as number");
+    assert(unpacked.args?.[0] === 42, "Safe integers should preserve value");
+});
+
+describe("ComlinkMessage: Reject unsafe integer numbers", () => {
+    assertThrowsRangeError(
+        () => ComlinkMessage.createCall("echo", [Number.MAX_SAFE_INTEGER + 1], "math").pack(),
+        "Unsafe integer numbers should be rejected",
+        "bigint"
+    );
+});
+
+describe("ComlinkMessage: Reject bigint outside signed int64", () => {
+    assertThrowsRangeError(
+        () => ComlinkMessage.createCall("echo", [9223372036854775808n], "math").pack(),
+        "Out-of-range bigint should be rejected",
+        "decimal string"
+    );
 });
 
 // ============================================================================

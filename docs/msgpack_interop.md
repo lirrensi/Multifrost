@@ -2,6 +2,8 @@
 
 Quick reference for cross-language MessagePack serialization. Covers Python, JavaScript, Go, and Rust.
 
+> WARNING: Numeric edge-case parity across implementations is still being aligned. Treat the rules in this document as the supported contract, and prefer explicit encodings for precision-sensitive values until the full cross-language matrix is enforced by tests.
+
 ---
 
 ## Critical Configuration (Per Language)
@@ -9,23 +11,24 @@ Quick reference for cross-language MessagePack serialization. Covers Python, Jav
 | Language | Must Enable | Why |
 |----------|-------------|-----|
 | **Python** | `use_bin_type=True`, `raw=False` | Distinguishes bytes from strings; decodes strings as `str` not `bytes` |
-| **JavaScript** | `useBigInt64: true` | Prevents truncation of integers >2^53 |
+| **JavaScript** | `msgpackr` int64 decoding (`int64AsType: 'auto'` or `bigint`) | Prevents precision loss when interoperating with signed int64 values |
 | **Go** | Struct tags (`msgpack:"field"`) | Field name matching; use `*T` for optional fields |
 | **Rust** | `#[serde(default)]` | Handles missing fields from dynamic languages |
 
 ---
 
-## Top 9 Gotchas
+## Top 10 Gotchas
 
 1. **String vs Binary** — Python `bytes` without `use_bin_type=True` serialize as strings → Go/Rust crash on UTF-8 decode
-2. **Integer Overflow** — Python arbitrary precision (`2**100`) → crashes Go/Rust `int64`
-3. **Non-String Map Keys** — `{1: "x"}` works in Python → breaks JS (auto-stringifies), confuses typed languages
-4. **NaN/Infinity** — Inconsistent handling across languages; convert to `null`
-5. **Optional Fields** — Go zero-values hide "missing" vs "default"; use pointers `*T`
-6. **Unknown Fields** — Rust errors by default; add `#[serde(default)]` or `#[serde(deny_unknown_fields)]`
-7. **Timestamps** — Use Ext type -1 (native), not ISO strings
-8. **Size/Depth Limits** — Set `max_*_len` in Python; prevent DoS and stack overflow
-9. **interface{} Boxing** — msgpack decodes arrays as `[]interface{}` and maps as `map[string]interface{}` in Go → requires unwrapping in typed method parameters
+2. **JS Safe Integer Boundary** — JavaScript `number` loses integer precision above `2^53 - 1` before packing; use `bigint` or an explicit string encoding
+3. **Integers Outside int64 Contract** — Python arbitrary precision (`2**100`) is outside the portable subset; do not silently clamp it
+4. **Non-String Map Keys** — `{1: "x"}` works in Python → breaks JS (auto-stringifies), confuses typed languages
+5. **NaN/Infinity** — Generic payload path normalizes them to `null`; do not rely on preserving non-finite floats
+6. **Optional Fields** — Go zero-values hide "missing" vs "default"; use pointers `*T`
+7. **Unknown Fields** — Rust errors by default; add `#[serde(default)]` or `#[serde(deny_unknown_fields)]`
+8. **Timestamps** — Use Ext type -1 (native), not ISO strings
+9. **Size/Depth Limits** — Set `max_*_len` in Python; prevent DoS and stack overflow
+10. **interface{} Boxing** — msgpack decodes arrays as `[]interface{}` and maps as `map[string]interface{}` in Go → requires unwrapping in typed method parameters
 
 ---
 
@@ -34,15 +37,17 @@ Quick reference for cross-language MessagePack serialization. Covers Python, Jav
 **Always Safe:**
 - Strings (UTF-8)
 - Integers in range `[-2^63, 2^63-1]`
-- Floats (no NaN/Infinity)
+- Finite floats
 - `bool`, `null`
 - Arrays, objects with string keys only
 - Binary data (with proper config)
 
 **Avoid or Handle Carefully:**
 - Non-string map keys
-- Integers >2^63
+- Integers outside `[-2^63, 2^63-1]`
+- Exact decimals / money
 - `NaN`, `Infinity`
+- Exact float-bit preservation or tensor payloads
 - Circular references
 - Python tuples as keys
 - Rust enums (complex ADT format)
@@ -50,12 +55,13 @@ Quick reference for cross-language MessagePack serialization. Covers Python, Jav
 
 ---
 
-## Auto-Healing Strategy (Bridge/RPC)
+## Normalization / Guardrails (Bridge/RPC)
 
 | Issue | Action |
 |-------|--------|
-| NaN/Infinity | → `null` (silent) |
-| Integer >2^63 | → clamp to int64 max |
+| NaN/Infinity | → `null` on the generic wire path |
+| Integer outside `[-2^63, 2^63-1]` | → explicit application encoding or **ERROR**; never silently clamp |
+| JavaScript integer outside safe `number` range | → use `bigint` or explicit string encoding before packing |
 | Non-string key | → stringify |
 | Circular ref / depth >100 | → **ERROR** (hard limit) |
 | Collection >100k items | → **ERROR** (DoS protection) |
@@ -81,10 +87,13 @@ unpacked = msgpack.unpackb(
 
 ### JavaScript
 ```javascript
-import { encode, decode } from '@msgpack/msgpack';
+import { Packr, Unpackr } from 'msgpackr';
 
-const encoded = encode(data, { useBigInt64: true });
-const decoded = decode(encoded, { useBigInt64: true });
+const packr = new Packr({ useRecords: false });
+const unpackr = new Unpackr({ int64AsType: 'auto' });
+
+const encoded = packr.pack(data);
+const decoded = unpackr.unpack(encoded);
 ```
 
 ### Go
@@ -117,14 +126,28 @@ let decoded: Config = rmp_serde::from_slice(&data)?;
 | Problem | Python Fix | JavaScript Fix | Go Fix | Rust Fix |
 |---------|-----------|----------------|---------|----------|
 | Binary vs String | `use_bin_type=True` | Use `Uint8Array` | Use `[]byte` | Use `Vec<u8>` |
-| Large Integers | Limit to ±2^63 | `useBigInt64: true` | Use `int64` | Use `i64` |
+| Large Integers | Keep generic numeric path within ±`2^63` | Preserve int64 without precision loss; encode larger values explicitly | Use `int64` for generic path; encode larger values explicitly | Use `i64` for generic path; encode larger values explicitly |
 | Optional Fields | Don't send if `None` | `ignoreUndefined: true` | Use `*T` + `omitempty` | Use `Option<T>` |
 | Map Keys | Use only strings | Objects = string keys only | Use `map[string]T` | Use `HashMap<String, T>` |
 | Unknown Fields | Ignore them | Ignore them | Ignore by default | `#[serde(default)]` |
-| NaN/Infinity | Avoid or use `null` | Convert to `null` | Handle as `null` | Handle as `None` |
+| NaN/Infinity | Avoid or use `null` | Normalize to `null` | Normalize to `null` | Normalize to `null` |
+| Exact decimals | Encode as string or scaled int | Encode as string or scaled int | Encode as string or scaled int | Encode as string or scaled int |
 | Timestamps | `datetime=True` | Manual encoding | Use `time.Time` | Use `chrono` crate |
 | Array/Map Boxing | N/A (native) | N/A (native) | Use `unwrapInterface()` helper | Use `Option<T>` for nullable |
 | Float for Integer | Avoid | Avoid | Automatic conversion | Avoid |
+
+---
+
+## Precision-Sensitive Values
+
+The base Multifrost contract intentionally does not define a special-number extension.
+
+- **Huge integers / BigInt beyond int64**: Encode as decimal strings.
+- **Exact decimals / money**: Encode as decimal strings or a scaled-integer schema like `{ units, scale }`.
+- **Exact float bits / tensors**: Encode as binary plus metadata such as `dtype`, `shape`, and `endianness`.
+- **Helper utilities**: Implementations MAY provide explicit helper functions for these encodings, but helpers are convenience APIs at the application boundary and do not change the core MessagePack contract.
+
+> Warning: If precision matters, do not rely on the generic numeric path for values outside the signed int64 + finite-float subset.
 
 ---
 
@@ -244,17 +267,20 @@ Create a torture test payload and verify round-trips across all language pairs:
 - Go → Rust → Go
 - etc.
 
+Also test any explicit application encoding you use for values outside the portable numeric subset (for example decimal-string bigints or binary tensor payloads).
+
 ---
 
 ## Production Checklist
 
 - [ ] Binary type distinction enabled (`use_bin_type=True` in Python)
 - [ ] String decoding enabled (`raw=False` in Python)
-- [ ] BigInt support enabled (JavaScript)
+- [ ] Int64 decoding in JavaScript preserves precision
 - [ ] Struct tags defined (Go)
 - [ ] Optional fields use `Option`/pointers (Rust/Go)
 - [ ] Size limits configured (prevent DoS)
 - [ ] Timestamp handling standardized (use ext type -1)
 - [ ] Schema version field included in all messages
+- [ ] Precision-sensitive values use explicit application encoding
 - [ ] Round-trip tests pass for all language pairs
 - [ ] Error handling implemented for all deserialize paths

@@ -59,6 +59,10 @@ Date: 2026-02-11
 5.2 id: string, UUID v4 recommended.
 5.3 type: string, one of call|response|error|stdout|stderr|heartbeat|shutdown.
 5.4 timestamp: number, seconds since Unix epoch (float).
+5.5 Portable numeric values in generic payload fields (`args`, `result`, `metadata`) are signed integers in `[-2^63, 2^63-1]` and finite floats.
+5.6 Receivers MUST normalize `NaN`, `Infinity`, and `-Infinity` to `null` on the generic wire path.
+5.7 Values requiring precision beyond the portable numeric subset (for example arbitrarily large integers, exact decimals, tensor dtypes, or exact float-bit preservation) are out of scope for the base protocol and MUST be explicitly encoded by the application.
+5.8 Implementations MAY expose helper utilities for such explicit encodings, but helpers are convenience APIs only and MUST NOT change default wire semantics.
 
 6. Message Types
 ----------------
@@ -67,14 +71,14 @@ Date: 2026-02-11
 6.1.1 Required fields: function, args (can be empty), namespace (default 'default').
 6.1.2 Optional fields: client_name.
 6.1.3 function MUST be a string, the method name exposed by Child.
-6.1.4 args MUST be an array/list of positional arguments.
+6.1.4 args MUST be an array/list of positional arguments whose values follow sections 5.5-5.8.
 6.1.5 namespace SHOULD be a string; Child ignores mismatched namespace.
 6.1.6 Child MUST reject methods starting with '_' (private).
 
 6.2 RESPONSE
 6.2.1 Required fields: result.
 6.2.2 id MUST match the CALL id.
-6.2.3 result MAY be any msgpack-serializable value.
+6.2.3 result MAY be any msgpack-serializable value that follows sections 5.5-5.8.
 
 6.3 ERROR
 6.3.1 Required fields: error (string).

@@ -2,10 +2,23 @@ import * as zmq from "zeromq";
 import { spawn, ChildProcess } from "child_process";
 import { randomUUID } from "crypto";
 import * as net from "net";
-import * as msgpack from "msgpackr";
+import { Packr, Unpackr } from "msgpackr";
 import { ServiceRegistry } from "./service_registry.js";
 
 const APP_NAME = "comlink_ipc_v4";
+const SIGNED_INT64_MIN = -(1n << 63n);
+const SIGNED_INT64_MAX = (1n << 63n) - 1n;
+const MSGPACK_ENCODER = new Packr({ useRecords: false });
+const MSGPACK_DECODER = new Unpackr({
+    useRecords: false,
+    int64AsType: "auto" as unknown as "bigint" | "number" | "string",
+});
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+    if (value === null || typeof value !== "object") return false;
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+}
 
 /**
  * Sanitize values for msgpack serialization to ensure cross-language interop safety.
@@ -13,12 +26,26 @@ const APP_NAME = "comlink_ipc_v4";
  */
 function sanitizeForMsgpack(value: unknown): unknown {
     if (typeof value === "number") {
-        if (isNaN(value) || !isFinite(value)) return null;
-        // Clamp to safe integer range (2^53) for interop
-        if (Math.abs(value) > 2 ** 53 && !Number.isInteger(value)) {
-            return Math.round(value);
+        if (!Number.isFinite(value)) return null;
+        if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+            throw new RangeError(
+                "Unsafe integer numbers must be encoded as bigint or an explicit encoding such as a decimal string."
+            );
         }
+
+        return value;
     }
+
+    if (typeof value === "bigint") {
+        if (value < SIGNED_INT64_MIN || value > SIGNED_INT64_MAX) {
+            throw new RangeError(
+                "BigInt values outside signed int64 range must be encoded explicitly, for example as a decimal string."
+            );
+        }
+
+        return value;
+    }
+
     return value;
 }
 
@@ -28,11 +55,11 @@ function sanitizeForMsgpack(value: unknown): unknown {
 function deepSanitize(obj: unknown): unknown {
     if (obj === null || obj === undefined) return obj;
     if (Array.isArray(obj)) return obj.map(item => deepSanitize(item));
-    if (typeof obj === "object") {
+    if (isPlainObject(obj)) {
         const result: Record<string, unknown> = {};
         for (const key in obj) {
             if (Object.prototype.hasOwnProperty.call(obj, key)) {
-                result[key] = deepSanitize((obj as Record<string, unknown>)[key]);
+                result[key] = deepSanitize(obj[key]);
             }
         }
         return result;
@@ -147,14 +174,14 @@ static createCall(
         return result;
     }
 
-pack(): Buffer {
+    pack(): Buffer {
         const sanitized = deepSanitize(this.toDict());
-        return msgpack.encode(sanitized);
+        return MSGPACK_ENCODER.pack(sanitized);
     }
     
     static unpack(data: Buffer): ComlinkMessage {
         try {
-            const decoded = msgpack.decode(data);
+            const decoded = MSGPACK_DECODER.unpack(data);
             return new ComlinkMessage(decoded);
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
@@ -530,6 +557,10 @@ export class ParentWorker {
             // Send message with DEALER envelope: [empty_frame, message_data]
             this._sendMessage(message).catch(error => {
                 settle(false);
+                if (error instanceof RangeError) {
+                    reject(error);
+                    return;
+                }
                 const errorMessage = error instanceof Error ? error.message : String(error);
                 reject(new Error(`Failed to send request: ${errorMessage}`));
             });

@@ -1,10 +1,12 @@
 # Multifrost Support Matrix
 
 **Version**: 1.0
-**Last Updated**: 2026-02-12
-**Status**: ✅ All implementations complete
+**Last Updated**: 2026-03-13
+**Status**: ⚠️ Broad feature coverage; parity alignment in progress
 
 This document provides a comprehensive overview of feature support across all Multifrost language implementations (Python, JavaScript, Go, Rust).
+
+> WARNING: This matrix describes the intended supported surface area, not a guarantee that every edge case is perfectly aligned today. For portable numeric payloads, number gotchas, and current guidance on precision-sensitive values, treat `docs/msgpack_interop.md` as the source of truth.
 
 ---
 
@@ -13,7 +15,7 @@ This document provides a comprehensive overview of feature support across all Mu
 | Feature Category | Python | JavaScript | Go | Rust | Notes |
 |------------------|--------|------------|-----|------|-------|
 | ZeroMQ DEALER/ROUTER | ✅ | ✅ | ✅ | ✅ | Core communication |
-| msgpack Serialization | ✅ | ✅ | ✅ | ✅ | Message encoding |
+| msgpack Serialization | ✅ | ✅ | ✅ | ✅ | Message encoding; portable numeric subset defined in `docs/msgpack_interop.md` |
 | Spawn Mode | ✅ | ✅ | ✅ | ✅ | Child process spawning |
 | Connect Mode | ✅ | ✅ | ✅ | ✅ | Remote connection |
 | Circuit Breaker | ✅ | ✅ | ✅ | ✅ | Fault tolerance |
@@ -38,6 +40,7 @@ This document provides a comprehensive overview of feature support across all Mu
 - All implementations use consistent message framing format
 - msgpack ensures binary compatibility across languages
 - DEALER/ROUTER pattern enables request/response semantics
+- Numeric edge-case portability is limited to the documented safe subset in `docs/msgpack_interop.md`
 
 ---
 
@@ -291,14 +294,14 @@ This document provides a comprehensive overview of feature support across all Mu
 
 ## Conclusion
 
-All Multifrost language implementations (Python, JavaScript, Go, Rust) provide **full parity** with the language-agnostic specification. Each implementation leverages language-specific features to provide the best developer experience:
+Multifrost language implementations target the same language-agnostic specification, but parity alignment is still in progress for some numeric edge cases and operational details. Each implementation leverages language-specific features to provide the best developer experience:
 
 - **Python**: Async-first with robust type hints and sync wrapper
 - **JavaScript**: Fluent API with Proxy-based method chaining
 - **Go**: Explicit error handling with goroutine concurrency
 - **Rust**: Strong type safety with async-native design
 
-The core communication features (ZeroMQ, msgpack, spawn/connect modes) are identical across all implementations, ensuring consistent behavior regardless of language choice.
+The core communication features (ZeroMQ, msgpack, spawn/connect modes) are shared across implementations, and the portable data subset is defined in `docs/msgpack_interop.md`.
 
 ---
 

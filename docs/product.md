@@ -517,8 +517,8 @@ See `docs/protocol.md` for full specification.
 | Type | Notes |
 |------|-------|
 | Strings (UTF-8) | Always safe |
-| Integers in [-2^63, 2^63-1] | Safe across all languages |
-| Floats (no NaN/Infinity) | Safe; convert NaN/Inf to null |
+| Integers in [-2^63, 2^63-1] | Portable numeric contract across all languages |
+| Finite floats | Portable across all languages |
 | Boolean | Safe |
 | Null | Safe |
 | Arrays | Safe |
@@ -528,12 +528,16 @@ See `docs/protocol.md` for full specification.
 
 | Type | Issue | Solution |
 |------|-------|----------|
-| Integers > 2^63 | Overflow in Go/Rust | Clamp to int64 max |
-| NaN / Infinity | Inconsistent handling | Convert to null |
+| Integers outside [-2^63, 2^63-1] | Outside guaranteed numeric subset; JavaScript `number` may already lose precision before packing | Encode explicitly (for example decimal string) |
+| Exact decimals / money | Binary floats may lose decimal precision | Encode as decimal string or `{units, scale}` |
+| NaN / Infinity | Not portable in generic numeric payloads | Normalize to `null` |
+| Exact float bits / tensors | Generic numeric path does not preserve dtype or bit layout | Encode as bytes plus application schema |
 | Non-string map keys | Breaks JS, confuses typed languages | Stringify keys |
 | Binary data | String/bytes confusion | Use `use_bin_type=True` in Python |
 
 See `docs/msgpack_interop.md` for detailed guidance.
+
+> Warning: Multifrost intentionally keeps the base numeric contract small. The generic wire path guarantees signed int64 integers and finite floats only. Values outside that subset are application-defined encodings. Implementations MAY expose small helper utilities for explicit encodings (for example bigint-to-string helpers), but those helpers are convenience APIs and do not change the core wire contract.
 
 ### 11.3 Known Divergences
 
@@ -543,6 +547,7 @@ See `docs/msgpack_interop.md` for detailed guidance.
 | `--worker` arg | Python adds, JS does not | Internal only, no interop impact |
 | Sync API | Python has, JS does not | API difference, same wire protocol |
 | STDOUT forwarding | All forward, implementation differs | Same behavior to parent |
+| Numeric edge cases | Parity still being aligned | Follow `docs/msgpack_interop.md` for the portable subset and gotchas |
 
 ---
 

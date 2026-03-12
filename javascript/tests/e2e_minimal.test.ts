@@ -13,7 +13,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 // Paths to worker scripts
-const PYTHON_WORKER = join(__dirname, "..", "e2e", "workers", "math_worker.py");
+const PYTHON_WORKER = join(__dirname, "..", "..", "e2e", "workers", "math_worker.py");
 
 // Test state
 let passed = 0;
@@ -95,6 +95,32 @@ async function testJSParentPythonChildVariousTypes() {
             result = await worker.call.echo({ a: 1, b: "test" });
             assert(typeof result === "object", "Should return object");
             assert((result as any).a === 1, "Object should have a=1");
+        } finally {
+            try { await worker.stop(); } catch {}
+        }
+    });
+}
+
+async function testJSParentPythonChildInt64Boundaries() {
+    await describe("JS -> Python: Int64 boundaries", async () => {
+        const worker = ParentWorker.spawn(PYTHON_WORKER, "python");
+
+        try {
+            await worker.start();
+            await new Promise(r => setTimeout(r, 2000));
+
+            const maxResult = await worker.call.echo(9223372036854775807n);
+            assert(maxResult === 9223372036854775807n, `echo(max int64) = ${String(maxResult)}`);
+
+            const minResult = await worker.call.echo(-9223372036854775808n);
+            assert(minResult === -9223372036854775808n, `echo(min int64) = ${String(minResult)}`);
+
+            try {
+                await worker.call.echo(Number.MAX_SAFE_INTEGER + 1);
+                assert(false, "Unsafe integer number should reject before transport");
+            } catch (e) {
+                assert(e instanceof RangeError, "Unsafe integer number should reject with RangeError");
+            }
         } finally {
             try { await worker.stop(); } catch {}
         }
@@ -196,6 +222,7 @@ async function runAllTests() {
     // JS Parent -> Python Child tests (cross-language!)
     await testJSParentPythonChildBasicCall();
     await testJSParentPythonChildVariousTypes();
+    await testJSParentPythonChildInt64Boundaries();
     await testJSParentPythonChildErrorHandling();
     await testJSParentPythonChildInfo();
     await testJSParentPythonChildFactorial();
@@ -209,6 +236,8 @@ async function runAllTests() {
     if (failed > 0) {
         process.exit(1);
     }
+
+    process.exit(0);
 }
 
 // Run if this is the entry point

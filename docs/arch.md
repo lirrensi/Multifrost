@@ -330,6 +330,14 @@ The wire protocol is identical across implementations:
 
 > **Async Nature**: This library is async-native. Adapters should use their language's idiomatic async approach (asyncio, Promises, etc.) and support both sync and async method handlers in Child. JavaScript is async-only (no sync mode) due to Node.js's single-threaded nature.
 
+### Portable Value Contract
+
+- The portable numeric subset for generic payloads (`args`, `result`, `metadata`) is signed integers in `[-2^63, 2^63-1]` and finite IEEE-754 floats.
+- Receivers MUST normalize `NaN`, `Infinity`, and `-Infinity` to `null` on the generic wire path.
+- The base protocol MUST NOT define implicit bigint, decimal, tensor, or exact-float extensions.
+- Applications that need values outside the portable subset MUST encode them explicitly (for example decimal strings, scaled integers, or binary payloads with application schema).
+- Implementations MAY offer helper utilities for these explicit encodings, but helper utilities are convenience APIs outside protocol conformance and MUST NOT change default wire semantics.
+
 ### Example: Python Parent, JS Child
 
 ```python
