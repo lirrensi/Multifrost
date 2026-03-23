@@ -1,716 +1,202 @@
-# Multifrost Product Specification
+# Multifrost Product Canon
 
-**Version**: 2.0  
-**Protocol ID**: `comlink_ipc_v4`  
-**Status**: Canonical
+Status: Canonical
+Version: v5 direction
 
-This document defines what Multifrost is, what every feature does, and how it behaves. It is the authoritative specification. If code and this document disagree, this document wins.
+## Overview
 
----
+Multifrost is a cross-language RPC fabric for local and trusted-network runtimes.
+It lets separately running code talk to named services as if they were local
+functions, without forcing callers to manage direct sockets, ports, or bespoke
+transport glue.
 
-## 1. Product Overview
+Version 5 changes the product shape in an important way: Multifrost is no longer
+defined around a parent owning a child worker. It is defined around a shared
+router and two explicit runtime classes:
 
-Multifrost is a multilanguage IPC (Inter-Process Communication) library that enables a **Parent** process to call methods on a **Child** worker process as if they were local function calls.
+- `service peer`: exposes callable functions under a unique `peer_id`
+- `caller peer`: issues calls and receives responses under its own `peer_id`
 
-### Core Value Proposition
+Both connect to the same router. The router is the shared space. Callers do not
+need a direct relationship with services, and services do not need to know who
+started them.
 
-- **Cross-language**: A parent in one language can call a child in any other supported language
-- **Transparent RPC**: Remote method calls look like local function calls
-- **Process isolation**: Child runs in separate OS process with independent memory and lifecycle
-- **Two modes**: Spawn (parent owns child) or Connect (connect to existing service)
+The developer experience should still feel familiar: connect, call a method,
+get a result, handle an error.
 
-### Problem Solved
+## Core Capabilities
 
-| Without Multifrost | With Multifrost |
-|--------------------|-----------------|
-| Manual socket management | ZeroMQ abstraction |
-| Custom serialization | msgpack auto-handled |
-| Language-specific IPC | Cross-language interoperability |
-| No fault tolerance | Circuit breaker, heartbeat, auto-restart |
-| No observability | Built-in metrics and structured logging |
+- Cross-language request/response calls through one shared router
+- Named service addressing through stable `peer_id` values
+- Separate caller and service identities with the same routing model
+- Router-backed presence checks before issuing work
+- Optional process startup helpers without making process ownership the product
+- A WebSocket transport model where connection state is the liveness signal
 
----
+## Main User Flows
 
-## 2. Supported Languages
+### Run a service
 
-| Language | Minimum Version | Package Name | Language Docs |
-|----------|-----------------|--------------|---------------|
-| **Python** | 3.10+ | `multifrost` | `python/docs/arch.md` |
-| **JavaScript** | Node.js 18+ | `multifrost` | `javascript/docs/arch.md` |
-| **Go** | 1.21+ | `multifrost` | `golang/docs/arch.md` |
-| **Rust** | 1.70+ | `multifrost` | `rust/docs/arch.md` |
+1. A service peer starts in its own process.
+2. It determines its `peer_id`.
+3. If no explicit `peer_id` is configured, the absolute file path becomes the
+   default identity.
+4. It attempts to connect to the router immediately.
+5. If the router is missing, it may coordinate router bootstrap through a shared
+   lock and then continue connecting.
+6. Once connected, it registers itself as a live `service` entry and waits for
+   incoming calls.
 
-All implementations share the same wire protocol and are fully interoperable.
+### Call a service
 
----
+1. A caller peer starts or is created by application code.
+2. It gets a `peer_id`, usually random or otherwise ephemeral.
+3. It connects to the router.
+4. It may query the router to verify that a target service peer exists.
+5. It sends a call addressed to the target service's `peer_id`.
+6. The router forwards the call and returns the response or error back to the
+   caller's own `peer_id`.
 
-## 3. Core Concepts
+### Host many peers in one process
 
-### 3.1 Roles
+One process may host:
 
-| Role | Responsibility | Socket Type |
-|------|----------------|-------------|
-| **Parent** | Initiates calls, manages child lifecycle (in spawn mode) | DEALER |
-| **Child** | Exposes callable methods, handles requests | ROUTER |
+- many service peers,
+- many caller peers,
+- or both.
 
-A process can be both a parent (calling other workers) and a child (exposing methods to other parents).
+These are still separate instances with separate responsibilities and separate
+`peer_id` values. A service peer may use one or more caller peers internally,
+but that does not merge the two classes.
 
-### 3.2 Lifecycle Modes
+### Start a worker process optionally
 
-| Mode | Who Binds | Who Connects | Use Case |
-|------|-----------|--------------|----------|
-| **Spawn** | Parent binds, Child connects | Parent owns child process | Parent controls worker lifetime |
-| **Connect** | Child binds, Parent connects | Child registers with discovery | Long-running services, multiple parents |
+`spawn` remains useful when one process wants to launch and supervise another.
+That is an operational helper, not the center of the product model.
 
-**Spawn mode**: Parent creates a full OS process. The executable can be any language runtime (python, node, go, etc.). Parent is responsible for child lifecycle.
+`spawn` starts a process. The started process then behaves like any other
+service peer: it eagerly connects to the router and may bootstrap the router if
+needed. `spawn` itself does not own router startup.
 
-**Connect mode**: Child registers itself in a service registry. Parent discovers and connects. Child may serve multiple parents. Child controls its own lifecycle.
+## System Shape
 
-### 3.3 Namespaces
+### Router
 
-Namespaces route messages to specific method groups within a child.
+The router is the shared runtime hub.
 
-- Default namespace: `"default"`
-- Child ignores calls with mismatched namespace
-- Parent can specify namespace per-call
+It is responsible for:
 
-### 3.4 Service Registry
+- accepting peer connections,
+- tracking which `peer_id` values are live,
+- recording whether a connected entry is a `service` or a `caller`,
+- routing requests by `to`,
+- routing responses and errors by `from`/`to`,
+- answering router-level presence queries,
+- using WebSocket connection state as the main liveness signal.
 
-Location: `~/.multifrost/services.json`
+The router is intentionally small. It routes traffic and tracks presence. It is
+not the application runtime.
 
-Used in connect mode for service discovery. Contains:
+The router is also long-lived. Once started, it is not owned by the peer that
+bootstrapped it. If the bootstrapper later exits, the router continues running
+until it is explicitly terminated or the host environment cleans it up.
 
-```json
-{
-  "service-id": {
-    "port": 5555,
-    "pid": 12345,
-    "started": "2026-02-11T12:00:00"
-  }
-}
-```
+### Service Peers
 
-Rules:
-- Registration fails if service_id exists with live PID
-- Dead PIDs are overwritten
-- Unregister only removes if PID matches
-- Atomic file locking prevents race conditions
+Service peers are the callable endpoints of the system.
 
----
+They:
 
-## 4. API Surface (Language-Agnostic)
+- expose functions,
+- own stable identities,
+- receive calls addressed to their own `peer_id`,
+- return results or structured errors.
 
-### 4.1 ParentWorker
+### Caller Peers
 
-#### Factory Methods
+Caller peers are the outbound side of the system.
 
-| Method | Description |
-|--------|-------------|
-| `ParentWorker.spawn(scriptPath, executable?, options?)` | Create parent that owns child process |
-| `ParentWorker.connect(serviceId, timeout?)` | Connect to existing service by ID |
+They:
 
-#### Options (Spawn Mode)
+- issue calls,
+- receive responses and errors back on their own `peer_id`,
+- may be short-lived or long-lived,
+- are not considered callable services by default.
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `autoRestart` | boolean | false | Restart child on crash |
-| `maxRestartAttempts` | number | 5 | Max restart attempts before giving up |
-| `defaultTimeout` | number | none | Default call timeout in milliseconds |
-| `heartbeatInterval` | number | 5.0 | Seconds between heartbeats |
-| `heartbeatTimeout` | number | 3.0 | Seconds to wait for heartbeat response |
-| `heartbeatMaxMisses` | number | 3 | Consecutive misses before circuit trips |
+### Shared Identity Model
 
-#### Lifecycle Methods
+Service peers and caller peers use the same routing idea:
 
-| Method | Description |
-|--------|-------------|
-| `start()` | Start the worker (bind socket, spawn child or connect) |
-| `close()` / `stop()` | Stop the worker (close socket, terminate child if spawned) |
+- every peer has a `peer_id`,
+- every routed message has `from` and `to`,
+- the router tracks both identity and peer class.
 
-#### Handle Methods
+The important difference is semantic, not structural: service peers are public
+call targets; caller peers are routing endpoints for outbound work and return
+paths.
 
-| Method | Description |
-|--------|-------------|
-| `worker.handle()` | Returns async handle (lifecycle + call interface) |
-| `worker.handle_sync()` | Returns sync handle (Python only) |
+One process may host many peer instances. The process itself is not "the peer."
+The individual service-peer and caller-peer instances are the peers.
 
-The handle is a lightweight interface that delegates to the worker's internal lifecycle methods. Worker holds the state; handle provides the API shape (sync/async).
+### Router Bootstrap
 
-#### Remote Calls
+The router is a shared local runtime dependency. It may already exist, or it may
+need to be started by the first participant that notices it is absent.
 
-| Syntax | Description |
-|--------|-------------|
-| `handle.start()` / `handle.stop()` | Lifecycle (mode: sync or async) |
-| `handle.call.methodName(...args)` | Call remote method |
-| `handle.call.withOptions({timeout?, namespace?}).methodName(...args)` | Call with per-call options |
+Router bootstrap is coordinated by peers themselves:
 
-#### Properties
+- any service peer or caller peer may attempt bootstrap if connect fails,
+- bootstrap is serialized with a shared OS-level lock,
+- the peer holding the lock re-checks router reachability before starting a new
+  router,
+- once the router is reachable, normal registration and traffic continue.
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `isHealthy` | boolean | Circuit breaker not tripped |
-| `circuitOpen` | boolean | Circuit breaker state |
-| `lastHeartbeatRttMs` | number \| undefined | Last heartbeat round-trip time |
-| `metrics` | Metrics | Performance metrics collector |
+This keeps startup race-safe without making router ownership part of the caller
+or service relationship.
 
-### 4.2 ChildWorker
+Bootstrap does not imply ownership. The peer that happened to start the router
+does not gain special lifecycle authority over it.
 
-#### Constructor
+## Design Principles
 
-| Syntax | Description |
-|--------|-------------|
-| `ChildWorker(serviceId?)` | Create child worker, optionally with service ID for connect mode |
+- Preserve the feeling of local method calls
+- Make the router the single shared routing point
+- Keep service peers and caller peers explicit and separate
+- Keep routing metadata small and inspectable
+- Use WebSocket connection state as the primary health signal
+- Keep process management helpers outside the core network model
+- Let one process host many independent peer instances
 
-#### Lifecycle Methods
+## Non-Goals
 
-| Method | Description |
-|--------|-------------|
-| `run()` | Blocking run loop with signal handling |
-| `start()` | Start the worker (non-blocking where applicable) |
-| `stop()` | Stop the worker |
+Multifrost v5 is not trying to be:
 
-#### Introspection
+- a direct peer-to-peer mesh as the default model,
+- a router that validates application function names or argument shapes,
+- a built-in load balancer,
+- a parent-child ownership protocol,
+- a PID-based correctness model,
+- a guarantee of exactly-once delivery,
+- a public-internet security layer by itself.
 
-| Method | Description |
-|--------|-------------|
-| `listFunctions()` | List all callable method names |
+## Migration Posture
 
-### 4.3 Per-Language Syntax
+v5 is a clean directional break from the v4 mental model.
 
-#### ParentWorker Creation
+What remains familiar:
 
-| Language | Spawn | Connect |
-|----------|-------|---------|
-| Python | `ParentWorker.spawn("worker.py", "python")` | `await ParentWorker.connect("my-service")` |
-| JavaScript | `ParentWorker.spawn("worker.ts", "tsx")` | `await ParentWorker.connect("my-service")` |
-| Go | `multifrost.Spawn("worker", "go")` | `multifrost.Connect("my-service")` |
-| Rust | `ParentWorker::spawn("worker.rs", "cargo")` | `ParentWorker::connect("my-service").await` |
+- remote calls still feel local,
+- handles and call-oriented APIs remain the intended developer experience,
+- explicit service identities remain central.
 
-#### Remote Call Syntax
+What changes:
 
-| Language | Async Handle | Sync Handle | Notes |
-|----------|--------------|-------------|-------|
-| Python | `worker.handle()` | `worker.handle_sync()` | Both available |
-| JavaScript | `worker.handle()` | N/A | Async-only |
-| Go | `worker.Handle()` | N/A | Goroutines handle concurrency |
-| Rust | `worker.handle()` | N/A | Async-first, can add later |
+- the core model is router-based rather than direct parent-child IPC,
+- `connect` is the canonical way peers join the network,
+- `spawn` is only a helper,
+- service presence is discovered through the router,
+- service and caller responsibilities are separated explicitly.
 
-**Usage pattern (all languages):**
-
-```python
-worker = ParentWorker.spawn("script.py")  # Config
-handle = worker.handle()                   # Async handle
-await handle.start()                       # Start (mode: async)
-result = await handle.call.method(args)    # Call
-await handle.stop()                        # Stop (mode: async)
-```
-
-#### ChildWorker Definition
-
-| Language | Syntax |
-|----------|--------|
-| Python | `class MyWorker(ChildWorker): def method(self, ...): ...` |
-| JavaScript | `class MyWorker extends ChildWorker { method() { ... } }` |
-| Go | Implement `Worker` interface with methods |
-| Rust | Implement `Worker` trait |
-
----
-
-## 5. Lifecycle Modes
-
-### 5.1 Spawn Mode
-
-Parent owns the child process lifecycle.
-
-**Flow:**
-
-1. Parent finds free port
-2. Parent binds DEALER to `tcp://*:<port>`
-3. Parent spawns child with `COMLINK_ZMQ_PORT=<port>` env
-4. Child creates ROUTER, connects to `tcp://localhost:<port>`
-5. Parent sends CALL messages
-6. Child processes and responds
-7. On stop: Parent closes socket, terminates child
-
-**Environment Variables (set by parent):**
-
-| Variable | Description |
-|----------|-------------|
-| `COMLINK_ZMQ_PORT` | Port for child to connect to |
-| `COMLINK_WORKER_MODE` | Set to `"1"` (hint for child) |
-
-**Child behavior on invalid port:**
-- Port outside 1024-65535: Child exits immediately
-- Missing port env: Child exits immediately
-
-### 5.2 Connect Mode
-
-Child registers itself; parent discovers and connects.
-
-**Flow:**
-
-1. Child registers service_id in `~/.multifrost/services.json`
-2. Child binds ROUTER to `tcp://*:<port>`
-3. Parent discovers service_id, gets port from registry
-4. Parent connects DEALER to `tcp://localhost:<port>`
-5. Parent sends CALL; Child responds
-6. Child unregisters on shutdown (if PID matches)
-
-**Discovery behavior:**
-- Polling interval: 100ms
-- Default timeout: 5 seconds
-- Lock timeout: 10 seconds max
-
-**Multiple parents:**
-- Child ROUTER supports multiple connected parents
-- Each parent has unique sender_id
-- Responses routed by sender_id
-
----
-
-## 6. Remote Calls
-
-### 6.1 Method Invocation
-
-Parent calls methods on child as if local:
-
-```
-result = await parent.call.methodName(arg1, arg2)
-```
-
-**Behavior:**
-- Method name must exist on child
-- Arguments serialized via msgpack
-- Response deserialized and returned
-- Errors raised as `RemoteCallError`
-
-### 6.2 Timeouts
-
-| Mode | Behavior |
-|------|----------|
-| Per-call timeout | `parent.call.withOptions({timeout: 5000}).method()` |
-| Default timeout | Set via `defaultTimeout` option on spawn |
-| No timeout | Call waits indefinitely (not recommended) |
-
-**On timeout:**
-- Python: Raises `TimeoutError`
-- JavaScript: Promise rejects with timeout error
-- Go: Returns error
-- Rust: Returns `Err`
-
-### 6.3 Error Handling
-
-| Condition | Response |
-|-----------|----------|
-| Method not found | ERROR: "Function X not found" |
-| Method not callable | ERROR: "X is not callable" |
-| Private method (`_foo`) | ERROR: "Cannot call private method X" |
-| Exception in method | ERROR: message + traceback (if available) |
-| Timeout | Parent raises TimeoutError |
-| Child crash | Parent rejects pending with RemoteCallError |
-
-### 6.4 Concurrent Calls
-
-- Parent may issue concurrent calls
-- Each call has unique `id` for correlation
-- Responses may arrive out of order
-- Parent matches response to pending request by `id`
-- Child processes one message at a time (sequential)
-
----
-
-## 7. Reliability Features
-
-### 7.1 Circuit Breaker
-
-Prevents cascading failures by stopping calls to unhealthy children.
-
-**States:**
-- **Closed**: Normal operation, calls proceed
-- **Open**: Too many failures, calls rejected immediately
-
-**Trip conditions:**
-- `maxRestartAttempts` consecutive call failures (default: 5)
-- `heartbeatMaxMisses` consecutive heartbeat timeouts (default: 3)
-- Child process exit (spawn mode)
-
-**Reset conditions:**
-- Successful call after failures
-
-**When open:**
-- All calls raise `CircuitOpenError`
-- No network traffic sent
-
-### 7.2 Heartbeat Monitoring
-
-Periodic health checks between parent and child.
-
-**Configuration:**
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `heartbeatInterval` | 5.0 seconds | Time between heartbeats |
-| `heartbeatTimeout` | 3.0 seconds | Time to wait for response |
-| `heartbeatMaxMisses` | 3 | Misses before circuit trips |
-
-**Behavior:**
-- Parent sends HEARTBEAT message
-- Child echoes back immediately
-- Parent calculates RTT from timestamp
-- Consecutive misses trip circuit breaker
-
-### 7.3 Auto-Restart
-
-Automatically restart crashed child (spawn mode only).
-
-**Configuration:**
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `autoRestart` | false | Enable auto-restart |
-| `maxRestartAttempts` | 5 | Max attempts before giving up |
-
-**Behavior:**
-- On child crash, parent restarts with same configuration
-- Restart count tracked per-worker
-- After max attempts, circuit breaker trips
-
-### 7.4 Metrics
-
-Built-in performance tracking.
-
-**Available metrics:**
-
-| Metric | Description |
-|--------|-------------|
-| `totalCalls` | Total number of calls made |
-| `successfulCalls` | Calls that returned successfully |
-| `failedCalls` | Calls that returned errors |
-| `avgLatencyMs` | Average call latency |
-| `p50LatencyMs` | 50th percentile latency |
-| `p95LatencyMs` | 95th percentile latency |
-| `p99LatencyMs` | 99th percentile latency |
-| `circuitTrips` | Number of circuit breaker trips |
-| `heartbeatRttMs` | Last heartbeat RTT |
-
----
-
-## 8. Output Handling
-
-### 8.1 STDOUT/STDERR Forwarding
-
-Child process output is forwarded to parent.
-
-**Behavior:**
-- Child captures stdout/stderr writes
-- Child sends OUTPUT message to parent
-- Parent logs with context prefix: `[script_name STDOUT]: message`
-
-**Reliability:**
-- Output messages are best-effort
-- May be dropped under high load
-- Retries on send failure (up to 2 attempts)
-
-**Language differences:**
-
-| Language | STDOUT Forwarding | STDERR Forwarding |
-|----------|-------------------|-------------------|
-| Python | Yes (via ZMQWriter) | Yes (via ZMQWriter) |
-| JavaScript | Yes (console override) | Yes (console override) |
-| Go | Yes | Yes |
-| Rust | Yes | Yes |
-
----
-
-## 9. Error Handling
-
-### 9.1 Error Types
-
-| Error Type | Cause | Recoverable |
-|------------|-------|-------------|
-| `RemoteCallError` | Child returned error | Yes (fix child code) |
-| `TimeoutError` | Call exceeded timeout | Yes (increase timeout or fix slow method) |
-| `CircuitOpenError` | Circuit breaker tripped | Yes (wait for recovery or manual reset) |
-| `ConnectionError` | Cannot connect to child | Yes (check child is running) |
-| `RegistryError` | Service registry issue | Yes (check registry file) |
-
-### 9.2 Error Propagation
-
-**From child to parent:**
-
-1. Child catches exception in method
-2. Child creates ERROR message with error string
-3. Child includes traceback if available
-4. Parent receives ERROR, raises `RemoteCallError`
-
-**Error message format:**
-
-```
-ErrorType: message
-[Traceback: ...]
-```
-
-### 9.3 Recovery Behavior
-
-| Scenario | Recovery |
-|----------|----------|
-| Single call failure | Return error to caller |
-| Consecutive failures | Circuit breaker trips |
-| Child crash | Auto-restart (if enabled) or circuit trips |
-| Heartbeat miss | Increment miss counter |
-| Max heartbeat misses | Circuit breaker trips |
-
----
-
-## 10. Security Model
-
-### 10.1 Trust Model
-
-**The protocol is unauthenticated and unencrypted.**
-
-| Threat | Mitigation |
-|--------|------------|
-| Eavesdropping | Use only on localhost or trusted networks |
-| Man-in-the-middle | Use only on localhost or trusted networks |
-| Unauthorized access | Do not expose ports to untrusted clients |
-| Malicious input | Validate all inputs in worker methods |
-
-### 10.2 Safe Usage Patterns
-
-**Safe:**
-- Parent and child on same machine (localhost)
-- Parent and child on trusted private network
-- Behind firewall with restricted access
-
-**Unsafe:**
-- Exposing child port to public internet
-- Accepting calls from untrusted parents
-- Processing unvalidated user input in child methods
-
-### 10.3 Input Validation
-
-All arguments passed to child methods are untrusted. Child methods MUST validate:
-
-- Argument types
-- Argument ranges
-- Argument content (no injection attacks)
-
----
-
-## 11. Cross-Language Interoperability
-
-### 11.1 Wire Protocol
-
-All languages use identical wire protocol:
-
-- **Transport**: ZeroMQ over TCP
-- **Pattern**: ROUTER (Child) <-> DEALER (Parent)
-- **Encoding**: msgpack
-- **App ID**: `comlink_ipc_v4`
-
-See `docs/protocol.md` for full specification.
-
-### 11.2 Type Compatibility
-
-**Safe types (always work):**
-
-| Type | Notes |
-|------|-------|
-| Strings (UTF-8) | Always safe |
-| Integers in [-2^63, 2^63-1] | Portable numeric contract across all languages |
-| Finite floats | Portable across all languages |
-| Boolean | Safe |
-| Null | Safe |
-| Arrays | Safe |
-| Objects with string keys | Safe |
-
-**Problematic types:**
-
-| Type | Issue | Solution |
-|------|-------|----------|
-| Integers outside [-2^63, 2^63-1] | Outside guaranteed numeric subset; JavaScript `number` may already lose precision before packing | Encode explicitly (for example decimal string) |
-| Exact decimals / money | Binary floats may lose decimal precision | Encode as decimal string or `{units, scale}` |
-| NaN / Infinity | Not portable in generic numeric payloads | Normalize to `null` |
-| Exact float bits / tensors | Generic numeric path does not preserve dtype or bit layout | Encode as bytes plus application schema |
-| Non-string map keys | Breaks JS, confuses typed languages | Stringify keys |
-| Binary data | String/bytes confusion | Use `use_bin_type=True` in Python |
-
-See `docs/msgpack_interop.md` for detailed guidance.
-
-> Warning: Multifrost intentionally keeps the base numeric contract small. The generic wire path guarantees signed int64 integers and finite floats only. Values outside that subset are application-defined encodings. Implementations MAY expose small helper utilities for explicit encodings (for example bigint-to-string helpers), but those helpers are convenience APIs and do not change the core wire contract.
-
-### 11.3 Known Divergences
-
-| Divergence | Languages | Impact |
-|------------|-----------|--------|
-| ERROR traceback | Python includes, JS does not | Parent sees more detail from Python |
-| `--worker` arg | Python adds, JS does not | Internal only, no interop impact |
-| Sync API | Python has, JS does not | API difference, same wire protocol |
-| STDOUT forwarding | All forward, implementation differs | Same behavior to parent |
-| Numeric edge cases | Parity still being aligned | Follow `docs/msgpack_interop.md` for the portable subset and gotchas |
-
----
-
-## 12. Guarantees and Non-Guarantees
-
-### 12.1 Guarantees
-
-| Guarantee | Description |
-|-----------|-------------|
-| **Message delivery** | Messages delivered in order on same connection |
-| **Response correlation** | Responses matched to requests by ID |
-| **Error propagation** | Child errors surfaced to parent |
-| **Clean shutdown** | Resources released on close |
-| **Cross-language calls** | Any parent can call any child |
-| **Circuit breaker** | Stops calls to failing children |
-| **Heartbeat detection** | Detects unresponsive children |
-
-### 12.2 Non-Guarantees
-
-| Non-Guarantee | Reason |
-|---------------|--------|
-| **Exactly-once delivery** | Network failures may cause duplicates or loss |
-| **Message persistence** | Messages not persisted; lost on crash |
-| **Ordered delivery across reconnects** | Order only guaranteed on single connection |
-| **Real-time delivery** | No latency guarantees |
-| **Security** | Protocol is unauthenticated and unencrypted |
-
-### 12.3 Best-Effort Features
-
-| Feature | Behavior |
-|---------|----------|
-| STDOUT/STDERR forwarding | May drop under load |
-| Metrics accuracy | Approximate, not precise |
-| Service registry | File-based, may have race conditions |
-
----
-
-## 13. Versioning
-
-### 13.1 Protocol Version
-
-The protocol is identified by the `app` field in every message:
-
-```
-app: "comlink_ipc_v4"
-```
-
-**Rules:**
-- Different app ID = hard fail (no negotiation)
-- All implementations MUST use exact app ID
-- Version changes require all participants to upgrade
-
-### 13.2 Compatibility Rules
-
-| Change Type | Compatibility |
-|-------------|----------------|
-| New optional field | Backward compatible |
-| New message type | Backward compatible (ignored by old receivers) |
-| Removed field | Breaking |
-| Changed field type | Breaking |
-| Changed app ID | Breaking |
-
-### 13.3 Forward/Backward Compatibility
-
-**Receivers MUST:**
-- Ignore unknown fields
-- Ignore unknown message types
-
-**Senders MUST:**
-- Include all required fields
-- Not assume receivers understand new optional fields
-
----
-
-## 14. Quick Reference
-
-### 14.1 Minimal Parent (Spawn Mode)
-
-```python
-# Python (async)
-from multifrost import ParentWorker
-
-worker = ParentWorker.spawn("worker.py", "python")
-handle = worker.handle()
-await handle.start()
-result = await handle.call.my_method(arg1, arg2)
-await handle.stop()
-
-# Python (sync)
-worker = ParentWorker.spawn("worker.py", "python")
-handle = worker.handle_sync()
-handle.start()  # blocking
-result = handle.call.my_method(arg1, arg2)
-handle.stop()
-```
-
-```javascript
-// JavaScript
-import { ParentWorker } from 'multifrost';
-
-const worker = ParentWorker.spawn('worker.ts', 'tsx');
-const handle = worker.handle();
-await handle.start();
-const result = await handle.call.myMethod(arg1, arg2);
-await handle.stop();
-```
-
-### 14.2 Minimal Child
-
-```python
-# Python
-from multifrost import ChildWorker
-
-class MyWorker(ChildWorker):
-    def my_method(self, a, b):
-        return a + b
-
-MyWorker().run()
-```
-
-```javascript
-// JavaScript
-import { ChildWorker } from 'multifrost';
-
-class MyWorker extends ChildWorker {
-    myMethod(a, b) {
-        return a + b;
-    }
-}
-
-new MyWorker().run();
-```
-
-### 14.3 Connect Mode
-
-```python
-# Parent connects to existing service
-worker = ParentWorker.connect("my-service")
-handle = worker.handle()
-await handle.start()
-result = await handle.call.my_method()
-```
-
-```python
-# Child registers as service
-class MyWorker(ChildWorker):
-    pass
-
-MyWorker(service_id="my-service").run()
-```
-
----
-
-## 15. Related Documentation
-
-| Document | Purpose |
-|----------|---------|
-| `docs/arch.md` | Technical architecture, wire protocol, implementation requirements |
-| `docs/protocol.md` | Normative wire protocol specification |
-| `docs/support_matrix.md` | Feature parity across languages |
-| `docs/msgpack_interop.md` | Cross-language serialization guide |
-| `docs/api-vision.md` | Future API direction |
-| `python/docs/arch.md` | Python-specific implementation |
-| `javascript/docs/arch.md` | JavaScript-specific implementation |
-| `golang/docs/arch.md` | Go-specific implementation |
-| `rust/docs/arch.md` | Rust-specific implementation |
+v5 is intentionally incompatible with v4. The protocol key and runtime model are
+separate, and coexistence during migration is an operational concern rather than
+a compatibility promise.
