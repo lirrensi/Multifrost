@@ -1,1232 +1,537 @@
+use crate::caller_transport::{CallerTransport, CallerTransportConfig};
 use crate::error::{MultifrostError, Result};
-use crate::logging::{LogLevel, StructuredLogger};
-use crate::message::{Message, MessageType};
+use crate::message::QueryGetResponseBody;
 use crate::metrics::Metrics;
-use crate::registry::ServiceRegistry;
-use bytes::Bytes;
-use std::collections::HashMap;
-use std::net::TcpListener;
+use crate::router_bootstrap::{router_port_from_env, RouterBootstrapConfig, RouterEndpointConfig};
+use serde_json::Value;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, Mutex, RwLock};
-use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
+use tokio::sync::Mutex;
+use uuid::Uuid;
 
-type PendingRequests = Arc<Mutex<HashMap<String, oneshot::Sender<Result<serde_json::Value>>>>>;
-type PendingHeartbeats = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Configuration options for ParentWorker.
-#[derive(Clone)]
-pub struct ParentWorkerConfig {
-    pub script_path: Option<String>,
-    pub executable: String,
-    pub service_id: Option<String>,
-    pub port: Option<u16>,
-    pub is_spawn_mode: bool,
-    pub auto_restart: bool,
-    pub max_restart_attempts: usize,
-    pub default_timeout: Option<Duration>,
-    pub heartbeat_interval: Duration,
-    pub heartbeat_timeout: Duration,
-    pub heartbeat_max_misses: usize,
-    pub enable_metrics: bool,
-}
-
-impl Default for ParentWorkerConfig {
-    fn default() -> Self {
-        Self {
-            script_path: None,
-            executable: String::new(),
-            service_id: None,
-            port: None,
-            is_spawn_mode: false,
-            auto_restart: false,
-            max_restart_attempts: 5,
-            default_timeout: None,
-            heartbeat_interval: Duration::from_secs(5),
-            heartbeat_timeout: Duration::from_secs(3),
-            heartbeat_max_misses: 3,
-            enable_metrics: true,
-        }
-    }
-}
-
-pub struct ParentWorker {
-    config: ParentWorkerConfig,
-    socket: Arc<Mutex<Option<DealerSocket>>>,
-    process: Option<Child>,
-    running: Arc<RwLock<bool>>,
-    pending: PendingRequests,
-    pending_heartbeats: PendingHeartbeats,
-    consecutive_failures: Arc<RwLock<usize>>,
-    circuit_open: Arc<RwLock<bool>>,
-    consecutive_heartbeat_misses: Arc<RwLock<usize>>,
-    last_heartbeat_rtt_ms: Arc<RwLock<Option<f64>>>,
-    metrics: Option<Metrics>,
-    logger: StructuredLogger,
-    restart_count: Arc<RwLock<usize>>,
-}
-
-impl ParentWorker {
-    /// Create a ParentWorker in spawn mode (owns the child process).
-    pub fn spawn(script_path: &str, executable: &str) -> Result<Self> {
-        let port = find_free_port_sync()?;
-        Ok(Self::with_config(ParentWorkerConfig {
-            script_path: Some(script_path.to_string()),
-            executable: executable.to_string(),
-            port: Some(port),
-            is_spawn_mode: true,
-            ..Default::default()
-        }))
-    }
-
-    /// Create a ParentWorker in spawn mode with custom options.
-    pub fn spawn_with_options(
-        script_path: &str,
-        executable: &str,
-        options: SpawnOptions,
-    ) -> Result<Self> {
-        let port = find_free_port_sync()?;
-        Ok(Self::with_config(ParentWorkerConfig {
-            script_path: Some(script_path.to_string()),
-            executable: executable.to_string(),
-            port: Some(port),
-            is_spawn_mode: true,
-            auto_restart: options.auto_restart,
-            max_restart_attempts: options.max_restart_attempts,
-            default_timeout: options.default_timeout.map(Duration::from_millis),
-            heartbeat_interval: Duration::from_secs_f64(options.heartbeat_interval),
-            heartbeat_timeout: Duration::from_secs_f64(options.heartbeat_timeout),
-            heartbeat_max_misses: options.heartbeat_max_misses,
-            enable_metrics: options.enable_metrics,
-            ..Default::default()
-        }))
-    }
-
-    /// Create a ParentWorker in connect mode (connects to existing service).
-    pub async fn connect(service_id: &str, timeout_ms: u64) -> Result<Self> {
-        let port = ServiceRegistry::discover(service_id, timeout_ms).await?;
-        Ok(Self::with_config(ParentWorkerConfig {
-            service_id: Some(service_id.to_string()),
-            port: Some(port),
-            is_spawn_mode: false,
-            ..Default::default()
-        }))
-    }
-
-    fn with_config(config: ParentWorkerConfig) -> Self {
-        let metrics = if config.enable_metrics {
-            Some(Metrics::new())
-        } else {
-            None
-        };
-
-        let worker_id = format!(
-            "{:x}",
-            md5::compute(format!(
-                "{}-{}",
-                config.script_path.as_deref().unwrap_or("connect"),
-                std::process::id()
-            ))
-        );
-        let service_id = config.service_id.clone();
-
-        Self {
-            config,
-            socket: Arc::new(Mutex::new(None)),
-            process: None,
-            running: Arc::new(RwLock::new(false)),
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            pending_heartbeats: Arc::new(Mutex::new(HashMap::new())),
-            consecutive_failures: Arc::new(RwLock::new(0)),
-            circuit_open: Arc::new(RwLock::new(false)),
-            consecutive_heartbeat_misses: Arc::new(RwLock::new(0)),
-            last_heartbeat_rtt_ms: Arc::new(RwLock::new(None)),
-            metrics,
-            logger: StructuredLogger::new(
-                Some(Arc::new(|entry| println!("{}", entry.to_json()))),
-                LogLevel::Info,
-                Some(worker_id),
-                service_id,
-            ),
-            restart_count: Arc::new(RwLock::new(0)),
-        }
-    }
-
-    /// Check if the worker is healthy (circuit breaker not tripped).
-    pub async fn is_healthy(&self) -> bool {
-        !*self.circuit_open.read().await && *self.running.read().await
-    }
-
-    /// Check if circuit breaker is open.
-    pub async fn circuit_open(&self) -> bool {
-        *self.circuit_open.read().await
-    }
-
-    /// Get the last heartbeat round-trip time in milliseconds.
-    pub async fn last_heartbeat_rtt_ms(&self) -> Option<f64> {
-        *self.last_heartbeat_rtt_ms.read().await
-    }
-
-    /// Get the metrics collector.
-    pub fn metrics(&self) -> Option<&Metrics> {
-        self.metrics.as_ref()
-    }
-
-    /// Set a custom log handler.
-    pub fn set_log_handler(
-        &mut self,
-        handler: Arc<dyn Fn(&crate::logging::LogEntry) + Send + Sync>,
-    ) {
-        self.logger.set_handler(handler);
-    }
-
-    /// Start the worker.
-    pub async fn start(&mut self) -> Result<()> {
-        let port = self.config.port.ok_or_else(|| {
-            MultifrostError::ConfigError("Port is required but not set".to_string())
-        })?;
-        let mut socket = DealerSocket::new();
-
-        if self.config.is_spawn_mode {
-            socket
-                .bind(&format!("tcp://0.0.0.0:{}", port))
-                .await
-                .map_err(|e| MultifrostError::ZmqError(e.to_string()))?;
-            self.start_child_process()?;
-        } else {
-            socket
-                .connect(&format!("tcp://127.0.0.1:{}", port))
-                .await
-                .map_err(|e| MultifrostError::ZmqError(e.to_string()))?;
-        }
-
-        *self.socket.lock().await = Some(socket);
-        *self.running.write().await = true;
-
-        // Start message loop in background
-        let socket = Arc::clone(&self.socket);
-        let pending = Arc::clone(&self.pending);
-        let pending_heartbeats = Arc::clone(&self.pending_heartbeats);
-        let running = Arc::clone(&self.running);
-        let consecutive_failures = Arc::clone(&self.consecutive_failures);
-        let circuit_open = Arc::clone(&self.circuit_open);
-        let consecutive_heartbeat_misses = Arc::clone(&self.consecutive_heartbeat_misses);
-        let last_heartbeat_rtt_ms = Arc::clone(&self.last_heartbeat_rtt_ms);
-        let metrics = self.metrics.clone();
-        let logger = self.logger.clone();
-        let is_spawn_mode = self.config.is_spawn_mode;
-        let heartbeat_interval = self.config.heartbeat_interval;
-        let heartbeat_timeout = self.config.heartbeat_timeout;
-        let heartbeat_max_misses = self.config.heartbeat_max_misses;
-        let max_restart_attempts = self.config.max_restart_attempts;
-        let auto_restart = self.config.auto_restart;
-        let restart_count = Arc::clone(&self.restart_count);
-        let script_path = self.config.script_path.clone();
-        let executable = self.config.executable.clone();
-
-        tokio::spawn(async move {
-            message_loop(
-                socket,
-                pending,
-                pending_heartbeats,
-                running,
-                consecutive_failures,
-                circuit_open,
-                consecutive_heartbeat_misses,
-                last_heartbeat_rtt_ms,
-                metrics,
-                logger,
-                is_spawn_mode,
-                heartbeat_interval,
-                heartbeat_timeout,
-                heartbeat_max_misses,
-                max_restart_attempts,
-                auto_restart,
-                restart_count,
-                script_path,
-                executable,
-                port,
-            )
-            .await;
-        });
-
-        // Log worker start
-        let mode = if self.config.is_spawn_mode {
-            "spawn"
-        } else {
-            "connect"
-        };
-        self.logger.worker_start(mode);
-
-        // Wait a bit for connection to establish
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        Ok(())
-    }
-
-    fn start_child_process(&mut self) -> Result<()> {
-        let port = self.config.port.ok_or_else(|| {
-            MultifrostError::ConfigError("Port is required but not set".to_string())
-        })?;
-        let mut cmd = if cfg!(target_os = "windows") {
-            let mut c = Command::new("cmd");
-            if let Some(ref script) = self.config.script_path {
-                c.args(["/C", &self.config.executable, script]);
-            } else {
-                c.args(["/C", &self.config.executable]);
-            }
-            c
-        } else {
-            let mut c = Command::new(&self.config.executable);
-            if let Some(ref script) = self.config.script_path {
-                c.arg(script);
-            }
-            c
-        };
-
-        cmd.env("COMLINK_ZMQ_PORT", port.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        self.process = Some(cmd.spawn()?);
-        Ok(())
-    }
-
-    /// Call a remote function with typed result.
-    pub async fn call<T: serde::de::DeserializeOwned>(
-        &self,
-        function: &str,
-        args: Vec<serde_json::Value>,
-    ) -> Result<T> {
-        let value = self.call_raw(function, args).await?;
-        serde_json::from_value(value).map_err(MultifrostError::JsonError)
-    }
-
-    /// Call a remote function returning raw JSON Value.
-    pub async fn call_raw(
-        &self,
-        function: &str,
-        args: Vec<serde_json::Value>,
-    ) -> Result<serde_json::Value> {
-        self.call_with_timeout(function, args, None).await
-    }
-
-    /// Call a remote function with timeout.
-    pub async fn call_with_timeout(
-        &self,
-        function: &str,
-        args: Vec<serde_json::Value>,
-        timeout: Option<Duration>,
-    ) -> Result<serde_json::Value> {
-        // Check circuit breaker
-        if *self.circuit_open.read().await {
-            let failures = *self.consecutive_failures.read().await;
-            return Err(MultifrostError::CircuitOpenError(failures));
-        }
-
-        if !*self.running.read().await {
-            return Err(MultifrostError::NotRunningError);
-        }
-
-        let effective_timeout = timeout.or(self.config.default_timeout);
-
-        let message = Message::create_call(function, args);
-        let msg_id = message.id.clone();
-
-        // Start metrics tracking
-        let start_time = if let Some(ref metrics) = self.metrics {
-            Some(metrics.start_request(&msg_id, function, "default").await)
-        } else {
-            None
-        };
-
-        // Log request start
-        self.logger
-            .request_start(&msg_id, function, "default", None, None);
-
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut pending = self.pending.lock().await;
-            pending.insert(msg_id.clone(), tx);
-        }
-
-        // Send message - DEALER sends: [empty, message]
-        let packed = message.pack()?;
-
-        {
-            let mut socket_guard = self.socket.lock().await;
-            if let Some(ref mut socket) = *socket_guard {
-                let zmq_msg: ZmqMessage = vec![Bytes::from(vec![]), Bytes::from(packed)]
-                    .try_into()
-                    .map_err(|_| MultifrostError::InvalidMessage("Empty message".to_string()))?;
-
-                socket
-                    .send(zmq_msg)
-                    .await
-                    .map_err(|e| MultifrostError::ZmqError(e.to_string()))?;
-            } else {
-                return Err(MultifrostError::NotRunningError);
-            }
-        }
-
-        // Wait for response
-        let result: serde_json::Value = if let Some(timeout) = effective_timeout {
-            match tokio::time::timeout(timeout, rx).await {
-                Ok(Ok(Ok(value))) => value,
-                Ok(Ok(Err(e))) => return Err(e),
-                Ok(Err(_)) => return Err(MultifrostError::TimeoutError),
-                Err(_) => return Err(MultifrostError::TimeoutError),
-            }
-        } else {
-            match rx.await {
-                Ok(Ok(value)) => value,
-                Ok(Err(e)) => return Err(e),
-                Err(_) => return Err(MultifrostError::TimeoutError),
-            }
-        };
-
-        // Record success
-        if let (Some(start), Some(ref metrics)) = (start_time, &self.metrics) {
-            let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
-            metrics.end_request(start, &msg_id, true, None).await;
-            self.logger
-                .request_end(&msg_id, function, duration_ms, true, None, None);
-        }
-
-        // Reset consecutive failures on success
-        {
-            let mut failures = self.consecutive_failures.write().await;
-            if *failures > 0 {
-                *failures = 0;
-                if *self.circuit_open.read().await {
-                    *self.circuit_open.write().await = false;
-                    self.logger.circuit_close();
-                    if let Some(ref metrics) = self.metrics {
-                        metrics.record_circuit_breaker_reset().await;
-                    }
-                }
-            }
-        }
-
-        Ok(result)
-    }
-
-    /// Stop the worker gracefully.
-    pub async fn stop(&mut self) {
-        self.logger.worker_stop("shutdown");
-
-        *self.running.write().await = false;
-
-        // Cancel pending requests
-        {
-            let mut pending = self.pending.lock().await;
-            for (_, tx) in pending.drain() {
-                let _ = tx.send(Err(MultifrostError::NotRunningError));
-            }
-        }
-
-        // Cancel pending heartbeats
-        {
-            let mut pending = self.pending_heartbeats.lock().await;
-            for (_, tx) in pending.drain() {
-                let _ = tx.send(false);
-            }
-        }
-
-        // Close socket
-        let mut socket_guard = self.socket.lock().await;
-        if let Some(socket) = socket_guard.take() {
-            drop(socket);
-        }
-
-        // Kill child process if still running
-        if let Some(ref mut child) = self.process {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-
-    /// Convert this worker into a handle that takes ownership.
-    ///
-    /// The handle provides a clean API view with lifecycle (start/stop) and call interface.
-    /// This consumes the worker - the handle now owns it.
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use multifrost::ParentWorker;
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    ///     let handle = ParentWorker::spawn("worker.py", "python")?.handle();
-    ///     handle.start().await?;
-    ///     let result: i32 = handle.call("add", vec![1.into(), 2.into()]).await?;
-    ///     handle.stop().await;
-    ///     Ok(())
-    /// }
-    /// ```
-    pub fn handle(self) -> Handle {
-        Handle { worker: self }
-    }
-}
-
-/// Handle owns a ParentWorker and provides a clean API view.
-///
-/// Separates process definition (Worker) from runtime interface (Handle).
-/// The handle owns the worker and has full control over lifecycle.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use multifrost::ParentWorker;
-///
-/// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let handle = ParentWorker::spawn("worker.py", "python")?.handle();
-///     handle.start().await?;
-///     let result: i32 = handle.call("add", vec![1.into(), 2.into()]).await?;
-///     handle.stop().await;
-///     Ok(())
-/// }
-/// ```
-pub struct Handle {
-    worker: ParentWorker,
-}
-
-impl Handle {
-    /// Start the worker (spawn process, connect ZMQ).
-    pub async fn start(&mut self) -> Result<()> {
-        self.worker.start().await
-    }
-
-    /// Stop the worker (cleanup resources, terminate child).
-    pub async fn stop(&mut self) {
-        self.worker.stop().await
-    }
-
-    /// Call a remote function with typed result.
-    pub async fn call<T: serde::de::DeserializeOwned>(
-        &self,
-        function: &str,
-        args: Vec<serde_json::Value>,
-    ) -> Result<T> {
-        self.worker.call(function, args).await
-    }
-
-    /// Call a remote function returning raw JSON Value.
-    pub async fn call_raw(
-        &self,
-        function: &str,
-        args: Vec<serde_json::Value>,
-    ) -> Result<serde_json::Value> {
-        self.worker.call_raw(function, args).await
-    }
-
-    /// Call a remote function with timeout.
-    pub async fn call_with_timeout(
-        &self,
-        function: &str,
-        args: Vec<serde_json::Value>,
-        timeout: std::time::Duration,
-    ) -> Result<serde_json::Value> {
-        self.worker
-            .call_with_timeout(function, args, Some(timeout))
-            .await
-    }
-
-    /// Check if the worker is healthy.
-    pub async fn is_healthy(&self) -> bool {
-        self.worker.is_healthy().await
-    }
-
-    /// Check if circuit breaker is open.
-    pub async fn circuit_open(&self) -> bool {
-        self.worker.circuit_open().await
-    }
-
-    /// Get the last heartbeat round-trip time in milliseconds.
-    pub async fn last_heartbeat_rtt_ms(&self) -> Option<f64> {
-        self.worker.last_heartbeat_rtt_ms().await
-    }
-
-    /// Get the metrics collector.
-    pub fn metrics(&self) -> Option<&Metrics> {
-        self.worker.metrics()
-    }
-}
-
-/// Options for spawning a ParentWorker.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct SpawnOptions {
-    pub auto_restart: bool,
-    pub max_restart_attempts: usize,
-    pub default_timeout: Option<u64>, // milliseconds
-    pub heartbeat_interval: f64,      // seconds
-    pub heartbeat_timeout: f64,       // seconds
-    pub heartbeat_max_misses: usize,
-    pub enable_metrics: bool,
+    pub caller_peer_id: Option<String>,
+    pub request_timeout: Option<Duration>,
+    pub router_port: Option<u16>,
 }
 
 impl Default for SpawnOptions {
     fn default() -> Self {
         Self {
-            auto_restart: false,
-            max_restart_attempts: 5,
-            default_timeout: None,
-            heartbeat_interval: 5.0,
-            heartbeat_timeout: 3.0,
-            heartbeat_max_misses: 3,
-            enable_metrics: true,
+            caller_peer_id: None,
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            router_port: None,
         }
     }
 }
 
-/// Options for connecting to an existing service.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ConnectOptions {
-    pub default_timeout: Option<u64>, // milliseconds
-    pub heartbeat_interval: f64,      // seconds
-    pub heartbeat_timeout: f64,       // seconds
-    pub heartbeat_max_misses: usize,
-    pub enable_metrics: bool,
+    pub caller_peer_id: Option<String>,
+    pub request_timeout: Option<Duration>,
+    pub router_port: Option<u16>,
 }
 
 impl Default for ConnectOptions {
     fn default() -> Self {
         Self {
-            default_timeout: None,
-            heartbeat_interval: 5.0,
-            heartbeat_timeout: 3.0,
-            heartbeat_max_misses: 3,
-            enable_metrics: true,
+            caller_peer_id: None,
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            router_port: None,
         }
     }
 }
 
-/// Builder pattern for creating ParentWorker instances.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use multifrost::{ParentWorkerBuilder, SpawnOptions};
-/// use std::time::Duration;
-///
-/// #[tokio::main]
-/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let worker = ParentWorkerBuilder::spawn("worker.py", "python worker.py")
-///         .auto_restart(true)
-///         .default_timeout(Duration::from_secs(30))
-///         .build()
-///         .await?;
-///
-///     worker.start().await?;
-///     // ...
-///     Ok(())
-/// }
-/// ```
+#[derive(Clone)]
+struct ParentRuntime {
+    transport: CallerTransport,
+    default_target_peer_id: Option<String>,
+    metrics: Option<Metrics>,
+    service_process: Arc<Mutex<Option<Child>>>,
+}
+
+#[derive(Clone)]
+pub struct ParentWorker {
+    inner: Arc<ParentRuntime>,
+}
+
+#[derive(Clone)]
+pub struct Handle {
+    inner: Arc<ParentRuntime>,
+}
+
+impl ParentWorker {
+    pub async fn connect(default_target_peer_id: &str, timeout_ms: u64) -> Result<Self> {
+        Self::connect_with_options(
+            default_target_peer_id,
+            ConnectOptions {
+                caller_peer_id: None,
+                request_timeout: Some(Duration::from_millis(timeout_ms)),
+                router_port: None,
+            },
+        )
+        .await
+    }
+
+    pub async fn connect_with_options(
+        default_target_peer_id: &str,
+        options: ConnectOptions,
+    ) -> Result<Self> {
+        let transport = connect_caller_transport(
+            default_target_peer_id.to_string(),
+            options.caller_peer_id,
+            options.request_timeout,
+            options.router_port,
+        )
+        .await?;
+        Ok(Self::from_transport(
+            transport,
+            Some(default_target_peer_id.to_string()),
+            None,
+        ))
+    }
+
+    pub async fn spawn(service_entrypoint: &str, executable: &str) -> Result<Self> {
+        Self::spawn_with_options(service_entrypoint, executable, SpawnOptions::default()).await
+    }
+
+    pub async fn spawn_with_options(
+        service_entrypoint: &str,
+        executable: &str,
+        options: SpawnOptions,
+    ) -> Result<Self> {
+        let target_peer_id = canonical_peer_path(PathBuf::from(service_entrypoint));
+        let service_process =
+            spawn_service_process(executable, service_entrypoint, options.router_port)?;
+
+        let transport = connect_caller_transport(
+            target_peer_id.clone(),
+            options.caller_peer_id,
+            options.request_timeout,
+            options.router_port,
+        )
+        .await?;
+
+        let worker = Self::from_transport(
+            transport,
+            Some(target_peer_id.clone()),
+            Some(service_process),
+        );
+        wait_for_service_peer(
+            &worker.inner.transport,
+            &target_peer_id,
+            options.request_timeout,
+        )
+        .await?;
+        Ok(worker)
+    }
+
+    fn from_transport(
+        transport: CallerTransport,
+        default_target_peer_id: Option<String>,
+        service_process: Option<Child>,
+    ) -> Self {
+        let runtime = ParentRuntime {
+            transport,
+            default_target_peer_id,
+            metrics: Some(Metrics::new()),
+            service_process: Arc::new(Mutex::new(service_process)),
+        };
+        Self {
+            inner: Arc::new(runtime),
+        }
+    }
+
+    pub fn handle(self) -> Handle {
+        Handle { inner: self.inner }
+    }
+
+    pub fn peer_id(&self) -> &str {
+        self.inner.transport.peer_id()
+    }
+
+    pub fn default_target_peer_id(&self) -> Option<&str> {
+        self.inner.default_target_peer_id.as_deref()
+    }
+
+    pub async fn start(&self) -> Result<()> {
+        Ok(())
+    }
+
+    pub async fn stop(&self) {
+        let _ = self.inner.transport.disconnect().await;
+        if let Some(mut child) = self.inner.service_process.lock().await.take() {
+            let _ = child.kill();
+        }
+    }
+
+    pub async fn is_healthy(&self) -> bool {
+        true
+    }
+
+    pub async fn circuit_open(&self) -> bool {
+        false
+    }
+
+    pub async fn last_heartbeat_rtt_ms(&self) -> Option<f64> {
+        None
+    }
+
+    pub fn metrics(&self) -> Option<&Metrics> {
+        self.inner.metrics.as_ref()
+    }
+
+    pub async fn call<R>(&self, function: &str, args: Vec<Value>) -> Result<R>
+    where
+        R: serde::de::DeserializeOwned,
+    {
+        self.inner.transport.call(function, args).await
+    }
+
+    pub async fn call_to<R>(
+        &self,
+        target_peer_id: &str,
+        function: &str,
+        args: Vec<Value>,
+    ) -> Result<R>
+    where
+        R: serde::de::DeserializeOwned,
+    {
+        self.inner
+            .transport
+            .call_to(target_peer_id, function, args)
+            .await
+    }
+
+    pub async fn query_peer_exists(&self, peer_id: &str) -> Result<bool> {
+        Ok(self
+            .inner
+            .transport
+            .query_peer_exists(peer_id)
+            .await?
+            .exists)
+    }
+
+    pub async fn query_peer_get(&self, peer_id: &str) -> Result<QueryGetResponseBody> {
+        self.inner.transport.query_peer_get(peer_id).await
+    }
+}
+
+impl Handle {
+    pub async fn start(&self) -> Result<()> {
+        Ok(())
+    }
+
+    pub async fn stop(&self) {
+        let _ = self.inner.transport.disconnect().await;
+        if let Some(mut child) = self.inner.service_process.lock().await.take() {
+            let _ = child.kill();
+        }
+    }
+
+    pub async fn is_healthy(&self) -> bool {
+        true
+    }
+
+    pub async fn circuit_open(&self) -> bool {
+        false
+    }
+
+    pub async fn last_heartbeat_rtt_ms(&self) -> Option<f64> {
+        None
+    }
+
+    pub fn metrics(&self) -> Option<&Metrics> {
+        self.inner.metrics.as_ref()
+    }
+
+    pub fn peer_id(&self) -> &str {
+        self.inner.transport.peer_id()
+    }
+
+    pub fn default_target_peer_id(&self) -> Option<&str> {
+        self.inner.default_target_peer_id.as_deref()
+    }
+
+    pub async fn call<R>(&self, function: &str, args: Vec<Value>) -> Result<R>
+    where
+        R: serde::de::DeserializeOwned,
+    {
+        self.inner.transport.call(function, args).await
+    }
+
+    pub async fn call_to<R>(
+        &self,
+        target_peer_id: &str,
+        function: &str,
+        args: Vec<Value>,
+    ) -> Result<R>
+    where
+        R: serde::de::DeserializeOwned,
+    {
+        self.inner
+            .transport
+            .call_to(target_peer_id, function, args)
+            .await
+    }
+
+    pub async fn query_peer_exists(&self, peer_id: &str) -> Result<bool> {
+        Ok(self
+            .inner
+            .transport
+            .query_peer_exists(peer_id)
+            .await?
+            .exists)
+    }
+
+    pub async fn query_peer_get(&self, peer_id: &str) -> Result<QueryGetResponseBody> {
+        self.inner.transport.query_peer_get(peer_id).await
+    }
+}
+
+#[derive(Clone)]
 pub struct ParentWorkerBuilder {
-    script_path: Option<String>,
-    executable: String,
-    options: SpawnOptions,
+    mode: BuilderMode,
+    target_peer_id: String,
+    executable: Option<String>,
+    options: BuilderOptions,
+}
+
+#[derive(Clone)]
+enum BuilderMode {
+    Spawn,
+    Connect,
+}
+
+#[derive(Clone)]
+struct BuilderOptions {
+    caller_peer_id: Option<String>,
+    request_timeout: Option<Duration>,
+    router_port: Option<u16>,
+}
+
+impl Default for BuilderOptions {
+    fn default() -> Self {
+        Self {
+            caller_peer_id: None,
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            router_port: None,
+        }
+    }
 }
 
 impl ParentWorkerBuilder {
-    /// Create a new builder for spawn mode.
-    pub fn spawn(script_path: &str, executable: &str) -> Self {
+    pub fn spawn(service_entrypoint: &str, executable: &str) -> Self {
         Self {
-            script_path: Some(script_path.to_string()),
-            executable: executable.to_string(),
-            options: SpawnOptions::default(),
+            mode: BuilderMode::Spawn,
+            target_peer_id: canonical_peer_path(PathBuf::from(service_entrypoint)),
+            executable: Some(executable.to_string()),
+            options: BuilderOptions::default(),
         }
     }
 
-    /// Create a new builder for connect mode.
-    pub fn connect(executable: &str) -> Self {
+    pub fn connect(target_peer_id: &str) -> Self {
         Self {
-            script_path: None,
-            executable: executable.to_string(),
-            options: SpawnOptions::default(),
+            mode: BuilderMode::Connect,
+            target_peer_id: target_peer_id.to_string(),
+            executable: None,
+            options: BuilderOptions::default(),
         }
     }
 
-    /// Enable automatic restart on failure.
-    pub fn auto_restart(mut self, enable: bool) -> Self {
-        self.options.auto_restart = enable;
+    pub fn caller_peer_id(mut self, peer_id: &str) -> Self {
+        self.options.caller_peer_id = Some(peer_id.to_string());
         self
     }
 
-    /// Set maximum restart attempts.
-    pub fn max_restart_attempts(mut self, attempts: usize) -> Self {
-        self.options.max_restart_attempts = attempts;
-        self
-    }
-
-    /// Set default timeout for calls (in milliseconds).
     pub fn default_timeout(mut self, timeout: Duration) -> Self {
-        self.options.default_timeout = Some(timeout.as_millis() as u64);
+        self.options.request_timeout = Some(timeout);
         self
     }
 
-    /// Set heartbeat interval in seconds.
-    pub fn heartbeat_interval(mut self, interval: f64) -> Self {
-        self.options.heartbeat_interval = interval;
+    pub fn router_port(mut self, port: u16) -> Self {
+        self.options.router_port = Some(port);
         self
     }
 
-    /// Set heartbeat timeout in seconds.
-    pub fn heartbeat_timeout(mut self, timeout: f64) -> Self {
-        self.options.heartbeat_timeout = timeout;
-        self
-    }
-
-    /// Set maximum missed heartbeats before considering worker dead.
-    pub fn heartbeat_max_misses(mut self, misses: usize) -> Self {
-        self.options.heartbeat_max_misses = misses;
-        self
-    }
-
-    /// Enable or disable metrics collection.
-    pub fn enable_metrics(mut self, enable: bool) -> Self {
-        self.options.enable_metrics = enable;
-        self
-    }
-
-    /// Build the ParentWorker in spawn mode.
-    pub async fn build_spawn(self) -> Result<ParentWorker> {
-        ParentWorker::spawn_with_options(
-            self.script_path.as_deref().unwrap_or(""),
-            &self.executable,
-            self.options,
-        )
-    }
-
-    /// Build the ParentWorker in connect mode.
-    pub async fn build_connect(self, service_id: &str, timeout_ms: u64) -> Result<ParentWorker> {
-        let config = ParentWorkerConfig {
-            script_path: self.script_path,
-            executable: self.executable,
-            service_id: Some(service_id.to_string()),
-            port: None,
-            is_spawn_mode: false,
-            auto_restart: self.options.auto_restart,
-            max_restart_attempts: self.options.max_restart_attempts,
-            default_timeout: self.options.default_timeout.map(Duration::from_millis),
-            heartbeat_interval: Duration::from_secs_f64(self.options.heartbeat_interval),
-            heartbeat_timeout: Duration::from_secs_f64(self.options.heartbeat_timeout),
-            heartbeat_max_misses: self.options.heartbeat_max_misses,
-            enable_metrics: self.options.enable_metrics,
-        };
-        let port = ServiceRegistry::discover(service_id, timeout_ms).await?;
-        let mut config = config;
-        config.port = Some(port);
-        Ok(ParentWorker::with_config(config))
-    }
-}
-
-fn find_free_port_sync() -> Result<u16> {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr().map(|a| a.port()))
-        .map_err(|e| MultifrostError::IoError(e))
-}
-
-async fn message_loop(
-    socket: Arc<Mutex<Option<DealerSocket>>>,
-    pending: PendingRequests,
-    pending_heartbeats: PendingHeartbeats,
-    running: Arc<RwLock<bool>>,
-    consecutive_failures: Arc<RwLock<usize>>,
-    circuit_open: Arc<RwLock<bool>>,
-    consecutive_heartbeat_misses: Arc<RwLock<usize>>,
-    last_heartbeat_rtt_ms: Arc<RwLock<Option<f64>>>,
-    metrics: Option<Metrics>,
-    logger: StructuredLogger,
-    is_spawn_mode: bool,
-    heartbeat_interval: Duration,
-    heartbeat_timeout: Duration,
-    heartbeat_max_misses: usize,
-    _max_restart_attempts: usize,
-    _auto_restart: bool,
-    _restart_count: Arc<RwLock<usize>>,
-    _script_path: Option<String>,
-    _executable: String,
-    _port: u16,
-) {
-    // Start heartbeat loop if in spawn mode
-    if is_spawn_mode && heartbeat_interval.as_secs() > 0 {
-        let socket_clone = Arc::clone(&socket);
-        let pending_heartbeats_clone = Arc::clone(&pending_heartbeats);
-        let running_clone = Arc::clone(&running);
-        let consecutive_heartbeat_misses_clone = Arc::clone(&consecutive_heartbeat_misses);
-        let last_heartbeat_rtt_ms_clone = Arc::clone(&last_heartbeat_rtt_ms);
-        let metrics_clone = metrics.clone();
-        let logger_clone = logger.clone();
-        let consecutive_failures_clone = Arc::clone(&consecutive_failures);
-        let circuit_open_clone = Arc::clone(&circuit_open);
-
-        tokio::spawn(async move {
-            heartbeat_loop(
-                socket_clone,
-                pending_heartbeats_clone,
-                running_clone,
-                consecutive_heartbeat_misses_clone,
-                last_heartbeat_rtt_ms_clone,
-                metrics_clone,
-                logger_clone,
-                heartbeat_interval,
-                heartbeat_timeout,
-                heartbeat_max_misses,
-                consecutive_failures_clone,
-                circuit_open_clone,
-            )
-            .await;
-        });
-    }
-
-    loop {
-        if !*running.read().await {
-            break;
-        }
-
-        // Use timeout to avoid holding the lock indefinitely
-        let msg_result = {
-            let mut socket_guard = socket.lock().await;
-            if let Some(ref mut sock) = *socket_guard {
-                tokio::time::timeout(Duration::from_millis(100), sock.recv()).await
-            } else {
-                break;
+    pub async fn build(self) -> Result<ParentWorker> {
+        match self.mode {
+            BuilderMode::Spawn => {
+                let executable = self.executable.ok_or_else(|| {
+                    MultifrostError::ConfigError("spawn builder missing executable".into())
+                })?;
+                ParentWorker::spawn_with_options(
+                    &self.target_peer_id,
+                    &executable,
+                    SpawnOptions {
+                        caller_peer_id: self.options.caller_peer_id,
+                        request_timeout: self.options.request_timeout,
+                        router_port: self.options.router_port,
+                    },
+                )
+                .await
             }
-        };
-
-        let zmq_msg = match msg_result {
-            Ok(Ok(msg)) => msg,
-            Ok(Err(_)) | Err(_) => continue,
-        };
-
-        // DEALER receives: [empty, message_data]
-        let frames: Vec<_> = zmq_msg.into_vec();
-
-        if frames.len() < 2 {
-            continue;
-        }
-
-        let message_data = frames[1].to_vec();
-
-        match Message::unpack(&message_data) {
-            Ok(message) => {
-                if !message.is_valid() {
-                    continue;
-                }
-
-                match message.msg_type {
-                    MessageType::Response => {
-                        if let Some(result) = message.result {
-                            let mut pending_guard = pending.lock().await;
-                            if let Some(tx) = pending_guard.remove(&message.id) {
-                                let _ = tx.send(Ok(result));
-                            }
-                        }
-                    }
-                    MessageType::Error => {
-                        let error = message.error.unwrap_or_else(|| "Unknown error".to_string());
-                        let mut pending_guard = pending.lock().await;
-                        if let Some(tx) = pending_guard.remove(&message.id) {
-                            let _ = tx.send(Err(MultifrostError::RemoteCallError(error)));
-                        }
-                    }
-                    MessageType::Stdout => {
-                        if let Some(ref output) = message.output {
-                            println!("[worker STDOUT]: {}", output);
-                        }
-                    }
-                    MessageType::Stderr => {
-                        if let Some(ref output) = message.output {
-                            eprintln!("[worker STDERR]: {}", output);
-                        }
-                    }
-                    MessageType::Heartbeat => {
-                        // Handle heartbeat response
-                        let mut pending_guard = pending_heartbeats.lock().await;
-                        if let Some(tx) = pending_guard.remove(&message.id) {
-                            // Calculate RTT from timestamp in metadata
-                            if let Some(ref metadata) = message.metadata {
-                                if let Some(hb_timestamp) =
-                                    metadata.get("hb_timestamp").and_then(|v| v.as_f64())
-                                {
-                                    let rtt_ms = (current_timestamp() - hb_timestamp) * 1000.0;
-                                    *last_heartbeat_rtt_ms.write().await = Some(rtt_ms);
-
-                                    if let Some(ref metrics) = metrics {
-                                        metrics.record_heartbeat_rtt(rtt_ms).await;
-                                    }
-                                }
-                            }
-
-                            // Reset consecutive misses on successful response
-                            *consecutive_heartbeat_misses.write().await = 0;
-                            let _ = tx.send(true);
-                        }
-                    }
-                    MessageType::Call
-                    | MessageType::Shutdown
-                    | MessageType::Ready
-                    | MessageType::Unknown => {}
-                }
-            }
-            Err(_) => {}
-        }
-    }
-}
-
-async fn heartbeat_loop(
-    socket: Arc<Mutex<Option<DealerSocket>>>,
-    pending_heartbeats: PendingHeartbeats,
-    running: Arc<RwLock<bool>>,
-    consecutive_heartbeat_misses: Arc<RwLock<usize>>,
-    _last_heartbeat_rtt_ms: Arc<RwLock<Option<f64>>>,
-    metrics: Option<Metrics>,
-    logger: StructuredLogger,
-    heartbeat_interval: Duration,
-    heartbeat_timeout: Duration,
-    heartbeat_max_misses: usize,
-    consecutive_failures: Arc<RwLock<usize>>,
-    circuit_open: Arc<RwLock<bool>>,
-) {
-    // Wait for initial connection
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
-    while *running.read().await {
-        tokio::time::sleep(heartbeat_interval).await;
-
-        if !*running.read().await {
-            break;
-        }
-
-        // Create heartbeat message
-        let heartbeat = Message::create_heartbeat(None, Some(current_timestamp()));
-        let heartbeat_id = heartbeat.id.clone();
-
-        let (tx, rx) = oneshot::channel();
-        {
-            let mut pending = pending_heartbeats.lock().await;
-            pending.insert(heartbeat_id.clone(), tx);
-        }
-
-        // Send heartbeat
-        let packed = match heartbeat.pack() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        {
-            let mut socket_guard = socket.lock().await;
-            if let Some(ref mut socket) = *socket_guard {
-                let zmq_msg_result: std::result::Result<ZmqMessage, _> =
-                    vec![Bytes::from(vec![]), Bytes::from(packed)].try_into();
-
-                if let Ok(msg) = zmq_msg_result {
-                    let _ = socket.send(msg).await;
-                }
-            }
-        }
-
-        // Wait for response with timeout
-        match tokio::time::timeout(heartbeat_timeout, rx).await {
-            Ok(Ok(_)) => {
-                // Success - RTT already recorded in message loop
-            }
-            Ok(Err(_)) | Err(_) => {
-                // Heartbeat timed out
-                let mut misses = consecutive_heartbeat_misses.write().await;
-                *misses += 1;
-
-                logger.heartbeat_missed(*misses, heartbeat_max_misses);
-
-                // Check if too many misses
-                if *misses >= heartbeat_max_misses {
-                    logger.heartbeat_timeout(*misses);
-
-                    // Record failure for circuit breaker
-                    let mut failures = consecutive_failures.write().await;
-                    *failures += 1;
-                    if *failures >= 5 {
-                        *circuit_open.write().await = true;
-                        logger.circuit_open(*failures);
-                        if let Some(ref metrics) = metrics {
-                            metrics.record_circuit_breaker_trip().await;
-                        }
-                    }
-                }
+            BuilderMode::Connect => {
+                ParentWorker::connect_with_options(
+                    &self.target_peer_id,
+                    ConnectOptions {
+                        caller_peer_id: self.options.caller_peer_id,
+                        request_timeout: self.options.request_timeout,
+                        router_port: self.options.router_port,
+                    },
+                )
+                .await
             }
         }
     }
 }
 
-fn current_timestamp() -> f64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+async fn connect_caller_transport(
+    default_target_peer_id: String,
+    caller_peer_id: Option<String>,
+    request_timeout: Option<Duration>,
+    router_port: Option<u16>,
+) -> Result<CallerTransport> {
+    let router_port = router_port.unwrap_or_else(router_port_from_env);
+    let bootstrap = RouterBootstrapConfig {
+        endpoint: RouterEndpointConfig {
+            host: "127.0.0.1".to_string(),
+            port: router_port,
+        },
+        lock_path: crate::router_bootstrap::default_router_lock_path(),
+        log_path: crate::router_bootstrap::default_router_log_path(),
+        readiness_timeout: DEFAULT_REQUEST_TIMEOUT,
+        readiness_poll_interval: Duration::from_millis(100),
+    };
+
+    let peer_id = caller_peer_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let transport = CallerTransport::connect(CallerTransportConfig {
+        peer_id,
+        default_target_peer_id: Some(default_target_peer_id),
+        request_timeout,
+        bootstrap,
+    })
+    .await?;
+    Ok(transport)
+}
+
+async fn wait_for_service_peer(
+    transport: &CallerTransport,
+    target_peer_id: &str,
+    timeout: Option<Duration>,
+) -> Result<()> {
+    let timeout = timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
+    let start = tokio::time::Instant::now();
+    while start.elapsed() < timeout {
+        match transport.query_peer_exists(target_peer_id).await {
+            Ok(response) if response.exists => return Ok(()),
+            _ => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    Err(MultifrostError::PeerNotFound(target_peer_id.to_string()))
+}
+
+fn spawn_service_process(
+    executable: &str,
+    service_entrypoint: &str,
+    router_port: Option<u16>,
+) -> Result<Child> {
+    let mut command = if executable.split_whitespace().count() > 1 {
+        if cfg!(windows) {
+            let mut command = Command::new("cmd");
+            command.arg("/C").arg(executable);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.arg("-c").arg(executable);
+            command
+        }
+    } else {
+        Command::new(executable)
+    };
+    command.env(
+        "MULTIFROST_ENTRYPOINT_PATH",
+        canonical_peer_path(PathBuf::from(service_entrypoint)),
+    );
+    if let Some(port) = router_port {
+        command.env("MULTIFROST_ROUTER_PORT", port.to_string());
+    }
+
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
+
+    command.spawn().map_err(Into::into)
+}
+
+fn canonical_peer_path(path: PathBuf) -> String {
+    path.canonicalize()
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[test]
-    fn test_spawn_options_default() {
+    fn default_timeout_is_present() {
         let options = SpawnOptions::default();
-        assert!(!options.auto_restart);
-        assert_eq!(options.max_restart_attempts, 5);
-        assert!(options.default_timeout.is_none());
-        assert!((options.heartbeat_interval - 5.0).abs() < 0.001);
-        assert!((options.heartbeat_timeout - 3.0).abs() < 0.001);
-        assert_eq!(options.heartbeat_max_misses, 3);
-        assert!(options.enable_metrics);
+        assert!(options.request_timeout.is_some());
     }
 
     #[test]
-    fn test_connect_options_default() {
+    fn builder_connect_uses_target_peer_id() {
+        let builder = ParentWorkerBuilder::connect("math-service");
+        assert_eq!(builder.target_peer_id, "math-service");
+    }
+
+    #[test]
+    fn connect_options_default_to_timeout() {
         let options = ConnectOptions::default();
-        assert!(options.default_timeout.is_none());
-        assert!((options.heartbeat_interval - 5.0).abs() < 0.001);
-        assert!((options.heartbeat_timeout - 3.0).abs() < 0.001);
-        assert_eq!(options.heartbeat_max_misses, 3);
-        assert!(options.enable_metrics);
+        assert!(options.request_timeout.is_some());
+        assert!(options.router_port.is_none());
     }
 
     #[test]
-    fn test_parent_worker_config_default() {
-        let config = ParentWorkerConfig::default();
-        assert!(config.script_path.is_none());
-        assert!(config.executable.is_empty());
-        assert!(config.service_id.is_none());
-        assert!(config.port.is_none());
-        assert!(!config.is_spawn_mode);
-        assert!(!config.auto_restart);
-        assert_eq!(config.max_restart_attempts, 5);
-        assert!(config.default_timeout.is_none());
-        assert_eq!(config.heartbeat_interval, Duration::from_secs(5));
-        assert_eq!(config.heartbeat_timeout, Duration::from_secs(3));
-        assert_eq!(config.heartbeat_max_misses, 3);
-        assert!(config.enable_metrics);
+    fn canonical_peer_path_uses_existing_absolute_path() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("service.rs");
+        fs::write(&file, "fn main() {}").unwrap();
+
+        let canonical = canonical_peer_path(file.clone());
+        assert_eq!(canonical, file.canonicalize().unwrap().to_string_lossy());
     }
 
     #[test]
-    fn test_spawn_options_custom() {
-        let options = SpawnOptions {
-            auto_restart: true,
-            max_restart_attempts: 10,
-            default_timeout: Some(5000),
-            heartbeat_interval: 10.0,
-            heartbeat_timeout: 5.0,
-            heartbeat_max_misses: 5,
-            enable_metrics: false,
-        };
-        assert!(options.auto_restart);
-        assert_eq!(options.max_restart_attempts, 10);
-        assert_eq!(options.default_timeout, Some(5000));
-        assert!((options.heartbeat_interval - 10.0).abs() < 0.001);
-        assert!((options.heartbeat_timeout - 5.0).abs() < 0.001);
-        assert_eq!(options.heartbeat_max_misses, 5);
-        assert!(!options.enable_metrics);
-    }
+    fn spawn_service_process_exports_entrypoint_and_router_port() {
+        let dir = tempdir().unwrap();
+        let entrypoint = dir.path().join("worker.rs");
+        fs::write(&entrypoint, "fn main() {}").unwrap();
+        let output = dir.path().join("env.txt");
+        let script = format!(
+            "printf '%s|%s' \"$MULTIFROST_ENTRYPOINT_PATH\" \"$MULTIFROST_ROUTER_PORT\" > '{}'",
+            output.display()
+        );
 
-    #[test]
-    fn test_connect_options_custom() {
-        let options = ConnectOptions {
-            default_timeout: Some(3000),
-            heartbeat_interval: 7.5,
-            heartbeat_timeout: 4.0,
-            heartbeat_max_misses: 2,
-            enable_metrics: false,
-        };
-        assert_eq!(options.default_timeout, Some(3000));
-        assert!((options.heartbeat_interval - 7.5).abs() < 0.001);
-        assert!((options.heartbeat_timeout - 4.0).abs() < 0.001);
-        assert_eq!(options.heartbeat_max_misses, 2);
-        assert!(!options.enable_metrics);
-    }
+        let mut child = spawn_service_process(&script, entrypoint.to_str().unwrap(), Some(4242))
+            .expect("spawn service process");
+        let status = child.wait().expect("wait for child");
+        assert!(status.success());
 
-    #[test]
-    fn test_parent_worker_spawn_creates_instance() {
-        let result = ParentWorker::spawn("test.py", "python");
-        assert!(result.is_ok());
-        let worker = result.unwrap();
-        // Verify metrics are enabled by default
-        assert!(worker.metrics().is_some());
-    }
-
-    #[test]
-    fn test_parent_worker_spawn_with_options() {
-        let options = SpawnOptions {
-            auto_restart: true,
-            max_restart_attempts: 3,
-            default_timeout: Some(10000),
-            heartbeat_interval: 15.0,
-            heartbeat_timeout: 8.0,
-            heartbeat_max_misses: 4,
-            enable_metrics: false,
-        };
-        let result = ParentWorker::spawn_with_options("test.py", "python", options);
-        assert!(result.is_ok());
-        let worker = result.unwrap();
-        // Metrics disabled
-        assert!(worker.metrics().is_none());
-    }
-
-    #[test]
-    fn test_builder_spawn_creates_builder() {
-        let builder = ParentWorkerBuilder::spawn("test.py", "python");
-        assert!(builder.script_path.is_some());
-        assert_eq!(builder.executable, "python");
-    }
-
-    #[test]
-    fn test_builder_connect_creates_builder() {
-        let builder = ParentWorkerBuilder::connect("python");
-        assert!(builder.script_path.is_none());
-        assert_eq!(builder.executable, "python");
-    }
-
-    #[test]
-    fn test_builder_auto_restart() {
-        let builder = ParentWorkerBuilder::spawn("test.py", "python").auto_restart(true);
-        assert!(builder.options.auto_restart);
-    }
-
-    #[test]
-    fn test_builder_max_restart_attempts() {
-        let builder = ParentWorkerBuilder::spawn("test.py", "python").max_restart_attempts(20);
-        assert_eq!(builder.options.max_restart_attempts, 20);
-    }
-
-    #[test]
-    fn test_builder_default_timeout() {
-        let builder = ParentWorkerBuilder::spawn("test.py", "python")
-            .default_timeout(Duration::from_secs(60));
-        assert_eq!(builder.options.default_timeout, Some(60000));
-    }
-
-    #[test]
-    fn test_builder_heartbeat_interval() {
-        let builder = ParentWorkerBuilder::spawn("test.py", "python").heartbeat_interval(30.0);
-        assert!((builder.options.heartbeat_interval - 30.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_builder_heartbeat_timeout() {
-        let builder = ParentWorkerBuilder::spawn("test.py", "python").heartbeat_timeout(10.0);
-        assert!((builder.options.heartbeat_timeout - 10.0).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_builder_heartbeat_max_misses() {
-        let builder = ParentWorkerBuilder::spawn("test.py", "python").heartbeat_max_misses(10);
-        assert_eq!(builder.options.heartbeat_max_misses, 10);
-    }
-
-    #[test]
-    fn test_builder_enable_metrics() {
-        let builder = ParentWorkerBuilder::spawn("test.py", "python").enable_metrics(false);
-        assert!(!builder.options.enable_metrics);
-    }
-
-    #[test]
-    fn test_builder_chain_all_options() {
-        let builder = ParentWorkerBuilder::spawn("test.py", "python")
-            .auto_restart(true)
-            .max_restart_attempts(7)
-            .default_timeout(Duration::from_secs(45))
-            .heartbeat_interval(12.0)
-            .heartbeat_timeout(6.0)
-            .heartbeat_max_misses(4)
-            .enable_metrics(false);
-
-        assert!(builder.options.auto_restart);
-        assert_eq!(builder.options.max_restart_attempts, 7);
-        assert_eq!(builder.options.default_timeout, Some(45000));
-        assert!((builder.options.heartbeat_interval - 12.0).abs() < 0.001);
-        assert!((builder.options.heartbeat_timeout - 6.0).abs() < 0.001);
-        assert_eq!(builder.options.heartbeat_max_misses, 4);
-        assert!(!builder.options.enable_metrics);
-    }
-
-    #[tokio::test]
-    async fn test_parent_worker_initial_state() {
-        let worker = ParentWorker::spawn("test.py", "python").unwrap();
-
-        // Initial state checks
-        assert!(!worker.is_healthy().await); // Not started yet
-        assert!(!worker.circuit_open().await);
-        assert!(worker.last_heartbeat_rtt_ms().await.is_none());
-    }
-
-    #[test]
-    fn test_handle_takes_ownership() {
-        let worker = ParentWorker::spawn("test.py", "python").unwrap();
-        let handle = worker.handle();
-        // Handle now owns the worker
-        assert!(handle.metrics().is_some());
-    }
-
-    #[tokio::test]
-    async fn test_handle_initial_state() {
-        let handle = ParentWorker::spawn("test.py", "python").unwrap().handle();
-
-        // Initial state checks
-        assert!(!handle.is_healthy().await); // Not started yet
-        assert!(!handle.circuit_open().await);
-        assert!(handle.last_heartbeat_rtt_ms().await.is_none());
-    }
-
-    #[test]
-    fn test_find_free_port_sync_returns_valid_port() {
-        let result = find_free_port_sync();
-        assert!(result.is_ok());
-        let port = result.unwrap();
-        assert!(port >= 1024);
-    }
-
-    #[test]
-    fn test_find_free_port_sync_returns_different_ports() {
-        let port1 = find_free_port_sync().unwrap();
-        let port2 = find_free_port_sync().unwrap();
-        // Most likely different
-        assert!(port1 >= 1024);
-        assert!(port2 >= 1024);
-    }
-
-    #[test]
-    fn test_spawn_options_clone() {
-        let options = SpawnOptions {
-            auto_restart: true,
-            max_restart_attempts: 10,
-            default_timeout: Some(5000),
-            heartbeat_interval: 10.0,
-            heartbeat_timeout: 5.0,
-            heartbeat_max_misses: 5,
-            enable_metrics: false,
-        };
-        let cloned = options.clone();
-        assert_eq!(options.auto_restart, cloned.auto_restart);
-        assert_eq!(options.max_restart_attempts, cloned.max_restart_attempts);
-        assert_eq!(options.default_timeout, cloned.default_timeout);
-    }
-
-    #[test]
-    fn test_connect_options_clone() {
-        let options = ConnectOptions {
-            default_timeout: Some(3000),
-            heartbeat_interval: 7.5,
-            heartbeat_timeout: 4.0,
-            heartbeat_max_misses: 2,
-            enable_metrics: false,
-        };
-        let cloned = options.clone();
-        assert_eq!(options.default_timeout, cloned.default_timeout);
-        assert_eq!(options.heartbeat_interval, cloned.heartbeat_interval);
+        let contents = fs::read_to_string(&output).expect("read env output");
+        let expected_entrypoint = entrypoint
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(contents, format!("{expected_entrypoint}|4242"));
     }
 }

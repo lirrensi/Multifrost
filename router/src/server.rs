@@ -54,28 +54,31 @@ async fn handle_connection(stream: TcpStream, registry: PeerRegistry) -> Result<
 
     let register = decode_register_body(&first_frame.body_bytes)?;
     validate_register_envelope(&first_frame.envelope, &register)?;
-    if registry
-        .reject_duplicate_live_peer_id(&register.peer_id)
-        .await
-    {
-        send_error_and_close(
-            sink.clone(),
-            &first_frame.envelope.msg_id,
-            "duplicate_peer_id",
-            &format!("peer_id {} is already live", register.peer_id),
-        )
-        .await?;
-        return Ok(());
-    }
 
-    registry
+    match registry
         .insert_live_peer(
             register.peer_id.clone(),
             register.class.clone(),
             sink.clone(),
         )
-        .await?;
-    send_register_ack(sink.clone(), &first_frame.envelope.msg_id, &register).await?;
+        .await
+    {
+        Ok(()) => {
+            send_register_ack(sink.clone(), &first_frame.envelope.msg_id, &register).await?;
+        }
+        Err(RouterError::DuplicatePeerId(peer_id)) => {
+            send_error_and_close(
+                sink.clone(),
+                &first_frame.envelope.msg_id,
+                "duplicate_peer_id",
+                &format!("peer_id {peer_id} is already live"),
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    }
+
     let peer_id = register.peer_id;
     let peer_class = register.class;
 
@@ -104,7 +107,6 @@ async fn handle_connection(stream: TcpStream, registry: PeerRegistry) -> Result<
                             sink.clone(),
                             registry.clone(),
                             peer_id.as_str(),
-                            peer_class.clone(),
                             envelope,
                             body_bytes,
                         )
@@ -114,7 +116,6 @@ async fn handle_connection(stream: TcpStream, registry: PeerRegistry) -> Result<
                         handle_call(
                             sink.clone(),
                             registry.clone(),
-                            peer_id.as_str(),
                             peer_class.clone(),
                             envelope,
                             raw,
@@ -125,7 +126,6 @@ async fn handle_connection(stream: TcpStream, registry: PeerRegistry) -> Result<
                         handle_response(
                             sink.clone(),
                             registry.clone(),
-                            peer_id.as_str(),
                             peer_class.clone(),
                             envelope,
                             raw,
@@ -136,7 +136,6 @@ async fn handle_connection(stream: TcpStream, registry: PeerRegistry) -> Result<
                         handle_error(
                             sink.clone(),
                             registry.clone(),
-                            peer_id.as_str(),
                             peer_class.clone(),
                             envelope,
                             raw,
@@ -219,7 +218,6 @@ async fn handle_query(
     sink: PeerSender,
     registry: PeerRegistry,
     current_peer_id: &str,
-    current_class: PeerClass,
     envelope: Envelope,
     body_bytes: Vec<u8>,
 ) -> Result<()> {
@@ -256,14 +254,12 @@ async fn handle_query(
         ts: envelope.ts,
     };
     send_frame(sink, &response_envelope, response).await?;
-    let _ = current_class;
     Ok(())
 }
 
 async fn handle_call(
     sink: PeerSender,
     registry: PeerRegistry,
-    current_peer_id: &str,
     current_class: PeerClass,
     envelope: Envelope,
     raw: Vec<u8>,
@@ -279,23 +275,12 @@ async fn handle_call(
         return Ok(());
     }
 
-    route_or_error(
-        registry,
-        current_peer_id,
-        envelope,
-        raw,
-        "peer not found",
-        "invalid target class",
-        "call",
-        sink,
-    )
-    .await
+    route_or_error(registry, envelope, raw, "call", sink).await
 }
 
 async fn handle_response(
     sink: PeerSender,
     registry: PeerRegistry,
-    current_peer_id: &str,
     current_class: PeerClass,
     envelope: Envelope,
     raw: Vec<u8>,
@@ -311,18 +296,17 @@ async fn handle_response(
         return Ok(());
     }
 
-    route_to_target(registry, current_peer_id, envelope, raw, sink, "response").await
+    route_to_target(registry, envelope, raw, sink, "response").await
 }
 
 async fn handle_error(
     sink: PeerSender,
     registry: PeerRegistry,
-    current_peer_id: &str,
     _current_class: PeerClass,
     envelope: Envelope,
     raw: Vec<u8>,
 ) -> Result<()> {
-    route_to_target(registry, current_peer_id, envelope, raw, sink, "error").await
+    route_to_target(registry, envelope, raw, sink, "error").await
 }
 
 async fn handle_heartbeat(
@@ -334,23 +318,19 @@ async fn handle_heartbeat(
 ) -> Result<()> {
     registry.mark_heartbeat(current_peer_id).await;
     if registry.snapshot_peer_exists(&envelope.to).await {
-        route_to_target(registry, current_peer_id, envelope, raw, sink, "heartbeat").await
+        route_to_target(registry, envelope, raw, sink, "heartbeat").await
     } else {
-        let echoed_envelope = Envelope {
-            v: envelope.v,
-            kind: KIND_HEARTBEAT.to_string(),
-            msg_id: envelope.msg_id,
-            from: ROUTER_PEER_ID.to_string(),
-            to: current_peer_id.to_string(),
-            ts: envelope.ts,
-        };
+        let echoed_envelope = build_envelope(
+            KIND_HEARTBEAT,
+            envelope.msg_id,
+            ROUTER_PEER_ID.to_string(),
+            current_peer_id.to_string(),
+            envelope.ts,
+        );
         send_frame(
             sink,
             &echoed_envelope,
-            encode_register_ack_body(&RegisterAckBody {
-                accepted: true,
-                reason: None,
-            })?,
+            encode_register_ack_body(&build_ack_body())?,
         )
         .await
     }
@@ -364,68 +344,34 @@ async fn handle_disconnect(
     _body_bytes: Vec<u8>,
 ) -> Result<()> {
     registry.remove_by_peer_id(current_peer_id).await;
-    let response_envelope = Envelope {
-        v: envelope.v,
-        kind: KIND_RESPONSE.to_string(),
-        msg_id: envelope.msg_id,
-        from: ROUTER_PEER_ID.to_string(),
-        to: current_peer_id.to_string(),
-        ts: envelope.ts,
-    };
+    let response_envelope = build_envelope(
+        KIND_RESPONSE,
+        envelope.msg_id,
+        ROUTER_PEER_ID.to_string(),
+        current_peer_id.to_string(),
+        envelope.ts,
+    );
     send_frame(
         sink,
         &response_envelope,
-        encode_register_ack_body(&RegisterAckBody {
-            accepted: true,
-            reason: None,
-        })?,
+        encode_register_ack_body(&build_ack_body())?,
     )
     .await
 }
 
 async fn route_or_error(
     registry: PeerRegistry,
-    current_peer_id: &str,
     envelope: Envelope,
     raw: Vec<u8>,
-    not_found_reason: &str,
-    invalid_class_reason: &str,
     kind: &str,
     sink: PeerSender,
 ) -> Result<()> {
-    match registry.snapshot_peer_class(&envelope.to).await {
-        None => {
-            send_peer_error(
-                sink,
-                envelope.msg_id.as_str(),
-                "peer_not_found",
-                not_found_reason,
-            )
-            .await?;
+    match decide_route_target(kind, registry.snapshot_peer_class(&envelope.to).await) {
+        RouteTargetDecision::Deliver => {
+            route_to_target(registry, envelope, raw, sink, kind).await?;
         }
-        Some(PeerClass::Caller) if kind == "call" => {
-            send_peer_error(
-                sink,
-                envelope.msg_id.as_str(),
-                "invalid_target_class",
-                invalid_class_reason,
-            )
-            .await?;
-        }
-        Some(PeerClass::Service) if kind == "response" => {
-            send_peer_error(
-                sink,
-                envelope.msg_id.as_str(),
-                "invalid_target_class",
-                "responses must target a caller peer",
-            )
-            .await?;
-        }
-        Some(_) if kind == "error" => {
-            route_to_target(registry, current_peer_id, envelope, raw, sink, kind).await?;
-        }
-        Some(_) => {
-            route_to_target(registry, current_peer_id, envelope, raw, sink, kind).await?;
+        RouteTargetDecision::Reject { code, message } => {
+            send_peer_error(sink, envelope.msg_id.as_str(), code, &message).await?;
         }
     }
     Ok(())
@@ -433,7 +379,6 @@ async fn route_or_error(
 
 async fn route_to_target(
     registry: PeerRegistry,
-    _current_peer_id: &str,
     envelope: Envelope,
     raw: Vec<u8>,
     sink: PeerSender,
@@ -481,21 +426,17 @@ async fn send_register_ack(
     msg_id: &str,
     register: &crate::protocol::RegisterBody,
 ) -> Result<()> {
-    let envelope = Envelope {
-        v: PROTOCOL_VERSION,
-        kind: KIND_RESPONSE.to_string(),
-        msg_id: msg_id.to_string(),
-        from: ROUTER_PEER_ID.to_string(),
-        to: register.peer_id.clone(),
-        ts: now_ts(),
-    };
+    let envelope = build_envelope(
+        KIND_RESPONSE,
+        msg_id.to_string(),
+        ROUTER_PEER_ID.to_string(),
+        register.peer_id.clone(),
+        now_ts(),
+    );
     send_frame(
         sink,
         &envelope,
-        encode_register_ack_body(&RegisterAckBody {
-            accepted: true,
-            reason: None,
-        })?,
+        encode_register_ack_body(&build_ack_body())?,
     )
     .await
 }
@@ -506,49 +447,86 @@ async fn send_error_and_close(
     code: &str,
     message: &str,
 ) -> Result<()> {
-    let envelope = Envelope {
-        v: PROTOCOL_VERSION,
-        kind: KIND_ERROR.to_string(),
-        msg_id: msg_id.to_string(),
-        from: ROUTER_PEER_ID.to_string(),
-        to: ROUTER_PEER_ID.to_string(),
-        ts: now_ts(),
-    };
+    let envelope = build_envelope(
+        KIND_ERROR,
+        msg_id.to_string(),
+        ROUTER_PEER_ID.to_string(),
+        ROUTER_PEER_ID.to_string(),
+        now_ts(),
+    );
     send_frame(
         sink,
         &envelope,
-        encode_error_body(&ErrorBody {
-            code: code.to_string(),
-            message: message.to_string(),
-            kind: "router".to_string(),
-            stack: None,
-            details: None,
-        })?,
+        encode_error_body(&build_error_body(code, message))?,
     )
     .await
 }
 
 async fn send_peer_error(sink: PeerSender, msg_id: &str, code: &str, message: &str) -> Result<()> {
-    let envelope = Envelope {
-        v: PROTOCOL_VERSION,
-        kind: KIND_ERROR.to_string(),
-        msg_id: msg_id.to_string(),
-        from: ROUTER_PEER_ID.to_string(),
-        to: ROUTER_PEER_ID.to_string(),
-        ts: now_ts(),
-    };
+    let envelope = build_envelope(
+        KIND_ERROR,
+        msg_id.to_string(),
+        ROUTER_PEER_ID.to_string(),
+        ROUTER_PEER_ID.to_string(),
+        now_ts(),
+    );
     send_frame(
         sink,
         &envelope,
-        encode_error_body(&ErrorBody {
-            code: code.to_string(),
-            message: message.to_string(),
-            kind: "router".to_string(),
-            stack: None,
-            details: None,
-        })?,
+        encode_error_body(&build_error_body(code, message))?,
     )
     .await
+}
+
+fn build_envelope(kind: &str, msg_id: String, from: String, to: String, ts: f64) -> Envelope {
+    Envelope {
+        v: PROTOCOL_VERSION,
+        kind: kind.to_string(),
+        msg_id,
+        from,
+        to,
+        ts,
+    }
+}
+
+fn build_ack_body() -> RegisterAckBody {
+    RegisterAckBody {
+        accepted: true,
+        reason: None,
+    }
+}
+
+fn build_error_body(code: &str, message: &str) -> ErrorBody {
+    ErrorBody {
+        code: code.to_string(),
+        message: message.to_string(),
+        kind: "router".to_string(),
+        stack: None,
+        details: None,
+    }
+}
+
+enum RouteTargetDecision {
+    Deliver,
+    Reject { code: &'static str, message: String },
+}
+
+fn decide_route_target(kind: &str, target_class: Option<PeerClass>) -> RouteTargetDecision {
+    match target_class {
+        None => RouteTargetDecision::Reject {
+            code: "peer_not_found",
+            message: format!("{kind} target not found"),
+        },
+        Some(PeerClass::Caller) if kind == KIND_CALL => RouteTargetDecision::Reject {
+            code: "invalid_target_class",
+            message: "invalid target class".to_string(),
+        },
+        Some(PeerClass::Service) if kind == KIND_RESPONSE => RouteTargetDecision::Reject {
+            code: "invalid_target_class",
+            message: "responses must target a caller peer".to_string(),
+        },
+        Some(_) => RouteTargetDecision::Deliver,
+    }
 }
 
 async fn send_frame(sink: PeerSender, envelope: &Envelope, body_bytes: Vec<u8>) -> Result<()> {
@@ -570,4 +548,119 @@ fn now_ts() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_register_envelope_accepts_matching_router_registration() {
+        let envelope = build_envelope(
+            KIND_REGISTER,
+            "msg-1".to_string(),
+            "peer-a".to_string(),
+            ROUTER_PEER_ID.to_string(),
+            1.0,
+        );
+        let register = crate::protocol::RegisterBody {
+            peer_id: "peer-a".to_string(),
+            class: PeerClass::Service,
+        };
+
+        assert!(validate_register_envelope(&envelope, &register).is_ok());
+    }
+
+    #[test]
+    fn validate_register_envelope_rejects_wrong_target() {
+        let envelope = build_envelope(
+            KIND_REGISTER,
+            "msg-1".to_string(),
+            "peer-a".to_string(),
+            "not-router".to_string(),
+            1.0,
+        );
+        let register = crate::protocol::RegisterBody {
+            peer_id: "peer-a".to_string(),
+            class: PeerClass::Service,
+        };
+
+        let err = validate_register_envelope(&envelope, &register).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::RouterError::MalformedRegisterBody(_)
+        ));
+    }
+
+    #[test]
+    fn validate_register_envelope_rejects_peer_id_mismatch() {
+        let envelope = build_envelope(
+            KIND_REGISTER,
+            "msg-1".to_string(),
+            "peer-a".to_string(),
+            ROUTER_PEER_ID.to_string(),
+            1.0,
+        );
+        let register = crate::protocol::RegisterBody {
+            peer_id: "peer-b".to_string(),
+            class: PeerClass::Service,
+        };
+
+        let err = validate_register_envelope(&envelope, &register).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::RouterError::MalformedRegisterBody(_)
+        ));
+    }
+
+    #[test]
+    fn decide_route_target_enforces_class_rules() {
+        assert!(matches!(
+            decide_route_target(KIND_CALL, Some(PeerClass::Service)),
+            RouteTargetDecision::Deliver
+        ));
+        assert!(matches!(
+            decide_route_target(KIND_CALL, Some(PeerClass::Caller)),
+            RouteTargetDecision::Reject {
+                code: "invalid_target_class",
+                ..
+            }
+        ));
+        assert!(matches!(
+            decide_route_target(KIND_RESPONSE, Some(PeerClass::Caller)),
+            RouteTargetDecision::Deliver
+        ));
+        assert!(matches!(
+            decide_route_target(KIND_RESPONSE, Some(PeerClass::Service)),
+            RouteTargetDecision::Reject {
+                code: "invalid_target_class",
+                ..
+            }
+        ));
+        assert!(matches!(
+            decide_route_target(KIND_ERROR, None),
+            RouteTargetDecision::Reject {
+                code: "peer_not_found",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn build_envelope_sets_router_metadata() {
+        let envelope = build_envelope(
+            KIND_ERROR,
+            "msg-9".to_string(),
+            "from-peer".to_string(),
+            "to-peer".to_string(),
+            42.5,
+        );
+
+        assert_eq!(envelope.v, PROTOCOL_VERSION);
+        assert_eq!(envelope.kind, KIND_ERROR);
+        assert_eq!(envelope.msg_id, "msg-9");
+        assert_eq!(envelope.from, "from-peer");
+        assert_eq!(envelope.to, "to-peer");
+        assert_eq!(envelope.ts, 42.5);
+    }
 }

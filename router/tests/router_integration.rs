@@ -9,9 +9,9 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use multifrost_router::protocol::{
-    decode_frame, encode_frame, encode_query_body, encode_register_body, Envelope, FrameParts,
-    PeerClass, QueryBody, RegisterBody, KIND_CALL, KIND_DISCONNECT, KIND_ERROR, KIND_QUERY,
-    KIND_REGISTER, KIND_RESPONSE, PROTOCOL_VERSION, ROUTER_PEER_ID,
+    decode_error_body, decode_frame, encode_frame, encode_query_body, encode_register_body,
+    Envelope, FrameParts, PeerClass, QueryBody, RegisterBody, KIND_CALL, KIND_DISCONNECT,
+    KIND_ERROR, KIND_QUERY, KIND_REGISTER, KIND_RESPONSE, PROTOCOL_VERSION, ROUTER_PEER_ID,
 };
 use multifrost_router::registry::PeerRegistry;
 use multifrost_router::server;
@@ -71,6 +71,19 @@ async fn read_binary_frame(
     decode_frame(bytes.as_ref()).unwrap()
 }
 
+async fn wait_for_peer_absent(registry: &PeerRegistry, peer_id: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if !registry.snapshot_peer_exists(peer_id).await {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("peer {peer_id} was still registered after waiting");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 async fn successful_service_register_on_default_port_override_test_server() {
     let (base_url, handle, _) = start_test_router().await;
@@ -99,6 +112,8 @@ async fn duplicate_live_peer_id_rejection() {
     let (mut ws2, _) = connect_peer(&base_url, "dupe", PeerClass::Service).await;
     let rejected = read_binary_frame(&mut ws2).await;
     assert_eq!(rejected.envelope.kind, KIND_ERROR);
+    let error_body = decode_error_body(&rejected.body_bytes).unwrap();
+    assert_eq!(error_body.code, "duplicate_peer_id");
     handle.abort();
 }
 
@@ -214,6 +229,8 @@ async fn call_to_missing_target_returns_router_error() {
 
     let reply = read_binary_frame(&mut caller_ws).await;
     assert_eq!(reply.envelope.kind, KIND_ERROR);
+    let error_body = decode_error_body(&reply.body_bytes).unwrap();
+    assert_eq!(error_body.code, "peer_not_found");
     handle.abort();
 }
 
@@ -242,6 +259,8 @@ async fn call_to_caller_target_returns_invalid_target_class_error() {
 
     let reply = read_binary_frame(&mut caller_ws).await;
     assert_eq!(reply.envelope.kind, KIND_ERROR);
+    let error_body = decode_error_body(&reply.body_bytes).unwrap();
+    assert_eq!(error_body.code, "invalid_target_class");
     handle.abort();
 }
 
@@ -252,7 +271,7 @@ async fn websocket_close_evicts_live_registry_entry_immediately() {
     let _ = read_binary_frame(&mut ws).await;
     ws.close(None).await.unwrap();
     drop(ws);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_peer_absent(&registry, "close-me").await;
     assert!(!registry.snapshot_peer_exists("close-me").await);
     handle.abort();
 }
@@ -276,11 +295,68 @@ async fn re_register_after_disconnect_succeeds() {
     ws.close(None).await.unwrap();
     drop(ws);
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_peer_absent(&registry, "rejoin").await;
     assert!(!registry.snapshot_peer_exists("rejoin").await);
 
     let (mut ws2, _) = connect_peer(&base_url, "rejoin", PeerClass::Service).await;
     let ack = read_binary_frame(&mut ws2).await;
     assert_eq!(ack.envelope.kind, KIND_RESPONSE);
+    handle.abort();
+}
+
+#[tokio::test]
+async fn non_register_first_message_gets_router_error() {
+    let (base_url, handle, _) = start_test_router().await;
+    let (mut ws, _) = connect_async(&base_url).await.unwrap();
+    let envelope = Envelope {
+        v: PROTOCOL_VERSION,
+        kind: KIND_CALL.to_string(),
+        msg_id: "first-call".into(),
+        from: "peer-first".into(),
+        to: ROUTER_PEER_ID.to_string(),
+        ts: 1_700_000_010.0,
+    };
+    let frame = encode_frame(&envelope, &[0x80]).unwrap();
+    ws.send(Message::Binary(Bytes::from(frame))).await.unwrap();
+
+    let reply = timeout(Duration::from_secs(2), ws.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let Message::Binary(bytes) = reply else {
+        panic!("expected binary error frame");
+    };
+    let decoded = decode_frame(bytes.as_ref()).unwrap();
+    assert_eq!(decoded.envelope.kind, KIND_ERROR);
+    let error_body = decode_error_body(&decoded.body_bytes).unwrap();
+    assert_eq!(error_body.code, "register.required");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn call_from_service_peer_gets_invalid_source_class_error() {
+    let (base_url, handle, _) = start_test_router().await;
+    let (mut service_ws, _) = connect_peer(&base_url, "service-src", PeerClass::Service).await;
+    let _ = read_binary_frame(&mut service_ws).await;
+
+    let envelope = Envelope {
+        v: PROTOCOL_VERSION,
+        kind: KIND_CALL.to_string(),
+        msg_id: "bad-call".into(),
+        from: "service-src".into(),
+        to: "service-target".into(),
+        ts: 1_700_000_011.0,
+    };
+    let frame = encode_frame(&envelope, &[0x80]).unwrap();
+    service_ws
+        .send(Message::Binary(Bytes::from(frame)))
+        .await
+        .unwrap();
+
+    let reply = read_binary_frame(&mut service_ws).await;
+    assert_eq!(reply.envelope.kind, KIND_ERROR);
+    let error_body = decode_error_body(&reply.body_bytes).unwrap();
+    assert_eq!(error_body.code, "invalid_source_class");
     handle.abort();
 }

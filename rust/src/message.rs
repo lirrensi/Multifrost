@@ -1,322 +1,341 @@
 use crate::error::{MultifrostError, Result};
-use rmp_serde::decode::Deserializer;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::io::Cursor;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-const APP_NAME: &str = "comlink_ipc_v4";
-const PROTOCOL_VERSION: &str = "4.0.0";
+pub const PROTOCOL_KEY: &str = "multifrost_ipc_v5";
+pub const PROTOCOL_VERSION: u32 = 5;
+pub const ROUTER_PEER_ID: &str = "router";
 
-/// Validate that all map keys in a serde_json::Value are strings
-fn validate_string_keys(value: &serde_json::Value) -> Result<()> {
-    match value {
-        serde_json::Value::Object(map) => {
-            // serde_json Object keys are always strings, so no validation needed
-            for (_key, val) in map.iter() {
-                validate_string_keys(val)?;
-            }
-            Ok(())
-        }
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                validate_string_keys(item)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
+pub const KIND_REGISTER: &str = "register";
+pub const KIND_QUERY: &str = "query";
+pub const KIND_CALL: &str = "call";
+pub const KIND_RESPONSE: &str = "response";
+pub const KIND_ERROR: &str = "error";
+pub const KIND_HEARTBEAT: &str = "heartbeat";
+pub const KIND_DISCONNECT: &str = "disconnect";
+
+pub const QUERY_PEER_EXISTS: &str = "peer.exists";
+pub const QUERY_PEER_GET: &str = "peer.get";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Envelope {
+    pub v: u32,
+    pub kind: String,
+    pub msg_id: String,
+    pub from: String,
+    pub to: String,
+    pub ts: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum MessageType {
-    Call,
-    Response,
-    Error,
-    Stdout,
-    Stderr,
-    Heartbeat,
-    Shutdown,
-    Ready,
-    #[serde(other)]
-    Unknown,
+pub enum PeerClass {
+    Service,
+    Caller,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Message {
-    pub app: String,
-    pub id: String,
-    #[serde(rename = "type")]
-    pub msg_type: MessageType,
-    #[serde(with = "timestamp_as_f64")]
-    pub timestamp: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+impl PeerClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Service => "service",
+            Self::Caller => "caller",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegisterBody {
+    pub peer_id: String,
+    pub class: PeerClass,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegisterAckBody {
+    pub accepted: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "query")]
+pub enum QueryBody {
+    #[serde(rename = "peer.exists")]
+    PeerExists { peer_id: String },
+    #[serde(rename = "peer.get")]
+    PeerGet { peer_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueryExistsResponseBody {
+    pub peer_id: String,
+    pub exists: bool,
+    pub class: Option<PeerClass>,
+    pub connected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueryGetResponseBody {
+    pub peer_id: String,
+    pub exists: bool,
+    pub class: Option<PeerClass>,
+    pub connected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallBody {
+    pub function: String,
     #[serde(default)]
-    pub function: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub args: Option<Vec<serde_json::Value>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
+    pub args: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub result: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub error: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub output: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub client_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
-    pub metadata: Option<serde_json::Value>,
 }
 
-/// Custom serializer for timestamp to handle msgpack integer/float ambiguity
-mod timestamp_as_f64 {
-    use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S>(value: &f64, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        // Always serialize as f64 to ensure msgpack uses float type
-        value.serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<f64, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        // Handle both integer and float from msgpack
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Numeric {
-            Float(f64),
-            Int(i64),
-            UInt(u64),
-        }
-
-        match Numeric::deserialize(deserializer)? {
-            Numeric::Float(f) => {
-                if f.is_nan() || f.is_infinite() {
-                    // Convert NaN/Infinity to 0.0 per msgpack safety contract
-                    Ok(0.0)
-                } else {
-                    Ok(f)
-                }
-            }
-            Numeric::Int(i) => Ok(i as f64),
-            Numeric::UInt(u) => {
-                // Clamp to i64::MAX to prevent overflow/precision loss
-                Ok(u.min(i64::MAX as u64) as f64)
-            }
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResponseBody {
+    pub result: serde_json::Value,
 }
 
-impl Message {
-    pub fn new(msg_type: MessageType) -> Self {
-        Self {
-            app: APP_NAME.to_string(),
-            id: Uuid::new_v4().to_string(),
-            msg_type,
-            timestamp: current_timestamp(),
-            function: None,
-            args: None,
-            namespace: None,
-            result: None,
-            error: None,
-            output: None,
-            client_name: None,
-            metadata: None,
-        }
-    }
-
-    pub fn create_call(function: &str, args: Vec<serde_json::Value>) -> Self {
-        Self {
-            app: APP_NAME.to_string(),
-            id: Uuid::new_v4().to_string(),
-            msg_type: MessageType::Call,
-            timestamp: current_timestamp(),
-            function: Some(function.to_string()),
-            args: Some(args),
-            namespace: Some("default".to_string()),
-            result: None,
-            error: None,
-            output: None,
-            client_name: None,
-            metadata: None,
-        }
-    }
-
-    pub fn create_response(result: serde_json::Value, msg_id: &str) -> Self {
-        Self {
-            app: APP_NAME.to_string(),
-            id: msg_id.to_string(),
-            msg_type: MessageType::Response,
-            timestamp: current_timestamp(),
-            function: None,
-            args: None,
-            namespace: None,
-            result: Some(result),
-            error: None,
-            output: None,
-            client_name: None,
-            metadata: None,
-        }
-    }
-
-    pub fn create_error(error: &str, msg_id: &str) -> Self {
-        Self {
-            app: APP_NAME.to_string(),
-            id: msg_id.to_string(),
-            msg_type: MessageType::Error,
-            timestamp: current_timestamp(),
-            function: None,
-            args: None,
-            namespace: None,
-            result: None,
-            error: Some(error.to_string()),
-            output: None,
-            client_name: None,
-            metadata: None,
-        }
-    }
-
-    pub fn create_shutdown() -> Self {
-        Self::new(MessageType::Shutdown)
-    }
-
-    pub fn create_ready() -> Self {
-        Self::new(MessageType::Ready)
-    }
-
-    pub fn create_stdout(output: &str) -> Self {
-        Self {
-            app: APP_NAME.to_string(),
-            id: Uuid::new_v4().to_string(),
-            msg_type: MessageType::Stdout,
-            timestamp: current_timestamp(),
-            output: Some(output.to_string()),
-            ..Default::default()
-        }
-    }
-
-    pub fn create_stderr(output: &str) -> Self {
-        Self {
-            app: APP_NAME.to_string(),
-            id: Uuid::new_v4().to_string(),
-            msg_type: MessageType::Stderr,
-            timestamp: current_timestamp(),
-            output: Some(output.to_string()),
-            ..Default::default()
-        }
-    }
-
-    pub fn create_heartbeat(msg_id: Option<String>, timestamp: Option<f64>) -> Self {
-        let hb_timestamp = timestamp.unwrap_or_else(|| current_timestamp());
-        let metadata = serde_json::json!({
-            "hb_timestamp": hb_timestamp
-        });
-
-        Self {
-            app: APP_NAME.to_string(),
-            id: msg_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
-            msg_type: MessageType::Heartbeat,
-            timestamp: current_timestamp(),
-            metadata: Some(metadata),
-            ..Default::default()
-        }
-    }
-
-    pub fn create_heartbeat_response(request_id: &str, original_timestamp: f64) -> Self {
-        let metadata = serde_json::json!({
-            "hb_timestamp": original_timestamp,
-            "hb_response": true
-        });
-
-        Self {
-            app: APP_NAME.to_string(),
-            id: request_id.to_string(),
-            msg_type: MessageType::Heartbeat,
-            timestamp: current_timestamp(),
-            metadata: Some(metadata),
-            ..Default::default()
-        }
-    }
-
-    pub fn pack(&self) -> Result<Vec<u8>> {
-        // Use named (map-based) serialization so field order doesn't matter
-        let packed = rmp_serde::to_vec_named(self).map_err(MultifrostError::from)?;
-        Ok(packed)
-    }
-
-    pub fn unpack(data: &[u8]) -> Result<Self> {
-        let mut deserializer = Deserializer::new(Cursor::new(data));
-        deserializer.set_max_depth(100); // Prevent stack overflow
-        let msg = Self::deserialize(&mut deserializer)
-            .map_err(|e| MultifrostError::DeserializeError(e))?;
-
-        // Validate map keys in args and metadata are strings
-        if let Some(ref args) = msg.args {
-            validate_string_keys(&serde_json::Value::Array(
-                args.clone().into_iter().collect(),
-            ))?;
-        }
-        if let Some(ref metadata) = msg.metadata {
-            validate_string_keys(metadata)?;
-        }
-
-        Ok(msg)
-    }
-
-    pub fn is_valid(&self) -> bool {
-        self.app == APP_NAME && !self.id.is_empty()
-    }
-
-    /// Check protocol version compatibility
-    pub fn check_protocol_version(&self) -> bool {
-        // For now, just check app name
-        // In the future, we could add version negotiation
-        self.app == APP_NAME
-    }
-
-    /// Get the protocol version
-    pub fn protocol_version() -> &'static str {
-        PROTOCOL_VERSION
-    }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ErrorBody {
+    pub code: String,
+    pub message: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stack: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<WireValue>,
 }
 
-impl Default for Message {
-    fn default() -> Self {
-        Self {
-            app: APP_NAME.to_string(),
-            id: Uuid::new_v4().to_string(),
-            msg_type: MessageType::Call,
-            timestamp: current_timestamp(),
-            function: None,
-            args: None,
-            namespace: None,
-            result: None,
-            error: None,
-            output: None,
-            client_name: None,
-            metadata: None,
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WireValue {
+    Nil,
+    Bool(bool),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    Text(String),
+    #[serde(with = "serde_bytes")]
+    Binary(Vec<u8>),
+    Array(Vec<WireValue>),
+    Map(Vec<(String, WireValue)>),
 }
 
-fn current_timestamp() -> f64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FrameParts {
+    pub envelope: Envelope,
+    pub body_bytes: Vec<u8>,
+}
+
+pub fn now_ts() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
+        .map(|duration| duration.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+pub fn new_msg_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+pub fn validate_protocol_key(value: &str) -> Result<()> {
+    if value == PROTOCOL_KEY {
+        Ok(())
+    } else {
+        Err(MultifrostError::InvalidProtocolKey(value.to_string()))
+    }
+}
+
+pub fn ensure_binary_ws_message(message: Message) -> Result<Vec<u8>> {
+    match message {
+        Message::Binary(bytes) => Ok(bytes.to_vec()),
+        other => Err(MultifrostError::MalformedFrame(format!(
+            "expected binary websocket message, got {other:?}"
+        ))),
+    }
+}
+
+pub fn encode_frame(envelope: &Envelope, body_bytes: &[u8]) -> Result<Vec<u8>> {
+    let envelope_bytes = encode_envelope(envelope)?;
+    let mut out = Vec::with_capacity(4 + envelope_bytes.len() + body_bytes.len());
+    out.extend_from_slice(&(envelope_bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(&envelope_bytes);
+    out.extend_from_slice(body_bytes);
+    Ok(out)
+}
+
+pub fn decode_frame(bytes: &[u8]) -> Result<FrameParts> {
+    if bytes.len() < 4 {
+        return Err(MultifrostError::MalformedFrame(
+            "frame too short for envelope length".into(),
+        ));
+    }
+
+    let envelope_len = u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    if bytes.len() < 4 + envelope_len {
+        return Err(MultifrostError::MalformedFrame(
+            "frame shorter than declared envelope length".into(),
+        ));
+    }
+
+    let envelope = decode_envelope(&bytes[4..4 + envelope_len])?;
+    let body_bytes = bytes[4 + envelope_len..].to_vec();
+    Ok(FrameParts {
+        envelope,
+        body_bytes,
+    })
+}
+
+pub fn encode_envelope(envelope: &Envelope) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(envelope).map_err(Into::into)
+}
+
+pub fn decode_envelope(bytes: &[u8]) -> Result<Envelope> {
+    let envelope: Envelope = rmp_serde::from_slice(bytes)
+        .map_err(|err| MultifrostError::MalformedFrame(err.to_string()))?;
+    if envelope.v != PROTOCOL_VERSION {
+        return Err(MultifrostError::InvalidProtocolKey(format!(
+            "v={}",
+            envelope.v
+        )));
+    }
+    Ok(envelope)
+}
+
+pub fn encode_register_body(body: &RegisterBody) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(body).map_err(Into::into)
+}
+
+pub fn decode_register_body(bytes: &[u8]) -> Result<RegisterBody> {
+    rmp_serde::from_slice(bytes).map_err(|err| MultifrostError::MalformedFrame(err.to_string()))
+}
+
+pub fn encode_register_ack_body(body: &RegisterAckBody) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(body).map_err(Into::into)
+}
+
+pub fn decode_register_ack_body(bytes: &[u8]) -> Result<RegisterAckBody> {
+    rmp_serde::from_slice(bytes).map_err(|err| MultifrostError::MalformedFrame(err.to_string()))
+}
+
+pub fn encode_query_body(body: &QueryBody) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(body).map_err(Into::into)
+}
+
+pub fn decode_query_body(bytes: &[u8]) -> Result<QueryBody> {
+    rmp_serde::from_slice(bytes).map_err(|err| MultifrostError::MalformedFrame(err.to_string()))
+}
+
+pub fn encode_query_exists_response(body: &QueryExistsResponseBody) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(body).map_err(Into::into)
+}
+
+pub fn decode_query_exists_response(bytes: &[u8]) -> Result<QueryExistsResponseBody> {
+    rmp_serde::from_slice(bytes).map_err(|err| MultifrostError::MalformedFrame(err.to_string()))
+}
+
+pub fn encode_query_get_response(body: &QueryGetResponseBody) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(body).map_err(Into::into)
+}
+
+pub fn decode_query_get_response(bytes: &[u8]) -> Result<QueryGetResponseBody> {
+    rmp_serde::from_slice(bytes).map_err(|err| MultifrostError::MalformedFrame(err.to_string()))
+}
+
+pub fn encode_call_body(body: &CallBody) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(body).map_err(Into::into)
+}
+
+pub fn decode_call_body(bytes: &[u8]) -> Result<CallBody> {
+    rmp_serde::from_slice(bytes).map_err(|err| MultifrostError::MalformedFrame(err.to_string()))
+}
+
+pub fn encode_response_body(body: &ResponseBody) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(body).map_err(Into::into)
+}
+
+pub fn decode_response_body(bytes: &[u8]) -> Result<ResponseBody> {
+    rmp_serde::from_slice(bytes).map_err(|err| MultifrostError::MalformedFrame(err.to_string()))
+}
+
+pub fn encode_error_body(body: &ErrorBody) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(body).map_err(Into::into)
+}
+
+pub fn decode_error_body(bytes: &[u8]) -> Result<ErrorBody> {
+    rmp_serde::from_slice(bytes).map_err(|err| MultifrostError::MalformedFrame(err.to_string()))
+}
+
+pub fn build_register_envelope(peer_id: &str, _class: PeerClass) -> Envelope {
+    Envelope {
+        v: PROTOCOL_VERSION,
+        kind: KIND_REGISTER.to_string(),
+        msg_id: new_msg_id(),
+        from: peer_id.to_string(),
+        to: ROUTER_PEER_ID.to_string(),
+        ts: now_ts(),
+    }
+}
+
+pub fn build_query_envelope(peer_id: &str, to: &str) -> Envelope {
+    Envelope {
+        v: PROTOCOL_VERSION,
+        kind: KIND_QUERY.to_string(),
+        msg_id: new_msg_id(),
+        from: peer_id.to_string(),
+        to: to.to_string(),
+        ts: now_ts(),
+    }
+}
+
+pub fn build_call_envelope(from: &str, to: &str) -> Envelope {
+    Envelope {
+        v: PROTOCOL_VERSION,
+        kind: KIND_CALL.to_string(),
+        msg_id: new_msg_id(),
+        from: from.to_string(),
+        to: to.to_string(),
+        ts: now_ts(),
+    }
+}
+
+pub fn build_response_envelope(from: &str, to: &str, msg_id: &str) -> Envelope {
+    Envelope {
+        v: PROTOCOL_VERSION,
+        kind: KIND_RESPONSE.to_string(),
+        msg_id: msg_id.to_string(),
+        from: from.to_string(),
+        to: to.to_string(),
+        ts: now_ts(),
+    }
+}
+
+pub fn build_error_envelope(from: &str, to: &str, msg_id: &str) -> Envelope {
+    Envelope {
+        v: PROTOCOL_VERSION,
+        kind: KIND_ERROR.to_string(),
+        msg_id: msg_id.to_string(),
+        from: from.to_string(),
+        to: to.to_string(),
+        ts: now_ts(),
+    }
+}
+
+pub fn build_disconnect_envelope(from: &str, to: &str, msg_id: &str) -> Envelope {
+    Envelope {
+        v: PROTOCOL_VERSION,
+        kind: KIND_DISCONNECT.to_string(),
+        msg_id: msg_id.to_string(),
+        from: from.to_string(),
+        to: to.to_string(),
+        ts: now_ts(),
+    }
+}
+
+pub fn binary_message(bytes: Vec<u8>) -> Message {
+    Message::Binary(Bytes::from(bytes))
 }
 
 #[cfg(test)]
@@ -325,260 +344,182 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_message_creation() {
-        let msg = Message::new(MessageType::Call);
-        assert_eq!(msg.app, APP_NAME);
-        assert_eq!(msg.msg_type, MessageType::Call);
-        assert!(!msg.id.is_empty());
-        assert!(msg.timestamp > 0.0);
-    }
-
-    #[test]
-    fn test_create_call_message() {
-        let args = vec![json!(5), json!(3)];
-        let msg = Message::create_call("add", args.clone());
-
-        assert_eq!(msg.msg_type, MessageType::Call);
-        assert_eq!(msg.function, Some("add".to_string()));
-        assert_eq!(msg.args, Some(args));
-        assert_eq!(msg.namespace, Some("default".to_string()));
-        assert!(msg.result.is_none());
-        assert!(msg.error.is_none());
-    }
-
-    #[test]
-    fn test_create_response_message() {
-        let result = json!(42);
-        let msg_id = "test-id-123";
-        let msg = Message::create_response(result.clone(), msg_id);
-
-        assert_eq!(msg.msg_type, MessageType::Response);
-        assert_eq!(msg.id, msg_id);
-        assert_eq!(msg.result, Some(result));
-        assert!(msg.error.is_none());
-    }
-
-    #[test]
-    fn test_create_error_message() {
-        let error = "Something went wrong";
-        let msg_id = "test-id-456";
-        let msg = Message::create_error(error, msg_id);
-
-        assert_eq!(msg.msg_type, MessageType::Error);
-        assert_eq!(msg.id, msg_id);
-        assert_eq!(msg.error, Some(error.to_string()));
-        assert!(msg.result.is_none());
-    }
-
-    #[test]
-    fn test_create_shutdown_message() {
-        let msg = Message::create_shutdown();
-        assert_eq!(msg.msg_type, MessageType::Shutdown);
-        assert_eq!(msg.app, APP_NAME);
-    }
-
-    #[test]
-    fn test_create_ready_message() {
-        let msg = Message::create_ready();
-        assert_eq!(msg.msg_type, MessageType::Ready);
-        assert_eq!(msg.app, APP_NAME);
-    }
-
-    #[test]
-    fn test_create_stdout_message() {
-        let output = "Hello from worker";
-        let msg = Message::create_stdout(output);
-
-        assert_eq!(msg.msg_type, MessageType::Stdout);
-        assert_eq!(msg.output, Some(output.to_string()));
-        assert_eq!(msg.app, APP_NAME);
-    }
-
-    #[test]
-    fn test_create_stderr_message() {
-        let output = "Error occurred";
-        let msg = Message::create_stderr(output);
-
-        assert_eq!(msg.msg_type, MessageType::Stderr);
-        assert_eq!(msg.output, Some(output.to_string()));
-        assert_eq!(msg.app, APP_NAME);
-    }
-
-    #[test]
-    fn test_create_heartbeat_message() {
-        let msg_id = Some("hb-123".to_string());
-        let timestamp = 1234567890.0;
-        let msg = Message::create_heartbeat(msg_id.clone(), Some(timestamp));
-
-        assert_eq!(msg.msg_type, MessageType::Heartbeat);
-        assert_eq!(msg.id, msg_id.unwrap());
-        assert!(msg.metadata.is_some());
-
-        let metadata = msg.metadata.unwrap();
-        assert_eq!(metadata.get("hb_timestamp"), Some(&json!(timestamp)));
-    }
-
-    #[test]
-    fn test_create_heartbeat_message_defaults() {
-        let msg = Message::create_heartbeat(None, None);
-
-        assert_eq!(msg.msg_type, MessageType::Heartbeat);
-        assert!(!msg.id.is_empty());
-        assert!(msg.metadata.is_some());
-
-        let metadata = msg.metadata.unwrap();
-        assert!(metadata.get("hb_timestamp").is_some());
-    }
-
-    #[test]
-    fn test_create_heartbeat_response() {
-        let request_id = "req-123";
-        let original_timestamp = 1234567890.0;
-        let msg = Message::create_heartbeat_response(request_id, original_timestamp);
-
-        assert_eq!(msg.msg_type, MessageType::Heartbeat);
-        assert_eq!(msg.id, request_id);
-        assert!(msg.metadata.is_some());
-
-        let metadata = msg.metadata.unwrap();
-        assert_eq!(
-            metadata.get("hb_timestamp"),
-            Some(&json!(original_timestamp))
-        );
-        assert_eq!(metadata.get("hb_response"), Some(&json!(true)));
-    }
-
-    #[test]
-    fn test_message_pack_unpack_roundtrip() {
-        let original = Message::create_call("test_func", vec![json!(1), json!(2)]);
-
-        let packed = original.pack().unwrap();
-        let unpacked = Message::unpack(&packed).unwrap();
-
-        assert_eq!(original.app, unpacked.app);
-        assert_eq!(original.msg_type, unpacked.msg_type);
-        assert_eq!(original.function, unpacked.function);
-        assert_eq!(original.args, unpacked.args);
-        assert_eq!(original.namespace, unpacked.namespace);
-    }
-
-    #[test]
-    fn test_message_pack_unpack_with_metadata() {
-        let metadata = json!({"key": "value", "num": 42});
-        let mut msg = Message::create_call("test", vec![]);
-        msg.metadata = Some(metadata.clone());
-
-        let packed = msg.pack().unwrap();
-        let unpacked = Message::unpack(&packed).unwrap();
-
-        assert_eq!(unpacked.metadata, Some(metadata));
-    }
-
-    #[test]
-    fn test_message_is_valid() {
-        let msg = Message::new(MessageType::Call);
-        assert!(msg.is_valid());
-    }
-
-    #[test]
-    fn test_message_is_valid_wrong_app() {
-        let mut msg = Message::new(MessageType::Call);
-        msg.app = "wrong_app".to_string();
-        assert!(!msg.is_valid());
-    }
-
-    #[test]
-    fn test_message_is_valid_empty_id() {
-        let mut msg = Message::new(MessageType::Call);
-        msg.id = String::new();
-        assert!(!msg.is_valid());
-    }
-
-    #[test]
-    fn test_timestamp_serialization_float() {
-        let timestamp = 1234567890.123;
-        let mut msg = Message::new(MessageType::Call);
-        msg.timestamp = timestamp;
-
-        let packed = msg.pack().unwrap();
-        let unpacked = Message::unpack(&packed).unwrap();
-
-        assert!((unpacked.timestamp - timestamp).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_timestamp_serialization_integer() {
-        // Test that we can handle integer timestamps from msgpack
-        let timestamp = 1234567890.0;
-        let mut msg = Message::new(MessageType::Call);
-        msg.timestamp = timestamp;
-
-        let packed = msg.pack().unwrap();
-        let unpacked = Message::unpack(&packed).unwrap();
-
-        assert!((unpacked.timestamp - timestamp).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_message_type_equality() {
-        assert_eq!(MessageType::Call, MessageType::Call);
-        assert_ne!(MessageType::Call, MessageType::Response);
-    }
-
-    #[test]
-    fn test_message_default() {
-        let msg = Message::default();
-        assert_eq!(msg.app, APP_NAME);
-        assert_eq!(msg.msg_type, MessageType::Call);
-        assert!(!msg.id.is_empty());
-        assert!(msg.function.is_none());
-        assert!(msg.args.is_none());
-    }
-
-    #[test]
-    fn test_message_with_all_fields() {
-        let metadata = json!({"trace_id": "abc123"});
-        let metadata_clone = metadata.clone();
-        let msg = Message {
-            app: APP_NAME.to_string(),
-            id: "test-id".to_string(),
-            msg_type: MessageType::Call,
-            timestamp: 1234567890.0,
-            function: Some("test".to_string()),
-            args: Some(vec![json!(1)]),
-            namespace: Some("test_ns".to_string()),
-            result: Some(json!(42)),
-            error: None,
-            output: None,
-            client_name: Some("test_client".to_string()),
-            metadata: Some(metadata),
+    fn frame_round_trip_preserves_body_bytes() {
+        let envelope = Envelope {
+            v: PROTOCOL_VERSION,
+            kind: KIND_CALL.to_string(),
+            msg_id: "abc".to_string(),
+            from: "caller".to_string(),
+            to: "service".to_string(),
+            ts: 1_700_000_000.5,
         };
+        let body_bytes = vec![0x82, 0xa3, b'f', b'o', b'o', 0x01];
 
-        let packed = msg.pack().unwrap();
-        let unpacked = Message::unpack(&packed).unwrap();
+        let encoded = encode_frame(&envelope, &body_bytes).unwrap();
+        let decoded = decode_frame(&encoded).unwrap();
 
-        assert_eq!(unpacked.function, Some("test".to_string()));
-        assert_eq!(unpacked.namespace, Some("test_ns".to_string()));
-        assert_eq!(unpacked.result, Some(json!(42)));
-        assert_eq!(unpacked.client_name, Some("test_client".to_string()));
-        assert_eq!(unpacked.metadata, Some(metadata_clone));
+        assert_eq!(decoded.envelope, envelope);
+        assert_eq!(decoded.body_bytes, body_bytes);
     }
 
     #[test]
-    fn test_message_clone() {
-        let msg = Message::create_call("test", vec![json!(1)]);
-        let cloned = msg.clone();
-
-        assert_eq!(msg.id, cloned.id);
-        assert_eq!(msg.msg_type, cloned.msg_type);
-        assert_eq!(msg.function, cloned.function);
+    fn frame_decode_rejects_short_input() {
+        let err = decode_frame(&[0x00, 0x00, 0x00]).unwrap_err();
+        assert!(matches!(err, MultifrostError::MalformedFrame(_)));
     }
 
     #[test]
-    fn test_message_debug() {
-        let msg = Message::create_call("test", vec![json!(1)]);
-        let debug_str = format!("{:?}", msg);
-        assert!(debug_str.contains("Call"));
-        assert!(debug_str.contains("test"));
+    fn frame_decode_rejects_truncated_envelope() {
+        let err = decode_frame(&[0x00, 0x00, 0x00, 0x10, 0x01]).unwrap_err();
+        assert!(matches!(err, MultifrostError::MalformedFrame(_)));
+    }
+
+    #[test]
+    fn envelope_decode_rejects_version_mismatch() {
+        let envelope = Envelope {
+            v: PROTOCOL_VERSION + 1,
+            kind: KIND_CALL.to_string(),
+            msg_id: "abc".to_string(),
+            from: "caller".to_string(),
+            to: "service".to_string(),
+            ts: 1_700_000_000.5,
+        };
+        let bytes = encode_envelope(&envelope).unwrap();
+        let err = decode_envelope(&bytes).unwrap_err();
+        assert!(matches!(err, MultifrostError::InvalidProtocolKey(_)));
+    }
+
+    #[test]
+    fn validate_protocol_key_accepts_and_rejects() {
+        assert!(validate_protocol_key(PROTOCOL_KEY).is_ok());
+        assert!(matches!(
+            validate_protocol_key("not-the-key"),
+            Err(MultifrostError::InvalidProtocolKey(_))
+        ));
+    }
+
+    #[test]
+    fn binary_message_wraps_bytes() {
+        let message = binary_message(vec![1, 2, 3]);
+        assert!(matches!(message, Message::Binary(_)));
+    }
+
+    #[test]
+    fn register_ack_round_trip() {
+        let body = RegisterAckBody {
+            accepted: true,
+            reason: None,
+        };
+        let bytes = encode_register_ack_body(&body).unwrap();
+        let decoded = decode_register_ack_body(&bytes).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn query_response_round_trips() {
+        let exists = QueryExistsResponseBody {
+            peer_id: "service".into(),
+            exists: true,
+            class: Some(PeerClass::Service),
+            connected: true,
+        };
+        let exists_bytes = encode_query_exists_response(&exists).unwrap();
+        assert_eq!(decode_query_exists_response(&exists_bytes).unwrap(), exists);
+
+        let get = QueryGetResponseBody {
+            peer_id: "service".into(),
+            exists: true,
+            class: Some(PeerClass::Service),
+            connected: true,
+        };
+        let get_bytes = encode_query_get_response(&get).unwrap();
+        assert_eq!(decode_query_get_response(&get_bytes).unwrap(), get);
+    }
+
+    #[test]
+    fn register_body_round_trip() {
+        let body = RegisterBody {
+            peer_id: "peer".into(),
+            class: PeerClass::Service,
+        };
+        let bytes = encode_register_body(&body).unwrap();
+        let decoded = decode_register_body(&bytes).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn query_body_round_trip() {
+        let body = QueryBody::PeerExists {
+            peer_id: "peer".into(),
+        };
+        let bytes = encode_query_body(&body).unwrap();
+        let decoded = decode_query_body(&bytes).unwrap();
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn call_and_response_and_error_bodies_round_trip() {
+        let call = CallBody {
+            function: "add".into(),
+            args: vec![json!(10), json!(20)],
+            namespace: Some("default".into()),
+        };
+        let call_bytes = encode_call_body(&call).unwrap();
+        assert_eq!(decode_call_body(&call_bytes).unwrap(), call);
+
+        let response = ResponseBody { result: json!(30) };
+        let response_bytes = encode_response_body(&response).unwrap();
+        assert_eq!(decode_response_body(&response_bytes).unwrap(), response);
+
+        let error = ErrorBody {
+            code: "boom".into(),
+            message: "boom".into(),
+            kind: "application".into(),
+            stack: Some("stack".into()),
+            details: Some(WireValue::Int(1)),
+        };
+        let error_bytes = encode_error_body(&error).unwrap();
+        assert_eq!(decode_error_body(&error_bytes).unwrap(), error);
+    }
+
+    #[test]
+    fn wire_value_round_trip_preserves_nested_lists() {
+        let value = WireValue::Array(vec![
+            WireValue::Bool(true),
+            WireValue::Text("ok".into()),
+            WireValue::Int(3),
+        ]);
+        let bytes = rmp_serde::to_vec_named(&value).unwrap();
+        let decoded: WireValue = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn envelope_builders_use_expected_fields() {
+        let register = build_register_envelope("caller-1", PeerClass::Caller);
+        assert_eq!(register.v, PROTOCOL_VERSION);
+        assert_eq!(register.kind, KIND_REGISTER);
+        assert_eq!(register.from, "caller-1");
+        assert_eq!(register.to, ROUTER_PEER_ID);
+
+        let query = build_query_envelope("caller-1", "router");
+        assert_eq!(query.kind, KIND_QUERY);
+        assert_eq!(query.to, "router");
+
+        let call = build_call_envelope("caller-1", "service-1");
+        assert_eq!(call.kind, KIND_CALL);
+        assert_eq!(call.to, "service-1");
+
+        let response = build_response_envelope("service-1", "caller-1", "msg-1");
+        assert_eq!(response.kind, KIND_RESPONSE);
+        assert_eq!(response.msg_id, "msg-1");
+
+        let error = build_error_envelope("router", "caller-1", "msg-2");
+        assert_eq!(error.kind, KIND_ERROR);
+        assert_eq!(error.to, "caller-1");
+
+        let disconnect = build_disconnect_envelope("caller-1", "router", "msg-3");
+        assert_eq!(disconnect.kind, KIND_DISCONNECT);
+        assert_eq!(disconnect.msg_id, "msg-3");
     }
 }

@@ -1,58 +1,65 @@
+use crate::caller_transport::{connect_ws, send_disconnect_frame};
 use crate::error::{MultifrostError, Result};
-use crate::message::{Message, MessageType};
-use crate::registry::ServiceRegistry;
+use crate::message::{
+    build_error_envelope, build_register_envelope, decode_call_body, decode_frame,
+    encode_error_body, encode_frame, encode_register_body, ErrorBody, PeerClass, RegisterBody,
+    KIND_CALL, KIND_DISCONNECT, KIND_ERROR, KIND_RESPONSE,
+};
+use crate::router_bootstrap::{connect_or_bootstrap, RouterBootstrapConfig};
 use async_trait::async_trait;
-use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
-use zeromq::{RouterSocket, Socket, SocketRecv, SocketSend, ZmqMessage};
+use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-fn current_timestamp() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
 
-/// Async child worker trait - for workers that need async processing
 #[async_trait]
 pub trait ChildWorker: Send + Sync + 'static {
     async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value>;
-}
 
-/// Sync child worker trait - for simple CPU-bound workers
-/// Implement this trait if your worker doesn't need async operations
-pub trait SyncChildWorker: Send + Sync + 'static {
-    fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value>;
-
-    /// Get list of available functions for introspection
     fn list_functions(&self) -> Vec<String> {
         vec![]
     }
 }
 
-/// Adapter to allow SyncChildWorker to be used where ChildWorker is expected
+pub trait SyncChildWorker: Send + Sync + 'static {
+    fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value>;
+
+    fn list_functions(&self) -> Vec<String> {
+        vec![]
+    }
+}
+
 struct SyncToAsyncAdapter<T: SyncChildWorker>(T);
 
 #[async_trait]
 impl<T: SyncChildWorker> ChildWorker for SyncToAsyncAdapter<T> {
     async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value> {
-        // SyncChildWorker::handle_call is sync, so we just call it directly
-        // It's marked async to satisfy the async_trait bound, but doesn't actually await
         self.0.handle_call(function, args)
+    }
+
+    fn list_functions(&self) -> Vec<String> {
+        self.0.list_functions()
     }
 }
 
+#[derive(Clone)]
 pub struct ChildWorkerContext {
     namespace: String,
     service_id: Option<String>,
-    running: bool,
-    socket: Option<RouterSocket>,
-    functions: HashMap<String, String>, // function_name -> description
+    entrypoint_path: Option<PathBuf>,
+    router: RouterBootstrapConfig,
+    request_timeout: Option<Duration>,
+    extra_functions: HashMap<String, String>,
 }
 
 impl ChildWorkerContext {
@@ -60,9 +67,10 @@ impl ChildWorkerContext {
         Self {
             namespace: "default".to_string(),
             service_id: None,
-            running: false,
-            socket: None,
-            functions: HashMap::new(),
+            entrypoint_path: None,
+            router: RouterBootstrapConfig::from_env(),
+            request_timeout: Some(Duration::from_secs(30)),
+            extra_functions: HashMap::new(),
         }
     }
 
@@ -71,21 +79,49 @@ impl ChildWorkerContext {
         self
     }
 
+    pub fn with_entrypoint_path<P: AsRef<Path>>(mut self, path: P) -> Self {
+        self.entrypoint_path = Some(path.as_ref().to_path_buf());
+        self
+    }
+
     pub fn with_namespace(mut self, namespace: &str) -> Self {
         self.namespace = namespace.to_string();
         self
     }
 
-    /// Register a function for introspection
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
     pub fn register_function(mut self, name: &str, description: &str) -> Self {
-        self.functions
+        self.extra_functions
             .insert(name.to_string(), description.to_string());
         self
     }
 
-    /// Get list of registered functions
     pub fn list_functions(&self) -> Vec<String> {
-        self.functions.keys().cloned().collect()
+        self.extra_functions.keys().cloned().collect()
+    }
+
+    fn resolve_peer_id(&self) -> Result<String> {
+        if let Some(id) = &self.service_id {
+            return Ok(id.clone());
+        }
+
+        if let Ok(explicit) = env::var("MULTIFROST_SERVICE_PEER_ID") {
+            if !explicit.trim().is_empty() {
+                return Ok(explicit);
+            }
+        }
+
+        let path = self
+            .entrypoint_path
+            .clone()
+            .or_else(|| env::var_os("MULTIFROST_ENTRYPOINT_PATH").map(PathBuf::from))
+            .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from(".")));
+
+        Ok(canonical_peer_path(path))
     }
 }
 
@@ -96,488 +132,644 @@ impl Default for ChildWorkerContext {
 }
 
 pub async fn run_worker<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) {
-    if let Err(e) = run_worker_async(worker, ctx).await {
-        eprintln!("Worker error: {}", e);
+    if let Err(err) = run_worker_async(worker, ctx).await {
+        eprintln!("Worker error: {err}");
         std::process::exit(1);
     }
 }
 
-/// Run a sync worker (CPU-bound, no async needed)
 pub fn run_worker_sync<W: SyncChildWorker>(worker: W, ctx: ChildWorkerContext) {
-    if let Err(e) = run_worker_sync_inner(worker, ctx) {
-        eprintln!("Worker error: {}", e);
+    if let Err(err) = run_worker_sync_inner(worker, ctx) {
+        eprintln!("Worker error: {err}");
         std::process::exit(1);
     }
 }
 
 fn run_worker_sync_inner<W: SyncChildWorker>(worker: W, ctx: ChildWorkerContext) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move {
-        // Wrap sync worker in adapter to implement ChildWorker
-        let adapter = SyncToAsyncAdapter(worker);
-        run_worker_async(adapter, ctx).await
-    })
+    rt.block_on(async move { run_worker_async(SyncToAsyncAdapter(worker), ctx).await })
 }
 
 async fn run_worker_async<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) -> Result<()> {
-    let ctx = Arc::new(RwLock::new(ctx));
-    let is_spawn_mode;
+    let peer_id = ctx.resolve_peer_id()?;
+    let endpoint = ctx.router.endpoint.ws_url();
 
-    // Setup ZMQ socket
-    {
-        let mut ctx_guard = ctx.write().await;
-        let port_env = env::var("COMLINK_ZMQ_PORT").ok();
-        is_spawn_mode = port_env.is_some();
+    connect_or_bootstrap(&ctx.router).await?;
+    let websocket = connect_ws(&endpoint).await?;
+    let (sink, mut source) = websocket.split();
+    let sink = Arc::new(Mutex::new(sink));
 
-        let mut socket = RouterSocket::new();
+    let register = RegisterBody {
+        peer_id: peer_id.clone(),
+        class: PeerClass::Service,
+    };
+    let register_envelope = build_register_envelope(&peer_id, PeerClass::Service);
+    let register_frame = encode_frame(&register_envelope, &encode_register_body(&register)?)?;
+    send_ws_frame(&sink, register_frame).await?;
 
-        if let Some(port_str) = port_env {
-            // Spawn mode: connect to parent's port
-            let port: u16 = port_str
-                .parse()
-                .map_err(|_| MultifrostError::InvalidMessage("Invalid port".to_string()))?;
-            if !(1024..=65535).contains(&port) {
-                return Err(MultifrostError::InvalidMessage(format!(
-                    "Port {} out of valid range (1024-65535)",
-                    port
+    let ack = match source.next().await {
+        Some(Ok(Message::Binary(bytes))) => {
+            let frame = decode_frame(&bytes)?;
+            if frame.envelope.kind != KIND_RESPONSE {
+                return Err(MultifrostError::RegisterRejected(format!(
+                    "unexpected register reply kind: {}",
+                    frame.envelope.kind
                 )));
             }
-            socket
-                .connect(&format!("tcp://127.0.0.1:{}", port))
-                .await
-                .map_err(|e| MultifrostError::ZmqError(e.to_string()))?;
-        } else if let Some(ref service_id) = ctx_guard.service_id {
-            // Service mode: register service and bind
-            let port = ServiceRegistry::register(service_id).await?;
-            socket
-                .bind(&format!("tcp://0.0.0.0:{}", port))
-                .await
-                .map_err(|e| MultifrostError::ZmqError(e.to_string()))?;
-        } else {
-            return Err(MultifrostError::InvalidMessage(
-                "Need COMLINK_ZMQ_PORT env or service_id".to_string(),
-            ));
+            crate::message::decode_register_ack_body(&frame.body_bytes)?
         }
+        Some(Ok(other)) => {
+            return Err(MultifrostError::RegisterRejected(format!(
+                "unexpected register reply message: {other:?}"
+            )))
+        }
+        Some(Err(err)) => return Err(MultifrostError::RouterUnavailable(err.to_string())),
+        None => return Err(MultifrostError::RegisterRejected("router closed".into())),
+    };
 
-        ctx_guard.socket = Some(socket);
-        ctx_guard.running = true;
+    if !ack.accepted {
+        return Err(MultifrostError::RegisterRejected(
+            ack.reason
+                .unwrap_or_else(|| "router rejected service registration".into()),
+        ));
     }
 
-    // Note: We don't send a ready message here because:
-    // 1. In the DEALER(bind)/ROUTER(connect) pattern, the ROUTER needs to receive
-    //    a message first to learn the DEALER's identity before it can send.
-    // 2. The Python parent doesn't expect a ready message - it just starts sending.
-    // 3. Go and Python children don't send ready messages either.
-
-    // Message loop
     let worker = Arc::new(worker);
+    let _ = ctx.list_functions();
 
-    loop {
-        let ctx_clone = Arc::clone(&ctx);
-        let worker_clone = Arc::clone(&worker);
+    while let Some(message) = source.next().await {
+        match message {
+            Ok(Message::Binary(bytes)) => {
+                let frame = match decode_frame(&bytes) {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        eprintln!("malformed inbound frame: {err}");
+                        continue;
+                    }
+                };
 
-        let msg_result = {
-            let mut ctx_guard = ctx_clone.write().await;
-            if !ctx_guard.running {
-                break;
-            }
-            if let Some(ref mut socket) = ctx_guard.socket {
-                socket.recv().await
-            } else {
-                break;
-            }
-        };
+                if frame.envelope.to != peer_id {
+                    continue;
+                }
 
-        match msg_result {
-            Ok(zmq_msg) => {
-                if let Err(e) = handle_message(ctx_clone, worker_clone, zmq_msg).await {
-                    eprintln!("Error handling message: {}", e);
+                match frame.envelope.kind.as_str() {
+                    KIND_CALL => {
+                        if let Err(err) =
+                            handle_call_frame(&sink, &peer_id, worker.clone(), frame).await
+                        {
+                            eprintln!("service call handling error: {err}");
+                        }
+                    }
+                    KIND_DISCONNECT => break,
+                    KIND_ERROR | KIND_RESPONSE => continue,
+                    _ => continue,
                 }
             }
-            Err(e) => {
-                eprintln!("ZMQ receive error: {}", e);
+            Ok(Message::Close(_)) => break,
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+            Ok(_) => continue,
+            Err(err) => {
+                eprintln!("service websocket error: {err}");
+                break;
             }
         }
     }
 
-    // Cleanup
-    {
-        let mut ctx_guard = ctx.write().await;
-        ctx_guard.running = false;
-        if let Some(ref service_id) = ctx_guard.service_id {
-            let _ = ServiceRegistry::unregister(service_id).await;
-        }
-    }
-
+    let _ = send_disconnect_frame(&sink, &peer_id).await;
     Ok(())
 }
 
-async fn handle_message<W: ChildWorker>(
-    ctx: Arc<RwLock<ChildWorkerContext>>,
+async fn handle_call_frame<W: ChildWorker>(
+    sink: &Arc<Mutex<WsSink>>,
+    peer_id: &str,
     worker: Arc<W>,
-    zmq_msg: ZmqMessage,
+    frame: crate::message::FrameParts,
 ) -> Result<()> {
-    // ROUTER receives: [sender_id, empty, message_data]
-    let frames: Vec<_> = zmq_msg.into_vec();
-
-    if frames.len() < 3 {
-        return Err(MultifrostError::InvalidMessage(
-            "Not enough frames".to_string(),
-        ));
-    }
-
-    let sender_id = frames[0].to_vec();
-    let message_data = frames[2].to_vec();
-    let message = Message::unpack(&message_data)?;
-
-    if !message.is_valid() {
-        return Err(MultifrostError::InvalidMessage(
-            "Invalid message".to_string(),
-        ));
-    }
-
-    // Check namespace
-    {
-        let ctx_guard = ctx.read().await;
-        if let Some(ref ns) = message.namespace {
-            if ns != &ctx_guard.namespace {
-                return Ok(()); // Ignore wrong namespace
-            }
-        }
-    }
-
-    let response = match message.msg_type {
-        MessageType::Call => {
-            // Check for introspection calls
-            if message.function.as_ref().map(|s| s.as_str()) == Some("listFunctions") {
-                let ctx_guard = ctx.read().await;
-                let functions = ctx_guard.list_functions();
-                Message::create_response(serde_json::json!(functions), &message.id)
-            } else {
-                handle_function_call(worker, &message).await
-            }
-        }
-        MessageType::Shutdown => {
-            let mut ctx_guard = ctx.write().await;
-            ctx_guard.running = false;
-            return Ok(());
-        }
-        MessageType::Heartbeat => {
-            // Handle heartbeat - echo back with response
-            let msg_id = message.id.clone();
-            let original_ts = message
-                .metadata
-                .as_ref()
-                .and_then(|m| m.get("hb_timestamp"))
-                .and_then(|v| v.as_f64())
-                .unwrap_or_else(|| current_timestamp());
-            Message::create_heartbeat_response(&msg_id, original_ts)
-        }
-        MessageType::Ready
-        | MessageType::Response
-        | MessageType::Error
-        | MessageType::Stdout
-        | MessageType::Stderr
-        | MessageType::Unknown => {
+    let call = match decode_call_body(&frame.body_bytes) {
+        Ok(call) => call,
+        Err(err) => {
+            send_error(
+                sink,
+                peer_id,
+                frame.envelope.from.as_str(),
+                frame.envelope.msg_id.as_str(),
+                "malformed_call",
+                "protocol",
+                err.to_string(),
+                None,
+            )
+            .await?;
             return Ok(());
         }
     };
 
-    // Send response - ROUTER sends: [sender_id, empty, message]
-    let response_data = response.pack()?;
-
-    let mut ctx_guard = ctx.write().await;
-    if let Some(ref mut socket) = ctx_guard.socket {
-        let reply: ZmqMessage = vec![
-            Bytes::from(sender_id),
-            Bytes::from(vec![]),
-            Bytes::from(response_data),
-        ]
-        .try_into()
-        .map_err(|_| MultifrostError::InvalidMessage("Empty message".to_string()))?;
-        socket
-            .send(reply)
-            .await
-            .map_err(|e| MultifrostError::ZmqError(e.to_string()))?;
+    if let Some(namespace) = call.namespace.as_deref() {
+        if namespace != "default" {
+            send_error(
+                sink,
+                peer_id,
+                frame.envelope.from.as_str(),
+                frame.envelope.msg_id.as_str(),
+                "invalid_namespace",
+                "protocol",
+                format!("unsupported namespace: {namespace}"),
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
     }
 
+    let reply = match worker.handle_call(&call.function, call.args).await {
+        Ok(result) => {
+            let envelope = build_response_envelope(
+                peer_id,
+                frame.envelope.from.as_str(),
+                frame.envelope.msg_id.as_str(),
+            );
+            let body =
+                crate::message::encode_response_body(&crate::message::ResponseBody { result })?;
+            encode_frame(&envelope, &body)?
+        }
+        Err(err) => {
+            let envelope = build_error_envelope(
+                peer_id,
+                frame.envelope.from.as_str(),
+                frame.envelope.msg_id.as_str(),
+            );
+            let body = encode_error_body(&ErrorBody {
+                code: "application_error".into(),
+                message: err.to_string(),
+                kind: "application".into(),
+                stack: None,
+                details: None,
+            })?;
+            encode_frame(&envelope, &body)?
+        }
+    };
+
+    send_ws_frame(sink, reply).await?;
     Ok(())
 }
 
-async fn handle_function_call<W: ChildWorker>(worker: Arc<W>, message: &Message) -> Message {
-    let msg_id = message.id.clone();
+async fn send_error(
+    sink: &Arc<Mutex<WsSink>>,
+    from_peer: &str,
+    to_peer: &str,
+    msg_id: &str,
+    code: &str,
+    kind: &str,
+    message: String,
+    details: Option<crate::message::WireValue>,
+) -> Result<()> {
+    let envelope = build_error_envelope(from_peer, to_peer, msg_id);
+    let body = encode_error_body(&ErrorBody {
+        code: code.into(),
+        message,
+        kind: kind.into(),
+        stack: None,
+        details,
+    })?;
+    send_ws_frame(sink, encode_frame(&envelope, &body)?).await
+}
 
-    match message.function {
-        Some(ref func) => {
-            let args = message.args.clone().unwrap_or_default();
+async fn send_ws_frame(sink: &Arc<Mutex<WsSink>>, frame: Vec<u8>) -> Result<()> {
+    let mut sink = sink.lock().await;
+    sink.send(Message::Binary(frame.into()))
+        .await
+        .map_err(|err| MultifrostError::WebSocketError(err.to_string()))
+}
 
-            // Prevent calling private methods
-            if func.starts_with('_') {
-                return Message::create_error(
-                    &format!("Cannot call private method '{}'", func),
-                    &msg_id,
-                );
-            }
+fn canonical_peer_path(path: PathBuf) -> String {
+    path.canonicalize()
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
+}
 
-            match worker.handle_call(func, args).await {
-                Ok(result) => Message::create_response(result, &msg_id),
-                Err(e) => Message::create_error(&e.to_string(), &msg_id),
-            }
-        }
-        None => Message::create_error("Missing function name", &msg_id),
+fn build_response_envelope(from: &str, to: &str, msg_id: &str) -> crate::message::Envelope {
+    crate::message::Envelope {
+        v: crate::message::PROTOCOL_VERSION,
+        kind: KIND_RESPONSE.to_string(),
+        msg_id: msg_id.to_string(),
+        from: from.to_string(),
+        to: to.to_string(),
+        ts: crate::message::now_ts(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::{KIND_REGISTER, ROUTER_PEER_ID};
+    use crate::router_bootstrap::{
+        router_is_reachable, RouterBootstrapConfig, RouterEndpointConfig, ROUTER_BIN_ENV,
+        ROUTER_PORT_ENV,
+    };
+    use crate::ParentWorker;
+    use bytes::Bytes;
+    use futures_util::{SinkExt, StreamExt};
     use serde_json::json;
+    use serial_test::serial;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::Path;
+    use tempfile::tempdir;
+    use tokio::net::TcpListener;
+    use tokio::time::{sleep, timeout, Instant};
+    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::Message;
 
-    // Test implementation of SyncChildWorker
-    struct TestSyncWorker;
+    struct AddWorker;
 
-    impl SyncChildWorker for TestSyncWorker {
-        fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value> {
-            match function {
-                "add" => {
-                    let a = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
-                    let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
-                    Ok(json!(a + b))
-                }
-                "echo" => Ok(args.get(0).cloned().unwrap_or(json!(null))),
-                "fail" => Err(MultifrostError::RemoteCallError(
-                    "Intentional failure".to_string(),
-                )),
-                _ => Err(MultifrostError::FunctionNotFound(function.to_string())),
-            }
-        }
-
-        fn list_functions(&self) -> Vec<String> {
-            vec!["add".to_string(), "echo".to_string(), "fail".to_string()]
-        }
-    }
-
-    // Test implementation of async ChildWorker
-    struct TestAsyncWorker;
-
-    #[async_trait::async_trait]
-    impl ChildWorker for TestAsyncWorker {
+    #[async_trait]
+    impl ChildWorker for AddWorker {
         async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value> {
             match function {
-                "multiply" => {
-                    let a = args.get(0).and_then(|v| v.as_i64()).unwrap_or(0);
-                    let b = args.get(1).and_then(|v| v.as_i64()).unwrap_or(0);
-                    Ok(json!(a * b))
+                "add" => {
+                    let a = args
+                        .get(0)
+                        .and_then(|value| value.as_i64())
+                        .ok_or_else(|| MultifrostError::InvalidMessage("missing a".into()))?;
+                    let b = args
+                        .get(1)
+                        .and_then(|value| value.as_i64())
+                        .ok_or_else(|| MultifrostError::InvalidMessage("missing b".into()))?;
+                    Ok(json!(a + b))
                 }
-                "delay" => {
-                    let ms = args.get(0).and_then(|v| v.as_u64()).unwrap_or(10);
-                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-                    Ok(json!("done"))
-                }
-                _ => Err(MultifrostError::FunctionNotFound(function.to_string())),
+                other => Err(MultifrostError::FunctionNotFound(other.to_string())),
             }
         }
     }
 
+    struct EchoWorker;
+
+    #[async_trait]
+    impl ChildWorker for EchoWorker {
+        async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value> {
+            match function {
+                "echo" => Ok(args.first().cloned().unwrap_or(Value::Null)),
+                other => Err(MultifrostError::FunctionNotFound(other.to_string())),
+            }
+        }
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn set_env_var(key: &'static str, value: &Path) -> EnvVarGuard {
+        let original = std::env::var_os(key);
+        std::env::set_var(key, value);
+        EnvVarGuard { key, original }
+    }
+
+    fn set_env_var_str(key: &'static str, value: &str) -> EnvVarGuard {
+        let original = std::env::var_os(key);
+        std::env::set_var(key, value);
+        EnvVarGuard { key, original }
+    }
+
+    fn repo_root() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("rust crate to have a parent repo directory")
+            .to_path_buf()
+    }
+
+    fn write_router_launcher_script(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let repo_root = repo_root();
+        let router_binary = repo_root.join("router/target/debug/multifrost-router");
+        let script = dir.path().join("router-launcher.sh");
+        let script_contents = format!("#!/bin/sh\nset -eu\nexec '{}'\n", router_binary.display());
+        fs::write(&script, script_contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+        script
+    }
+
+    fn build_router_binary() {
+        let status = std::process::Command::new("cargo")
+            .arg("build")
+            .arg("--manifest-path")
+            .arg(repo_root().join("router/Cargo.toml"))
+            .arg("--quiet")
+            .arg("--bin")
+            .arg("multifrost-router")
+            .status()
+            .unwrap();
+        assert!(status.success(), "router binary build failed");
+    }
+
+    fn build_math_worker_example() {
+        let status = std::process::Command::new("cargo")
+            .arg("build")
+            .arg("--example")
+            .arg("math_worker")
+            .arg("--quiet")
+            .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
+            .status()
+            .unwrap();
+        assert!(status.success(), "math_worker example build failed");
+    }
+
+    fn router_binary_path() -> std::path::PathBuf {
+        repo_root().join("router/target/debug/multifrost-router")
+    }
+
+    fn math_worker_entrypoint_path() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/math_worker.rs")
+    }
+
+    fn math_worker_binary_path() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/examples/math_worker")
+    }
+
+    fn service_context(
+        service_id: &str,
+        port: u16,
+        workspace: &tempfile::TempDir,
+    ) -> ChildWorkerContext {
+        ChildWorkerContext {
+            namespace: "default".to_string(),
+            service_id: Some(service_id.to_string()),
+            entrypoint_path: None,
+            router: RouterBootstrapConfig {
+                endpoint: RouterEndpointConfig {
+                    host: "127.0.0.1".into(),
+                    port,
+                },
+                lock_path: workspace.path().join(format!("{service_id}.lock")),
+                log_path: workspace.path().join(format!("{service_id}.log")),
+                readiness_timeout: Duration::from_secs(30),
+                readiness_poll_interval: Duration::from_millis(100),
+            },
+            request_timeout: Some(Duration::from_secs(5)),
+            extra_functions: HashMap::new(),
+        }
+    }
+
+    async fn wait_for_router(
+        endpoint: &RouterEndpointConfig,
+        log_path: &Path,
+        worker_task: &mut Option<tokio::task::JoinHandle<Result<()>>>,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if router_is_reachable(endpoint).await {
+                return;
+            }
+            if worker_task
+                .as_ref()
+                .map(|handle| handle.is_finished())
+                .unwrap_or(false)
+            {
+                let result = worker_task.take().unwrap().await.unwrap();
+                panic!("service worker exited before router became reachable: {result:?}");
+            }
+            if Instant::now() >= deadline {
+                let log_excerpt = fs::read_to_string(log_path).unwrap_or_default();
+                panic!(
+                    "router did not become reachable at {}; log output:\n{}",
+                    endpoint.ws_url(),
+                    log_excerpt
+                );
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn wait_for_peer_exists(handle: &ParentWorker, peer_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if handle.query_peer_exists(peer_id).await.unwrap() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("peer {peer_id} did not appear in router registry");
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn start_service_router() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+
+            let register_frame = read_binary_frame(&mut ws).await;
+            assert_eq!(register_frame.envelope.kind, KIND_REGISTER);
+            let register_body =
+                crate::message::decode_register_body(&register_frame.body_bytes).unwrap();
+            assert_eq!(register_body.class, PeerClass::Service);
+
+            let ack = crate::message::RegisterAckBody {
+                accepted: true,
+                reason: None,
+            };
+            let ack_envelope = crate::message::Envelope {
+                v: 5,
+                kind: KIND_RESPONSE.to_string(),
+                msg_id: register_frame.envelope.msg_id.clone(),
+                from: ROUTER_PEER_ID.to_string(),
+                to: register_body.peer_id.clone(),
+                ts: 0.0,
+            };
+            let ack_frame = crate::message::encode_frame(
+                &ack_envelope,
+                &crate::message::encode_register_ack_body(&ack).unwrap(),
+            )
+            .unwrap();
+            ws.send(Message::Binary(Bytes::from(ack_frame)))
+                .await
+                .unwrap();
+
+            let call_envelope =
+                crate::message::build_call_envelope(ROUTER_PEER_ID, &register_body.peer_id);
+            let call_body = crate::message::CallBody {
+                function: "add".into(),
+                args: vec![json!(2), json!(3)],
+                namespace: Some("default".into()),
+            };
+            let call_frame = crate::message::encode_frame(
+                &call_envelope,
+                &crate::message::encode_call_body(&call_body).unwrap(),
+            )
+            .unwrap();
+            ws.send(Message::Binary(Bytes::from(call_frame)))
+                .await
+                .unwrap();
+
+            let response_frame = read_binary_frame(&mut ws).await;
+            assert_eq!(response_frame.envelope.kind, KIND_RESPONSE);
+            let response =
+                crate::message::decode_response_body(&response_frame.body_bytes).unwrap();
+            assert_eq!(response.result, json!(5));
+
+            let _ = ws.close(None).await;
+        });
+
+        (port, handle)
+    }
+
+    async fn read_binary_frame(
+        ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) -> crate::message::FrameParts {
+        let message = timeout(Duration::from_secs(2), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match message {
+            Message::Binary(bytes) => crate::message::decode_frame(bytes.as_ref()).unwrap(),
+            other => panic!("expected binary message, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn test_child_worker_context_new() {
+    fn resolves_default_peer_id_from_current_exe() {
         let ctx = ChildWorkerContext::new();
-        assert_eq!(ctx.namespace, "default");
-        assert!(ctx.service_id.is_none());
-        assert!(!ctx.running);
-        assert!(ctx.socket.is_none());
-        assert!(ctx.functions.is_empty());
+        let peer_id = ctx.resolve_peer_id().unwrap();
+        assert!(!peer_id.is_empty());
     }
 
     #[test]
-    fn test_child_worker_context_with_service_id() {
-        let ctx = ChildWorkerContext::new().with_service_id("test-service");
-        assert_eq!(ctx.service_id, Some("test-service".to_string()));
+    fn explicit_service_id_wins_over_other_sources() {
+        let ctx = ChildWorkerContext::new().with_service_id("explicit-service");
+        assert_eq!(ctx.resolve_peer_id().unwrap(), "explicit-service");
     }
 
     #[test]
-    fn test_child_worker_context_with_namespace() {
-        let ctx = ChildWorkerContext::new().with_namespace("custom-namespace");
-        assert_eq!(ctx.namespace, "custom-namespace");
-    }
-
-    #[test]
-    fn test_child_worker_context_register_function() {
-        let ctx = ChildWorkerContext::new()
-            .register_function("add", "Adds two numbers")
-            .register_function("multiply", "Multiplies two numbers");
-
-        assert!(ctx.functions.contains_key("add"));
-        assert!(ctx.functions.contains_key("multiply"));
+    fn entrypoint_path_is_used_when_service_id_is_missing() {
+        let dir = tempdir().unwrap();
+        let entrypoint = dir.path().join("service.rs");
+        fs::write(&entrypoint, "fn main() {}").unwrap();
+        let ctx = ChildWorkerContext::new().with_entrypoint_path(&entrypoint);
         assert_eq!(
-            ctx.functions.get("add"),
-            Some(&"Adds two numbers".to_string())
+            ctx.resolve_peer_id().unwrap(),
+            entrypoint.canonicalize().unwrap().to_string_lossy()
         );
     }
 
     #[test]
-    fn test_child_worker_context_list_functions() {
+    fn namespace_timeout_and_registered_functions_are_recorded() {
         let ctx = ChildWorkerContext::new()
-            .register_function("add", "Adds two numbers")
-            .register_function("multiply", "Multiplies two numbers");
+            .with_namespace("custom")
+            .with_timeout(Duration::from_secs(5))
+            .register_function("add", "Add two numbers")
+            .register_function("mul", "Multiply two numbers");
 
-        let functions = ctx.list_functions();
-        assert_eq!(functions.len(), 2);
-        assert!(functions.contains(&"add".to_string()));
-        assert!(functions.contains(&"multiply".to_string()));
-    }
+        assert_eq!(ctx.namespace, "custom");
+        assert_eq!(ctx.request_timeout, Some(Duration::from_secs(5)));
 
-    #[test]
-    fn test_child_worker_context_default() {
-        let ctx = ChildWorkerContext::default();
-        assert_eq!(ctx.namespace, "default");
-        assert!(ctx.service_id.is_none());
-    }
-
-    #[test]
-    fn test_child_worker_context_builder_chain() {
-        let ctx = ChildWorkerContext::new()
-            .with_service_id("my-service")
-            .with_namespace("my-namespace")
-            .register_function("func1", "Description 1")
-            .register_function("func2", "Description 2");
-
-        assert_eq!(ctx.service_id, Some("my-service".to_string()));
-        assert_eq!(ctx.namespace, "my-namespace");
-        assert_eq!(ctx.functions.len(), 2);
+        let mut functions = ctx.list_functions();
+        functions.sort();
+        assert_eq!(functions, vec!["add".to_string(), "mul".to_string()]);
     }
 
     #[tokio::test]
-    async fn test_sync_child_worker_add() {
-        let worker = TestSyncWorker;
-        let result = worker.handle_call("add", vec![json!(5), json!(3)]).unwrap();
-        assert_eq!(result, json!(8));
+    async fn run_worker_async_handles_calls_over_mock_router() {
+        let (port, router_task) = start_service_router().await;
+        let ctx = ChildWorkerContext {
+            namespace: "default".to_string(),
+            service_id: Some("service-1".to_string()),
+            entrypoint_path: None,
+            router: RouterBootstrapConfig {
+                endpoint: crate::router_bootstrap::RouterEndpointConfig {
+                    host: "127.0.0.1".into(),
+                    port,
+                },
+                lock_path: std::env::temp_dir().join("multifrost-test.lock"),
+                log_path: std::env::temp_dir().join("multifrost-test.log"),
+                readiness_timeout: Duration::from_secs(1),
+                readiness_poll_interval: Duration::from_millis(50),
+            },
+            request_timeout: Some(Duration::from_secs(2)),
+            extra_functions: HashMap::new(),
+        };
+
+        let worker_task = tokio::spawn(async move { run_worker_async(AddWorker, ctx).await });
+        timeout(Duration::from_secs(3), worker_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        router_task.abort();
     }
 
     #[tokio::test]
-    async fn test_sync_child_worker_echo() {
-        let worker = TestSyncWorker;
-        let result = worker.handle_call("echo", vec![json!("hello")]).unwrap();
-        assert_eq!(result, json!("hello"));
-    }
+    #[serial]
+    async fn service_worker_bootstraps_router_and_second_worker_joins_existing_router() {
+        let port_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = port_listener.local_addr().unwrap().port();
+        drop(port_listener);
 
-    #[tokio::test]
-    async fn test_sync_child_worker_fail() {
-        let worker = TestSyncWorker;
-        let result = worker.handle_call("fail", vec![]);
-        assert!(result.is_err());
-    }
+        build_router_binary();
+        build_math_worker_example();
 
-    #[tokio::test]
-    async fn test_sync_child_worker_not_found() {
-        let worker = TestSyncWorker;
-        let result = worker.handle_call("unknown", vec![]);
-        assert!(result.is_err());
-        assert!(matches!(result, Err(MultifrostError::FunctionNotFound(_))));
-    }
+        let _router_bin =
+            set_env_var_str(ROUTER_BIN_ENV, &router_binary_path().display().to_string());
 
-    #[tokio::test]
-    async fn test_sync_child_worker_list_functions() {
-        let worker = TestSyncWorker;
-        let functions = worker.list_functions();
-        assert_eq!(functions.len(), 3);
-        assert!(functions.contains(&"add".to_string()));
-        assert!(functions.contains(&"echo".to_string()));
-        assert!(functions.contains(&"fail".to_string()));
-    }
+        let service_entrypoint = math_worker_entrypoint_path();
+        let service_binary = math_worker_binary_path();
 
-    #[tokio::test]
-    async fn test_async_child_worker_multiply() {
-        let worker = TestAsyncWorker;
-        let result = worker
-            .handle_call("multiply", vec![json!(4), json!(7)])
+        let service = ParentWorker::spawn_with_options(
+            service_entrypoint.to_str().unwrap(),
+            service_binary.to_str().unwrap(),
+            crate::parent::SpawnOptions {
+                caller_peer_id: Some("caller-a".into()),
+                request_timeout: Some(Duration::from_secs(10)),
+                router_port: Some(port),
+            },
+        )
+        .await
+        .unwrap();
+        let service_handle = service.handle();
+        let sum: i64 = service_handle
+            .call("add", vec![json!(10), json!(20)])
             .await
             .unwrap();
-        assert_eq!(result, json!(28));
-    }
+        assert_eq!(sum, 30);
 
-    #[tokio::test]
-    async fn test_async_child_worker_delay() {
-        let worker = TestAsyncWorker;
-        let start = std::time::Instant::now();
-        let result = worker.handle_call("delay", vec![json!(50)]).await.unwrap();
-        let elapsed = start.elapsed();
-
-        assert_eq!(result, json!("done"));
-        assert!(elapsed.as_millis() >= 45);
-    }
-
-    #[tokio::test]
-    async fn test_async_child_worker_not_found() {
-        let worker = TestAsyncWorker;
-        let result = worker.handle_call("unknown", vec![]).await;
-        assert!(result.is_err());
-        assert!(matches!(result, Err(MultifrostError::FunctionNotFound(_))));
-    }
-
-    #[tokio::test]
-    async fn test_handle_function_call_success() {
-        let worker = Arc::new(TestAsyncWorker);
-        let msg = Message::create_call("multiply", vec![json!(3), json!(5)]);
-        let response = handle_function_call(worker, &msg).await;
-
-        assert_eq!(response.msg_type, MessageType::Response);
-        assert_eq!(response.result, Some(json!(15)));
-    }
-
-    #[tokio::test]
-    async fn test_handle_function_call_error() {
-        // Wrap sync worker in adapter for async use
-        let worker = Arc::new(SyncToAsyncAdapter(TestSyncWorker));
-        let msg = Message::create_call("fail", vec![]);
-        let response = handle_function_call(worker, &msg).await;
-
-        assert_eq!(response.msg_type, MessageType::Error);
-        assert!(response.error.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_handle_function_call_private_method() {
-        let worker = Arc::new(TestAsyncWorker);
-        let msg = Message::create_call("_private", vec![]);
-        let response = handle_function_call(worker, &msg).await;
-
-        assert_eq!(response.msg_type, MessageType::Error);
-        assert!(response.error.unwrap().contains("private method"));
-    }
-
-    #[tokio::test]
-    async fn test_handle_function_call_missing_function() {
-        let worker = Arc::new(TestAsyncWorker);
-        let mut msg = Message::new(MessageType::Call);
-        msg.args = Some(vec![]);
-        // No function name set
-        let response = handle_function_call(worker, &msg).await;
-
-        assert_eq!(response.msg_type, MessageType::Error);
-        assert!(response.error.unwrap().contains("Missing function name"));
-    }
-
-    #[tokio::test]
-    async fn test_handle_function_call_not_found() {
-        let worker = Arc::new(TestAsyncWorker);
-        let msg = Message::create_call("nonexistent", vec![]);
-        let response = handle_function_call(worker, &msg).await;
-
-        assert_eq!(response.msg_type, MessageType::Error);
-        assert!(response.error.unwrap().contains("Function not found"));
-    }
-
-    #[tokio::test]
-    async fn test_sync_to_async_adapter() {
-        let sync_worker = TestSyncWorker;
-        let adapter = SyncToAsyncAdapter(sync_worker);
-
-        // The adapter should work like the sync worker
-        let result = adapter
-            .handle_call("add", vec![json!(10), json!(20)])
+        let caller = ParentWorker::connect_with_options(
+            service_entrypoint.to_str().unwrap(),
+            crate::parent::ConnectOptions {
+                caller_peer_id: Some("caller-b".into()),
+                request_timeout: Some(Duration::from_secs(10)),
+                router_port: Some(port),
+            },
+        )
+        .await
+        .unwrap();
+        let caller_handle = caller.handle();
+        assert!(caller_handle
+            .query_peer_exists(service_entrypoint.to_str().unwrap())
+            .await
+            .unwrap());
+        let product: i64 = caller_handle
+            .call("multiply", vec![json!(6), json!(7)])
             .await
             .unwrap();
-        assert_eq!(result, json!(30));
+        assert_eq!(product, 42);
+
+        service_handle.stop().await;
+        caller_handle.stop().await;
     }
 }

@@ -1,14 +1,28 @@
-//! Multifrost - Lightweight IPC library for Rust
+//! Multifrost is a router-based IPC library for Rust.
 //!
-//! Spawn and control worker processes through async calls.
-//! Compatible with Python, JavaScript, and Go versions.
+//! Service peers expose methods under a stable `peer_id`.
+//! Caller peers connect to the router and issue typed calls.
 //!
-//! # Example
+//! # Caller Example
 //!
-//! ## Child Worker
 //! ```rust,no_run
-//! use multifrost::{ChildWorker, ChildWorkerContext, run_worker, Result, MultifrostError};
+//! use multifrost::{call, ParentWorker};
+//!
+//! # #[tokio::main]
+//! # async fn main() -> multifrost::Result<()> {
+//! let worker = ParentWorker::connect("math-service", 5_000).await?;
+//! let handle = worker.handle();
+//! let sum: i64 = call!(handle, add(10, 20)).await?;
+//! assert_eq!(sum, 30);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Service Example
+//!
+//! ```rust,no_run
 //! use async_trait::async_trait;
+//! use multifrost::{ChildWorker, ChildWorkerContext, MultifrostError, Result, run_worker};
 //! use serde_json::Value;
 //!
 //! struct MathWorker;
@@ -18,85 +32,44 @@
 //!     async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value> {
 //!         match function {
 //!             "add" => {
-//!                 // Use ArgsExtractor for safe argument extraction with clear error messages
-//!                 use multifrost::ArgsExtractor;
-//!                 let mut args = ArgsExtractor::new(args);
-//!                 let a = args.take_i64()?.ok_or_else(|| 
-//!                     MultifrostError::InvalidMessage("arg[0] must be an integer".into()))?;
-//!                 let b = args.take_i64()?.ok_or_else(|| 
-//!                     MultifrostError::InvalidMessage("arg[1] must be an integer".into()))?;
+//!                 let args = multifrost::ArgsExtractor::new(args);
+//!                 let a: i64 = args.get(0)?;
+//!                 let b: i64 = args.get(1)?;
 //!                 Ok(serde_json::json!(a + b))
 //!             }
-//!             _ => Err(MultifrostError::FunctionNotFound(function.to_string()))
+//!             _ => Err(MultifrostError::FunctionNotFound(function.to_string())),
 //!         }
 //!     }
 //! }
 //!
-//! #[tokio::main]
-//! async fn main() {
-//!     run_worker(MathWorker, ChildWorkerContext::new()).await;
-//! }
-//! ```
-//!
-//! ## Parent (with ergonomic API)
-//! ```rust,no_run
-//! use multifrost::{ParentWorker, call};
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let mut worker = ParentWorker::spawn("examples/math_worker.rs", "cargo run --example math_worker").await?;
-//!     worker.start().await?;
-//!
-//!     // Using the ergonomic call! macro
-//!     let result: i64 = worker.call!(add(10, 20)).await?;
-//!     println!("10 + 20 = {}", result);
-//!
-//!     worker.stop().await;
-//!     Ok(())
-//! }
-//! ```
-//!
-//! ## Parent (with builder pattern)
-//! ```rust,no_run
-//! use multifrost::{ParentWorkerBuilder, ParentWorker};
-//! use std::time::Duration;
-//!
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let worker = ParentWorkerBuilder::spawn("examples/math_worker.rs", "cargo run --example math_worker")
-//!         .auto_restart(true)
-//!         .default_timeout(Duration::from_secs(30))
-//!         .build()
-//!         .await?;
-//!
-//!     worker.start().await?;
-//!     // ...
-//!     Ok(())
-//! }
+//! # #[tokio::main]
+//! # async fn main() {
+//! run_worker(MathWorker, ChildWorkerContext::new().with_service_id("math-service")).await;
+//! # }
 //! ```
 
-mod error;
-mod message;
-mod registry;
-mod child;
-mod parent;
-mod metrics;
-mod logging;
 mod call_macro;
+mod caller_transport;
+mod child;
+mod error;
+mod logging;
+mod message;
+mod metrics;
+mod parent;
+mod router_bootstrap;
 
-#[cfg(test)]
-mod test_utils;
-
+pub use call_macro::{ArgsExtractor, CallArgs, ErgonomicCall, ExtractArgs, ToJsonArg};
+pub use child::{run_worker, run_worker_sync, ChildWorker, ChildWorkerContext, SyncChildWorker};
 pub use error::{MultifrostError, Result};
-pub use message::{Message, MessageType};
-pub use registry::ServiceRegistry;
-pub use child::{ChildWorker, ChildWorkerContext, run_worker, run_worker_sync, SyncChildWorker};
-pub use parent::{ParentWorker, ParentWorkerBuilder, SpawnOptions, ConnectOptions, Handle};
-pub use metrics::{Metrics, MetricsSnapshot, RequestMetrics};
 pub use logging::{
-    StructuredLogger, LogEntry, LogEvent, LogLevel, LogHandler,
-    default_json_handler, default_pretty_handler, LogOptions,
+    default_json_handler, default_pretty_handler, LogEntry, LogEvent, LogHandler, LogLevel,
+    LogOptions, StructuredLogger,
 };
-pub use call_macro::{ExtractArgs, ArgsExtractor, ToJsonArg, ErgonomicCall, CallArgs};
+pub use message::{
+    CallBody, Envelope, ErrorBody, FrameParts, PeerClass, QueryBody, QueryExistsResponseBody,
+    QueryGetResponseBody, RegisterAckBody, RegisterBody, ResponseBody, WireValue,
+};
+pub use metrics::{Metrics, MetricsSnapshot, RequestMetrics};
+pub use parent::{ConnectOptions, Handle, ParentWorker, ParentWorkerBuilder, SpawnOptions};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -1,21 +1,28 @@
-//! Ergonomic call API with typed method wrappers and argument helpers
+//! Ergonomic call helpers for the v5 router API.
 //!
-//! This module provides macros and traits to make remote calls ergonomic:
+//! ```rust,no_run
+//! use multifrost::{call, ParentWorker};
 //!
-//! ```rust
-//! use multifrost::{ParentWorker, call};
-//!
-//! let result: i64 = worker.call!(add(10, 20)).await?;
+//! # #[tokio::main]
+//! # async fn main() -> multifrost::Result<()> {
+//! let worker = ParentWorker::connect("math-service", 5_000).await?;
+//! let handle = worker.handle();
+//! let result: i64 = call!(handle, add(10, 20)).await?;
+//! assert_eq!(result, 30);
+//! # Ok(())
+//! # }
 //! ```
 //!
-//! Or use the argument extraction helpers:
+//! ```rust,no_run
+//! use multifrost::ArgsExtractor;
 //!
-//! ```rust
-//! use multifrost::ExtractArgs;
-//!
-//! let args = ExtractArgs::new(args)?;
-//! let a: i64 = args.get(0)?;
-//! let b: i64 = args.get(1)?;
+//! fn main() -> multifrost::Result<()> {
+//!     let args = ArgsExtractor::new(vec![serde_json::json!(10), serde_json::json!(20)]);
+//!     let a: i64 = args.get(0)?;
+//!     let b: i64 = args.get(1)?;
+//!     assert_eq!(a + b, 30);
+//!     Ok(())
+//! }
 //! ```
 
 use crate::error::{MultifrostError, Result};
@@ -208,69 +215,48 @@ impl<T: Serialize + Clone> ToJsonArg for &[T] {
     }
 }
 
-/// Macro to create a typed remote call
+/// Macro to create a typed remote call.
 ///
-/// This macro provides ergonomic syntax for making remote calls:
+/// ```rust,no_run
+/// use multifrost::{call, ParentWorker};
 ///
-/// ```rust
-/// # use multifrost::{ParentWorker, call};
-/// # use serde::Deserialize;
-/// # #[derive(Deserialize)]
-/// # struct AddResult { result: i64 }
-/// #
-/// let result: i64 = worker.call!(add(10, 20)).await?;
-/// let result: AddResult = worker.call!(add(10, 20)).await?;
-/// ```
-///
-/// Without the macro (verbose):
-/// ```rust
-/// # use serde_json::json;
-/// let result: i64 = worker.call("add", vec![json!(10), json!(20)]).await?;
-/// ```
-///
-/// # Arguments
-///
-/// - Function name as identifier
-/// - Comma-separated arguments (any type implementing `ToJsonArg`)
-/// - Return type annotation (usingturbofish or type inference)
-///
-/// # Examples
-///
-/// ```rust
-/// // Simple calls
-/// let sum: i64 = worker.call!(add(10, 20)).await?;
-/// let product: i64 = worker.call!(multiply(7, 8)).await?;
-///
-/// // With type annotation
-/// let result = worker.call!(add(10, 20))<i64>.await?;
-///
-/// // String arguments
-/// let greeting: String = worker.call!(greet("world")).await?;
-///
-/// // Multiple arguments of different types
-/// let result: bool = worker.call!(check(true, 42, "test")).await?;
+/// # #[tokio::main]
+/// # async fn main() -> multifrost::Result<()> {
+/// let worker = ParentWorker::connect("math-service", 5_000).await?;
+/// let handle = worker.handle();
+/// let sum: i64 = call!(handle, add(10, 20)).await?;
+/// assert_eq!(sum, 30);
+/// # Ok(())
+/// # }
 /// ```
 #[macro_export]
 macro_rules! call {
     ($worker:expr, $func:ident($($arg:expr),*)) => {
-        $worker.call(stringify!($func), vec![$($crate::call_macro::ToJsonArg::to_json($arg)),*])
+        $worker.call(stringify!($func), vec![$($crate::ToJsonArg::to_json($arg)),*])
     };
     ($worker:expr, $func:ident($($arg:expr),*), $($rest:tt)*) => {
         compile_error!("call! macro takes function name and arguments only")
     };
 }
 
-/// Macro to create a typed remote call with explicit return type
+/// Macro to create a typed remote call with explicit return type.
 ///
-/// This is useful when type inference fails:
+/// ```rust,no_run
+/// use multifrost::{call_with_type, ParentWorker};
 ///
-/// ```rust
-/// let result = worker.call_with_type!(add, (10, 20), i64).await?;
+/// # #[tokio::main]
+/// # async fn main() -> multifrost::Result<()> {
+/// let worker = ParentWorker::connect("math-service", 5_000).await?;
+/// let handle = worker.handle();
+/// let result: i64 = call_with_type!(handle, add, (10, 20), i64).await?;
+/// assert_eq!(result, 30);
+/// # Ok(())
+/// # }
 /// ```
 #[macro_export]
 macro_rules! call_with_type {
     ($worker:expr, $func:ident, ($($arg:expr),*), $ret:ty) => {
-        $worker.call::<$ret>(stringify!($func), vec![$($crate::call_macro::ToJsonArg::to_json($arg)),*])
+        $worker.call::<$ret>(stringify!($func), vec![$($crate::ToJsonArg::to_json($arg)),*])
     };
 }
 
@@ -283,7 +269,7 @@ pub trait ErgonomicCall {
         A: CallArgs;
 }
 
-impl<'a> ErgonomicCall for &'a crate::parent::ParentWorker {
+impl<'a> ErgonomicCall for &'a crate::parent::Handle {
     fn call_fn<R, A>(&self, name: &str, args: A) -> impl Future<Output = Result<R>>
     where
         R: serde::de::DeserializeOwned,
@@ -291,7 +277,7 @@ impl<'a> ErgonomicCall for &'a crate::parent::ParentWorker {
     {
         async move {
             let json_args: Vec<Value> = args.to_json_args();
-            self.call(name, json_args).await
+            self.call::<R>(name, json_args).await
         }
     }
 }
@@ -401,11 +387,33 @@ mod tests {
     }
 
     #[test]
+    fn test_args_extractor_remaining_and_len() {
+        let args = ArgsExtractor::new(vec![json!(1), json!(2), json!(3)]);
+        assert_eq!(args.len(), 3);
+        assert!(!args.is_empty());
+        assert_eq!(args.remaining(), &[json!(1), json!(2), json!(3)]);
+    }
+
+    #[test]
+    fn test_args_extractor_take_middle_value() {
+        let args = ArgsExtractor::new(vec![json!(10), json!(20), json!(30)]);
+        let middle: i64 = args.take(1).unwrap();
+        assert_eq!(middle, 20);
+    }
+
+    #[test]
     fn test_to_json_arg_primitives() {
         assert_eq!(5i64.to_json(), json!(5));
         assert_eq!(true.to_json(), json!(true));
         assert_eq!("hello".to_json(), json!("hello"));
         assert_eq!(3.14.to_json(), json!(3.14));
+    }
+
+    #[test]
+    fn test_to_json_arg_collections() {
+        let values = vec![1, 2, 3];
+        assert_eq!(values.clone().to_json(), json!([1, 2, 3]));
+        assert_eq!(values.as_slice().to_json(), json!([1, 2, 3]));
     }
 
     #[test]
@@ -419,6 +427,14 @@ mod tests {
             (1i64, 2i64, 3i64).to_json_args(),
             vec![json!(1), json!(2), json!(3)]
         );
+        assert_eq!(
+            (1i64, 2i64, 3i64, 4i64).to_json_args(),
+            vec![json!(1), json!(2), json!(3), json!(4)]
+        );
+        assert_eq!(
+            (1i64, 2i64, 3i64, 4i64, 5i64, 6i64).to_json_args(),
+            vec![json!(1), json!(2), json!(3), json!(4), json!(5), json!(6)]
+        );
     }
 
     #[test]
@@ -430,5 +446,11 @@ mod tests {
         assert_eq!(a, 42);
         assert_eq!(b, "hello");
         assert_eq!(c, true);
+    }
+
+    #[test]
+    fn test_extract_args_type_conversion_failure() {
+        let args = ArgsExtractor::new(vec![json!("not-a-number")]);
+        assert!(args.get::<i64>(0).is_err());
     }
 }

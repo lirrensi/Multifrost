@@ -160,7 +160,7 @@ pub type LogHandler = Arc<dyn Fn(&LogEntry) + Send + Sync>;
 /// # Example
 ///
 /// ```rust,no_run
-/// use multifrost::logging::{StructuredLogger, LogEvent, LogLevel};
+/// use multifrost::{LogEvent, LogLevel, StructuredLogger};
 /// use std::sync::Arc;
 ///
 /// let logger = StructuredLogger::new(
@@ -172,7 +172,7 @@ pub type LogHandler = Arc<dyn Fn(&LogEntry) + Send + Sync>;
 ///     None,
 /// );
 ///
-/// logger.info(LogEvent::WorkerStart, "Worker started");
+/// logger.info(LogEvent::WorkerStart, "Worker started", multifrost::LogOptions::default());
 /// ```
 #[derive(Clone)]
 pub struct StructuredLogger {

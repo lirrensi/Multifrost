@@ -1,7 +1,4 @@
-//! E2E Test Worker - Rust implementation
-//! This worker provides various methods for cross-language testing.
-//! Build: cargo build --example e2e_math_worker --release
-//! Binary will be at: target/release/examples/e2e_math_worker.exe
+//! E2E test worker for the v5 router flow.
 
 use async_trait::async_trait;
 use multifrost::{run_worker, ChildWorker, ChildWorkerContext, MultifrostError, Result};
@@ -95,10 +92,8 @@ async fn main() {
     let args: Vec<String> = env::args().collect();
 
     let ctx = if args.contains(&"--service".to_string()) {
-        // Service mode - register with service registry
         ChildWorkerContext::new().with_service_id("math-service")
     } else {
-        // Spawn mode - parent will provide port via env
         ChildWorkerContext::new()
     };
 

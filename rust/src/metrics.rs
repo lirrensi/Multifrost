@@ -61,18 +61,17 @@ pub struct MetricsSnapshot {
 /// # Example
 ///
 /// ```rust,no_run
-/// use multifrost::metrics::Metrics;
+/// use multifrost::Metrics;
 ///
+/// # #[tokio::main]
+/// # async fn main() -> multifrost::Result<()> {
 /// let metrics = Metrics::new();
-///
-/// // Start tracking a request
-/// let start = metrics.start_request("req-123", "myFunc", "default");
-/// // ... do work ...
-/// metrics.end_request(start, "req-123", true);
-///
-/// // Get snapshot
+/// let start = metrics.start_request("req-123", "myFunc", "default").await;
+/// metrics.end_request(start, "req-123", true, None).await;
 /// let snapshot = metrics.snapshot().await;
 /// println!("Avg latency: {}ms", snapshot.latency_avg_ms);
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Clone)]
 pub struct Metrics {
@@ -131,7 +130,12 @@ impl Metrics {
     /// Start tracking a request.
     ///
     /// Returns start timestamp for later end_request() call.
-    pub async fn start_request(&self, _request_id: &str, _function: &str, _namespace: &str) -> Instant {
+    pub async fn start_request(
+        &self,
+        _request_id: &str,
+        _function: &str,
+        _namespace: &str,
+    ) -> Instant {
         let mut inner = self.inner.write().await;
         inner.requests_total += 1;
         inner.queue_depth += 1;
@@ -142,7 +146,13 @@ impl Metrics {
     /// End tracking a request.
     ///
     /// Returns latency in milliseconds.
-    pub async fn end_request(&self, start_time: Instant, _request_id: &str, success: bool, _error: Option<String>) -> f64 {
+    pub async fn end_request(
+        &self,
+        start_time: Instant,
+        _request_id: &str,
+        success: bool,
+        _error: Option<String>,
+    ) -> f64 {
         let latency_ms = start_time.elapsed().as_secs_f64() * 1000.0;
 
         let mut inner = self.inner.write().await;
@@ -218,7 +228,14 @@ impl Metrics {
                 let latency_min = latencies[0];
                 let latency_max = latencies[n - 1];
 
-                (latency_avg, latency_p50, latency_p95, latency_p99, latency_min, latency_max)
+                (
+                    latency_avg,
+                    latency_p50,
+                    latency_p95,
+                    latency_p99,
+                    latency_min,
+                    latency_max,
+                )
             } else {
                 (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
             };
@@ -333,7 +350,9 @@ mod tests {
         let metrics = Metrics::new();
         let start = metrics.start_request("req-1", "fail", "default").await;
 
-        let latency = metrics.end_request(start, "req-1", false, Some("Test error".to_string())).await;
+        let latency = metrics
+            .end_request(start, "req-1", false, Some("Test error".to_string()))
+            .await;
 
         let snapshot = metrics.snapshot().await;
         assert_eq!(snapshot.requests_total, 1);
@@ -348,10 +367,14 @@ mod tests {
 
         // Record multiple requests with different latencies
         for i in 0..100 {
-            let start = metrics.start_request(&format!("req-{}", i), "test", "default").await;
+            let start = metrics
+                .start_request(&format!("req-{}", i), "test", "default")
+                .await;
             // Simulate varying latencies
             tokio::time::sleep(std::time::Duration::from_millis(i)).await;
-            metrics.end_request(start, &format!("req-{}", i), true, None).await;
+            metrics
+                .end_request(start, &format!("req-{}", i), true, None)
+                .await;
         }
 
         let snapshot = metrics.snapshot().await;
@@ -499,8 +522,12 @@ mod tests {
 
         // Record more than max samples
         for i in 0..10 {
-            let start = metrics.start_request(&format!("req-{}", i), "test", "default").await;
-            metrics.end_request(start, &format!("req-{}", i), true, None).await;
+            let start = metrics
+                .start_request(&format!("req-{}", i), "test", "default")
+                .await;
+            metrics
+                .end_request(start, &format!("req-{}", i), true, None)
+                .await;
         }
 
         let snapshot = metrics.snapshot().await;
@@ -555,9 +582,13 @@ mod tests {
         for i in 0..10 {
             let metrics_clone = metrics.clone();
             let handle = tokio::spawn(async move {
-                let start = metrics_clone.start_request(&format!("req-{}", i), "test", "default").await;
+                let start = metrics_clone
+                    .start_request(&format!("req-{}", i), "test", "default")
+                    .await;
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                metrics_clone.end_request(start, &format!("req-{}", i), true, None).await;
+                metrics_clone
+                    .end_request(start, &format!("req-{}", i), true, None)
+                    .await;
             });
             handles.push(handle);
         }
