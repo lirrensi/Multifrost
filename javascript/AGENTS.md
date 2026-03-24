@@ -1,154 +1,51 @@
-# Multifrost JavaScript/TypeScript Implementation
+# Multifrost JavaScript / TypeScript v5 Guide
 
-## Architecture Overview
+## Architecture
 
-The JavaScript implementation provides a Node.js-based IPC system using ZeroMQ DEALER/ROUTER sockets and msgpack serialization. Key design principles:
+The JavaScript package is a router-based v5 binding. Callers and services are separate runtime roles that communicate only through the shared router over WebSocket.
 
-- **Async-Native**: All operations are Promise-based; no blocking I/O allowed
-- **Proxy-Based Method Access**: Uses Proxy objects for fluent API (`worker.call.methodName(args)`)
-- **TypeScript-First**: Full type safety with compile-time checking
-- **Event-Driven**: Leverages Node.js event loop for efficient async operations
-- **Dual Modes**: Supports both spawn mode (create new process) and connect mode (discover existing service)
+### Primary Modules
 
-## Core Components
+- `src/protocol.ts` for protocol constants, wire types, and envelope validation
+- `src/frame.ts` for msgpack encoding and the `[u32][envelope][body]` frame layout
+- `src/errors.ts` for the stable v5 error classes
+- `src/router_bootstrap.ts` for router reachability, lock handling, and startup
+- `src/transport.ts` for the live WebSocket transport
+- `src/connection.ts` for caller configuration and the live `Handle`
+- `src/process.ts` for service process launching
+- `src/service.ts` for `ServiceWorker`, `ServiceContext`, and `runService`
+- `src/index.ts` for package entrypoint exports
 
-### ParentWorker (DEALER socket)
-- Manages child process lifecycle (spawn/connect)
-- Handles message loop with async iteration
-- Implements circuit breaker, heartbeat monitoring, metrics
-- Provides proxy-based API for remote method calls
+## Working Rules
 
-### ChildWorker (ROUTER socket)
-- Runs in child process with its own event loop
-- Dynamically dispatches method calls via `Record<string, unknown>`
-- Redirects console output to parent
-- Handles shutdown signals gracefully
+- Keep the Node surface async-only.
+- Do not reintroduce parent/child naming, ZeroMQ sockets, or direct peer-to-peer transport.
+- Keep `connect(...)` as caller configuration and `spawn(...)` as process launch only.
+- Keep `runService(...)` responsible for the service peer registration and dispatch loop.
+- Preserve binary frame handling and `msg_id` correlation.
+- When editing public files, make sure the README, examples, and docs continue to teach the v5 names.
 
-## Communication Protocol
+## Testing
 
-- **Socket Types**: DEALER (parent) ↔ ROUTER (child)
-- **Message Format**: `[empty_frame, message_data]` for DEALER, `[sender_id, empty, message_data]` for ROUTER
-- **Serialization**: msgpack v5 with deepSanitize for type safety
-- **Message Types**: CALL, RESPONSE, ERROR, HEARTBEAT, STDOUT, STDERR, SHUTDOWN
-
-## Commands
+Use the package-level commands:
 
 ```bash
-# Install dependencies
-npm install
-
-# Build TypeScript
-npm run build
-# or: npx tsc
-
-# Run tests
+npm run typecheck
 npm test
-
-# Lint and format
-npm run lint
-npm run format
-
-# Watch mode (development)
-npx tsc --watch
 ```
 
-## Code Style Guidelines
+For examples, prefer `npx tsx` so the scripts stay close to the source files while the package is under rewrite.
 
-### Import Organization
-1. Standard library imports
-2. Third-party dependencies (zeromq, msgpackr)
-3. Local module imports
+## Style
 
-### Formatting
-- Use Prettier with default settings
-- No configuration needed
+- Prefer small, focused modules.
+- Use TypeScript strictness and explicit public types.
+- Keep error handling explicit and surface router-vs-service failures distinctly.
+- Avoid adding compatibility aliases for retired v4 names.
 
-### Type Safety
-- Use TypeScript with strict mode enabled
-- Prefer explicit type annotations for public APIs
-- Use `unknown` for dynamic values, `any` only when necessary
-- Leverage interfaces for complex types
+## Non-Goals
 
-### Naming Conventions
-- **Classes**: PascalCase (`ParentWorker`, `ChildWorker`)
-- **Methods/Functions**: camelCase (`callFunction`, `handleMessage`)
-- **Private members**: underscore prefix (`_pendingRequests`, `_consecutiveFailures`)
-- **Constants**: SCREAMING_SNAKE_CASE (`APP_NAME`, `MAX_RETRIES`)
-- **Interfaces**: PascalCase with `I` prefix (`IPendingRequest`, `IMetrics`)
-
-### Error Handling
-- Use custom error classes for domain errors
-- Always catch and handle errors in async functions
-- Provide descriptive error messages
-- Use `throw new Error()` for unexpected errors
-- Never suppress errors silently
-
-### Documentation
-- Use JSDoc comments for public APIs
-- Include parameter types and return types
-- Document async/await behavior
-- Explain error conditions
-
-```typescript
-/**
- * Calls a remote method with optional timeout and namespace.
- * @param functionName - Name of the method to call
- * @param args - Arguments to pass to the method
- * @param timeout - Optional timeout in milliseconds
- * @param namespace - Optional namespace (default: "default")
- * @returns Promise resolving to the method result
- * @throws RemoteCallError if the call fails
- * @throws CircuitOpenError if the circuit breaker is open
- */
-async callFunction<T = unknown>(
-    functionName: string,
-    args: unknown[] = [],
-    timeout?: number,
-    namespace: string = "default"
-): Promise<T>
-```
-
-## Common Patterns
-
-### Creating a Worker
-```typescript
-// Spawn mode
-const worker = ParentWorker.spawn("./worker.js", "node", {
-    autoRestart: true,
-    defaultTimeout: 5000,
-});
-
-// Connect mode
-const worker = await ParentWorker.connect("my-service");
-```
-
-### Calling Remote Methods
-```typescript
-// Fluent API
-const result = await worker.call.factorial(10);
-
-// With options
-const result = await worker
-    .withOptions({ timeout: 3000, namespace: "custom" })
-    .add(1, 2);
-```
-
-### Error Handling
-```typescript
-try {
-    const result = await worker.call.compute(100);
-} catch (error) {
-    if (error instanceof CircuitOpenError) {
-        // Handle circuit breaker
-    } else if (error instanceof RemoteCallError) {
-        // Handle remote error
-    }
-}
-```
-
-## Cross-Language Notes
-
-- **No Sync API**: JavaScript is single-threaded; all operations are async
-- **Type Mapping**: JavaScript `number` → Python `float` (clamped to 2^53)
-- **BigInt**: Converted to `float` (loses precision)
-- **Error Messages**: JavaScript sends only message string; Python includes traceback
+- no ZeroMQ
+- no synchronous API
+- no `ParentWorker` / `ParentHandle` / `ChildWorker`
+- no direct caller-to-service transport

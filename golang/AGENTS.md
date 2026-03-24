@@ -1,116 +1,52 @@
-# Multifrost Go Implementation - Agent Guide
+# Multifrost Go v5 Guide
 
-## Architecture Overview
+## Mental Model
 
-The Go implementation uses goroutines for concurrent execution and reflection-based method dispatch. Unlike Python's async/await, Go uses goroutines and channels for concurrency.
+Go is the synchronous, context-driven binding for Multifrost v5.
 
-```
-ParentWorker (DEALER)          ChildWorker (ROUTER)
-├─ Spawn mode                  ├─ Method dispatch
-├─ Connect mode                ├─ Reflection-based calls
-├─ Circuit breaker             ├─ Output forwarding
-├─ Heartbeat monitoring        ├─ Heartbeat response
-├─ Metrics collection          └─ Signal handling
-└─ Retry logic
-```
+- `Connect` returns caller configuration.
+- `Connection.Handle()` opens the live caller transport.
+- `Handle.Call(ctx, function, args...)` is the main caller API.
+- `Spawn` starts a service process.
+- `RunService` connects a service peer and dispatches calls through `ServiceWorker.HandleCall`.
 
-**Key Patterns:**
-- **No async/await**: Go doesn't have async/await syntax. Concurrent operations use goroutines and channels.
-- **Reflection-based dispatch**: Methods must be exported (capitalized) to be callable.
-- **msgpack serialization**: Uses vmihailenco/msgpack/v5 for message serialization.
-- **ZeroMQ**: Pure Go implementation (github.com/go-zeromq/zmq4) with DEALER/ROUTER socket types.
+## Rules
 
-## Concurrency Model
+- Use `context.Context` for cancellation and timeouts.
+- Keep public API names aligned with the v5 surface.
+- Do not reintroduce the retired v4 worker/proxy surface.
+- Do not use reflection as the primary service dispatch path.
+- Do not use async naming in Go. Goroutines are fine; async surface names are not.
+
+## Service Dispatch
+
+Service implementations should be tiny and explicit:
 
 ```go
-// Goroutines run concurrently:
-// - ParentWorker: messageLoop(), heartbeatLoop(), CallFunction()
-// - ChildWorker: messageLoop(), forwardOutput()
+type MathService struct{}
 
-// Channels provide type-safe communication between goroutines
-// sync.RWMutex protects shared state (pending requests, metrics)
+func (s *MathService) HandleCall(ctx context.Context, function string, args []any) (any, error) {
+	switch function {
+	case "add":
+		return 30, nil
+	default:
+		return nil, fmt.Errorf("function not found: %s", function)
+	}
+}
 ```
 
-## Build & Test Commands
+## Process Notes
+
+- `Spawn` only starts the child process.
+- `ServiceProcess` owns process lifecycle, not network state.
+- `RunService` owns registration and dispatch on the service side.
+
+## Validation
+
+From `golang/`, the usual checks are:
 
 ```bash
-# Build
-go build ./...
-
-# Run tests
+go fmt ./...
 go test ./...
-
-# Run with verbose output
-go test ./... -v
-
-# Run with coverage
-go test ./... -cover
-
-# Vet for issues
 go vet ./...
-```
-
-## Code Style Guidelines
-
-### Imports
-- Group imports: Standard library → Third-party → Local
-- Sort alphabetically within each group
-
-### Formatting
-- Use `gofmt` (automatic, no config needed)
-- No custom formatting required
-
-### Type Safety
-- Strong typing throughout
-- Use `any` (Go 1.18+) for dynamic values
-- Prefer `Result<T, E>` over `Option<T>` for error handling
-
-### Naming Conventions
-- **Exported names**: PascalCase (e.g., `ParentWorker`, `CallFunction`)
-- **Private names**: camelCase (e.g., `messageLoop`, `config`)
-- **Constants**: SCREAMING_SNAKE_CASE (e.g., `LockTimeout`)
-
-### Error Handling
-- Use explicit errors: `if err != nil { return err }`
-- Wrap errors with `%w` for error chain preservation
-- Return typed errors: `*CircuitOpenError`, `*RemoteCallError`
-- Use `defer` for resource cleanup (locks, file handles)
-
-### Documentation
-- Use Go documentation comments: `//` for package/file, `///` for types/methods
-- Document exported types and methods
-- Include example usage in comments
-
-### Code Patterns
-- Use `defer` for cleanup
-- Use `context.Context` for cancellation
-- Use table-driven tests with `testify`
-- Use atomic operations for simple counters
-- Use mutexes for complex shared state
-
-## Implementation Notes
-
-1. **Reflection**: Only exported methods (capitalized) can be called. Private methods are rejected.
-
-2. **Context**: Used for cancellation, not async operations.
-
-3. **Socket types**: DEALER (parent) ↔ ROUTER (child) with multipart message framing.
-
-4. **Heartbeat**: Spawn mode only - parent sends periodic heartbeats to child.
-
-5. **Circuit breaker**: Tracks consecutive failures and opens after threshold.
-
-6. **Metrics**: Thread-safe using `sync.RWMutex`.
-
-## API Surface
-
-```go
-// ParentWorker
-Spawn(scriptPath string, executable ...string) *ParentWorker
-Connect(ctx context.Context, serviceID string, timeout ...time.Duration) (*ParentWorker, error)
-CallFunction(ctx context.Context, functionName string, args ...any) (any, error)
-
-// ChildWorker
-NewChildWorkerWithService(serviceID string) *ChildWorker
-ListFunctions() []string
 ```

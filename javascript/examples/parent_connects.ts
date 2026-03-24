@@ -1,56 +1,37 @@
 /**
- * Example: Multiple parents connecting to a single worker.
- * 
- * This demonstrates the ROUTER/DEALER architecture where multiple
- * parent processes can connect to and call functions on a single
- * worker service.
- * 
- * Usage:
- * 1. First, run math_worker_service.ts in a separate terminal
- * 2. Then run this script to see multiple parents connecting
- * 
- * npx ts-node examples/math_worker_service.ts  # Terminal 1
- * npx ts-node examples/parent_connects.ts      # Terminal 2
+ * FILE: javascript/examples/parent_connects.ts
+ * PURPOSE: Show multiple Node callers connecting to the same v5 service peer through the router.
+ * OWNS: Caller-side connect/handle usage for concurrent remote calls.
+ * EXPORTS: None
+ * DOCS: docs/spec.md, javascript/README.md
  */
 
-import { ParentWorker } from "../src/multifrost.js";
+import { connect } from "../src/index.js";
 
+async function callerTask(callerId: number): Promise<void> {
+    const connection = connect("math-service", {
+        eagerTargetQuery: "exists",
+    });
 
-async function parentTask(parentId: number): Promise<void> {
-    console.log(`Parent ${parentId}: Connecting to math-service...`);
+    const handle = connection.handle();
+    await handle.start();
 
     try {
-        const worker = await ParentWorker.connect("math-service", 5000);
-        const handle = await worker.handle();
-        console.log(`Parent ${parentId}: Connected!`);
-
-        for (let i = 0; i < 3; i++) {
-            const result = await handle.call.add(parentId * 10, i);
-            console.log(`Parent ${parentId}: ${parentId * 10} + ${i} = ${result}`);
-            await new Promise(resolve => setTimeout(resolve, 500));
+        for (let iteration = 0; iteration < 3; iteration += 1) {
+            const left = callerId * 10;
+            const result = await handle.call.add(left, iteration);
+            console.log(`caller ${callerId}: ${left} + ${iteration} = ${result}`);
         }
-
+    } finally {
         await handle.stop();
-        console.log(`Parent ${parentId}: Done`);
-    } catch (e) {
-        console.error(`Parent ${parentId}: Error - ${e}`);
     }
 }
 
-
 async function main(): Promise<void> {
-    console.log("Starting multiple parents connecting to math-service...");
-    console.log("Make sure math_worker_service.ts is running!\n");
-
-    // Run 3 parents concurrently
-    await Promise.all([
-        parentTask(1),
-        parentTask(2),
-        parentTask(3),
-    ]);
-
-    console.log("\nAll parents finished!");
+    await Promise.all([callerTask(1), callerTask(2), callerTask(3)]);
 }
 
-
-main();
+void main().catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+});

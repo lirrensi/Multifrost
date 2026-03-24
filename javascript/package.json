@@ -1,40 +1,34 @@
 {
     "name": "multifrost",
-    "version": "4.1.0",
-    "description": "Cross-language IPC library for Python, Node.js, Go, and Rust",
+    "version": "5.0.0",
+    "description": "Router-based v5 RPC library for Python, Node.js, Go, and Rust",
     "license": "MIT",
     "author": "lirrensi",
     "type": "module",
     "main": "index.ts",
     "scripts": {
-        "test": "npx tsx tests/test.test.ts",
-        "test:all": "npm run test:message && npm run test:metrics && npm run test:logging && npm run test:registry && npm run test:circuit && npm run test:parent && npm run test:child && npm run test",
-        "test:message": "npx tsx tests/message.test.ts",
-        "test:metrics": "npx tsx tests/metrics.test.ts",
-        "test:logging": "npx tsx tests/logging.test.ts",
-        "test:registry": "npx tsx tests/service_registry.test.ts",
-        "test:circuit": "npx tsx tests/circuit_breaker.test.ts",
-        "test:parent": "npx tsx tests/parent_worker.test.ts",
-        "test:child": "npx tsx tests/child_worker.test.ts",
+        "test": "npm run test:unit && npm run test:interop",
+        "test:unit": "node ./node_modules/tsx/dist/cli.mjs tests/v5_unit.test.ts",
+        "test:interop": "node ./node_modules/tsx/dist/cli.mjs tests/v5_interop.test.ts",
+        "test:all": "npm run test && npm run typecheck",
         "lint": "eslint src/",
         "format": "prettier --write \"src/**/*.ts\"",
         "format:check": "prettier --check \"src/**/*.ts\"",
-        "typecheck": "tsc --noEmit"
+        "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit"
     },
     "dependencies": {
-        "msgpackr": "^1.11.8",
-        "pidusage": "^4.0.1",
+        "msgpackr": "^1.11.9",
         "proper-lockfile": "^4.1.2",
-        "zeromq": "^6.5.0"
+        "ws": "^8.20.0"
     },
     "devDependencies": {
-        "@types/node": "^22.19.11",
-        "@types/pidusage": "^2.0.5",
+        "@types/node": "^25.5.0",
+        "@types/ws": "^8.18.1",
         "@types/proper-lockfile": "^4.1.4",
-        "eslint": "^9.0.0",
-        "prettier": "^3.0.0",
+        "eslint": "^10.1.0",
+        "prettier": "^3.8.1",
         "tsx": "^4.21.0",
-        "typescript": "^5.9.3",
-        "typescript-eslint": "^8.0.0"
+        "typescript": "^6.0.2",
+        "typescript-eslint": "^8.57.2"
     }
 }

@@ -1,17 +1,44 @@
-import { ParentWorker } from "../src/multifrost";
+/**
+ * FILE: javascript/examples/node_calls_py.ts
+ * PURPOSE: Show a Node caller talking to a service peer that already speaks the v5 router protocol.
+ * OWNS: Caller-side connect/handle usage for cross-language RPC.
+ * EXPORTS: None
+ * DOCS: docs/spec.md, javascript/README.md
+ */
 
-async function main() {
-    const worker = new ParentWorker(`../examples/math_worker.py`, "python");
-    const handle = await worker.handle();
+import { connect } from "../src/index.js";
 
-    // will run first | blocking
-    handle.call.fibonacci(55).then(result => {
-        console.log("fibo number => ", result);
-    });
+async function waitForPeerExists(
+    handle: { queryPeerExists(peerId: string): Promise<boolean> },
+    peerId: string
+): Promise<void> {
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+        if (await handle.queryPeerExists(peerId)) {
+            return;
+        }
+        await new Promise(resolve => setTimeout(resolve, 50));
+    }
 
-    const fact = await handle.call.factorial(15);
-    console.log("factorial => ", fact);
-
-    await handle.stop();
+    throw new Error(`peer ${peerId} did not appear in the router registry`);
 }
-main().catch(console.error);
+
+async function main(): Promise<void> {
+    const connection = connect("math-service");
+
+    const handle = connection.handle();
+    await handle.start();
+
+    try {
+        await waitForPeerExists(handle, "math-service");
+        const fact = await handle.call.factorial(11);
+        console.log({ fact });
+    } finally {
+        await handle.stop();
+    }
+}
+
+void main().catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+});

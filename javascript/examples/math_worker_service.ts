@@ -1,37 +1,37 @@
 /**
- * Math worker that runs as a standalone microservice.
- * 
- * Run this first, then run parent_connects.ts to connect to it.
- * 
- * npx ts-node examples/math_worker_service.ts
+ * FILE: javascript/examples/math_worker_service.ts
+ * PURPOSE: Show a minimal service peer built from ServiceWorker and runService.
+ * OWNS: Service-side method dispatch example.
+ * EXPORTS: None
+ * DOCS: docs/spec.md, javascript/README.md
  */
 
-import { ChildWorker } from "../src/multifrost.js";
+import { runService, ServiceContext, ServiceWorker } from "../src/index.js";
 
-
-class MathWorker extends ChildWorker {
-    constructor() {
-        // Register with service_id for connect mode
-        super("math-service");
-    }
-
-    add(a: number, b: number): number {
-        console.error(`Adding ${a} + ${b}`);
+class MathService extends ServiceWorker {
+    async add(a: number, b: number): Promise<number> {
         return a + b;
     }
 
-    multiply(a: number, b: number): number {
-        console.error(`Multiplying ${a} * ${b}`);
+    async multiply(a: number, b: number): Promise<number> {
         return a * b;
     }
 
-    power(base: number, exp: number): number {
-        console.error(`Computing ${base}^${exp}`);
-        return Math.pow(base, exp);
+    async factorial(value: number): Promise<number> {
+        let result = 1;
+        for (let i = 2; i <= value; i += 1) {
+            result *= i;
+        }
+        return result;
     }
 }
 
-
-console.error("Starting MathWorker as microservice...");
-const worker = new MathWorker();
-worker.run();
+void runService(
+    new MathService(),
+    new ServiceContext({
+        peerId: "math-service",
+    })
+).catch(error => {
+    console.error(error);
+    process.exitCode = 1;
+});

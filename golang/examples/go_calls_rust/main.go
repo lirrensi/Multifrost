@@ -1,6 +1,6 @@
-// FILE: golang/examples/parent_spawn/main.go
-// PURPOSE: Show caller-side Spawn plus Handle usage against the Go v5 service peer.
-// OWNS: Spawn + handle caller example.
+// FILE: golang/examples/go_calls_rust/main.go
+// PURPOSE: Show a Go caller reaching the Rust v5 service example through the router.
+// OWNS: Go-to-Rust caller example.
 // EXPORTS: main.
 // DOCS: docs/spec.md, golang/docs/quick-examples.md
 package main
@@ -16,12 +16,6 @@ import (
 
 func main() {
 	ctx := context.Background()
-
-	process, err := multifrost.Spawn("examples/math_worker/main.go")
-	if err != nil {
-		log.Fatalf("spawn failed: %v", err)
-	}
-	defer process.Stop(context.Background())
 
 	connection := multifrost.Connect("math-service", multifrost.ConnectOptions{
 		RequestTimeout:   10 * time.Second,
@@ -42,15 +36,21 @@ func main() {
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	result, err := handle.Call(ctx, "add", 5, 3)
+	sum, err := handle.Call(ctx, "add", 10, 20)
 	if err != nil {
 		log.Fatalf("add failed: %v", err)
 	}
-	fmt.Printf("add(5, 3) = %v\n", result)
+	fmt.Printf("add(10, 20) = %v\n", sum)
 
-	exists, err := handle.QueryPeerExists(ctx, "math-service")
+	product, err := handle.Call(ctx, "multiply", 7, 8)
 	if err != nil {
-		log.Fatalf("peer.exists failed: %v", err)
+		log.Fatalf("multiply failed: %v", err)
 	}
-	fmt.Printf("math-service live: %v\n", exists)
+	fmt.Printf("multiply(7, 8) = %v\n", product)
+
+	factorial, err := handle.Call(ctx, "factorial", 5)
+	if err != nil {
+		log.Fatalf("factorial failed: %v", err)
+	}
+	fmt.Printf("factorial(5) = %v\n", factorial)
 }

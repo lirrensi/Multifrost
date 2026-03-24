@@ -339,3 +339,4 @@ e2e/.venv/
 private/
 .tmp
 plans/
+docs/CODEMAP.*.md

@@ -82,7 +82,7 @@ export interface MetricsDict {
 }
 
 /**
- * Thread-safe metrics collector for ParentWorker.
+ * Thread-safe metrics collector for async request tracking.
  *
  * Usage:
  *     const metrics = new Metrics();
