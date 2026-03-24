@@ -7,8 +7,10 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/multifrost/golang"
@@ -16,8 +18,9 @@ import (
 
 func main() {
 	ctx := context.Background()
+	target := resolveTarget()
 
-	connection := multifrost.Connect("math-service", multifrost.ConnectOptions{
+	connection := multifrost.Connect(target, multifrost.ConnectOptions{
 		RequestTimeout:   10 * time.Second,
 		BootstrapTimeout: 10 * time.Second,
 	})
@@ -29,7 +32,7 @@ func main() {
 	defer handle.Stop(context.Background())
 
 	for i := 0; i < 50; i++ {
-		exists, err := handle.QueryPeerExists(ctx, "math-service")
+		exists, err := handle.QueryPeerExists(ctx, target)
 		if err == nil && exists {
 			break
 		}
@@ -53,4 +56,18 @@ func main() {
 		log.Fatalf("factorial failed: %v", err)
 	}
 	fmt.Printf("factorial(5) = %v\n", factorial)
+}
+
+func resolveTarget() string {
+	target := os.Getenv("MULTIFROST_TARGET_PEER_ID")
+	if target != "" {
+		return target
+	}
+
+	flagTarget := flag.String("target", "math-service", "target peer id")
+	flag.Parse()
+	if trimmed := *flagTarget; trimmed != "" {
+		return trimmed
+	}
+	return "math-service"
 }

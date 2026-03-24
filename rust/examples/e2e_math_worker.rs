@@ -87,14 +87,36 @@ fn fibonacci(n: u64) -> u64 {
     b
 }
 
+fn resolve_peer_id() -> Option<String> {
+    if let Ok(peer_id) = env::var("MULTIFROST_PEER_ID") {
+        let trimmed = peer_id.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let args: Vec<String> = env::args().collect();
+    if let Some(index) = args.iter().position(|arg| arg == "--service-id") {
+        if let Some(peer_id) = args.get(index + 1) {
+            let trimmed = peer_id.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+
+    if args.iter().any(|arg| arg == "--service") {
+        return Some("math-service".to_string());
+    }
+
+    None
+}
+
 #[tokio::main]
 async fn main() {
-    let args: Vec<String> = env::args().collect();
-
-    let ctx = if args.contains(&"--service".to_string()) {
-        ServiceContext::new().with_service_id("math-service")
-    } else {
-        ServiceContext::new()
+    let ctx = match resolve_peer_id() {
+        Some(peer_id) => ServiceContext::new().with_service_id(&peer_id),
+        None => ServiceContext::new(),
     };
 
     run_service(MathWorker, ctx).await;

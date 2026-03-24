@@ -29,7 +29,7 @@ class MathService extends ServiceWorker {
 void runService(
     new MathService(),
     new ServiceContext({
-        peerId: "math-service",
+        peerId: process.env.MULTIFROST_PEER_ID?.trim() || "math-service",
     })
 ).catch(error => {
     console.error(error);

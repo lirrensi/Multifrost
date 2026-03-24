@@ -144,7 +144,12 @@ func fibonacci(n int64) int64 {
 }
 
 func main() {
-	if err := multifrost.RunService(context.Background(), &MathService{}, multifrost.ServiceContext{PeerID: "math-service"}); err != nil {
+	peerID := os.Getenv("MULTIFROST_PEER_ID")
+	if peerID == "" {
+		peerID = "math-service"
+	}
+
+	if err := multifrost.RunService(context.Background(), &MathService{}, multifrost.ServiceContext{PeerID: peerID}); err != nil {
 		panic(err)
 	}
 }

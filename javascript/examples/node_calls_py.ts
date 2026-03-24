@@ -23,16 +23,36 @@ async function waitForPeerExists(
     throw new Error(`peer ${peerId} did not appear in the router registry`);
 }
 
+function resolveTargetPeerId(): string {
+    const targetFromEnv = process.env.MULTIFROST_TARGET_PEER_ID?.trim();
+    if (targetFromEnv) {
+        return targetFromEnv;
+    }
+
+    const index = process.argv.indexOf("--target");
+    if (index >= 0 && process.argv[index + 1]?.trim()) {
+        return process.argv[index + 1].trim();
+    }
+
+    return "math-service";
+}
+
 async function main(): Promise<void> {
-    const connection = connect("math-service");
+    const target = resolveTargetPeerId();
+    const connection = connect(target);
 
     const handle = connection.handle();
     await handle.start();
 
     try {
-        await waitForPeerExists(handle, "math-service");
-        const fact = await handle.call.factorial(11);
-        console.log({ fact });
+        await waitForPeerExists(handle, target);
+        const add = await handle.call.add(10, 20);
+        const product = await handle.call.multiply(7, 8);
+        const fact = await handle.call.factorial(5);
+        console.log(`target = ${target}`);
+        console.log(`add(10, 20) = ${add}`);
+        console.log(`multiply(7, 8) = ${product}`);
+        console.log(`factorial(5) = ${fact}`);
     } finally {
         await handle.stop();
     }

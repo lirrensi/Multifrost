@@ -19,14 +19,7 @@ caller_bin="$rust_dir/target/debug/examples/connect$exe_suffix"
 
 temp_home="$(mktemp -d)"
 router_output_log="$temp_home/router-process.log"
-router_port="$(python3 - <<'PY'
-import socket
-sock = socket.socket()
-sock.bind(("127.0.0.1", 0))
-print(sock.getsockname()[1])
-sock.close()
-PY
-)"
+router_port="${MULTIFROST_ROUTER_PORT:-9981}"
 
 export HOME="$temp_home"
 export MULTIFROST_ROUTER_PORT="$router_port"

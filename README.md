@@ -466,18 +466,15 @@ Because this repository contains multiple language-specific packages, not one pa
 
 So if you only want one implementation, you do not need the whole repo layout in your build tool - just the subdirectory for that language, or a local clone that points at it.
 
-### Development
+### End-to-end
+The full v5 end-to-end flow lives in `e2e/Makefile`.
+
 ```bash
-# Install all implementations
-make install
-
-# Run all tests
+cd e2e
 make test
-
-# Run tests for specific language
-make test-python
-make test-javascript
 ```
+
+That builds the router and runs the four-caller by four-service matrix.
 
 ## 📖 Examples
 

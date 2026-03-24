@@ -32,169 +32,176 @@ async fn handle_connection(stream: TcpStream, registry: PeerRegistry) -> Result<
     let websocket = accept_async(stream).await?;
     let (sink, mut source) = websocket.split();
     let sink = Arc::new(Mutex::new(sink));
+    let mut registered_peer_id: Option<String> = None;
 
-    let first = match source.next().await {
-        Some(Ok(message)) => message,
-        Some(Err(err)) => return Err(err.into()),
-        None => return Err(RouterError::ConnectionClosed),
-    };
+    let result: Result<()> = async {
+        let first = match source.next().await {
+            Some(Ok(message)) => message,
+            Some(Err(err)) => return Err(err.into()),
+            None => return Err(RouterError::ConnectionClosed),
+        };
 
-    let first_bytes = crate::protocol::ensure_binary_ws_message(first)?;
-    let first_frame = decode_frame(&first_bytes)?;
-    if first_frame.envelope.kind != KIND_REGISTER {
-        send_error_and_close(
-            sink.clone(),
-            &first_frame.envelope.msg_id,
-            "register.required",
-            "first message must be register",
-        )
-        .await?;
-        return Ok(());
-    }
-
-    let register = decode_register_body(&first_frame.body_bytes)?;
-    validate_register_envelope(&first_frame.envelope, &register)?;
-
-    match registry
-        .insert_live_peer(
-            register.peer_id.clone(),
-            register.class.clone(),
-            sink.clone(),
-        )
-        .await
-    {
-        Ok(()) => {
-            send_register_ack(sink.clone(), &first_frame.envelope.msg_id, &register).await?;
-        }
-        Err(RouterError::DuplicatePeerId(peer_id)) => {
+        let first_bytes = crate::protocol::ensure_binary_ws_message(first)?;
+        let first_frame = decode_frame(&first_bytes)?;
+        if first_frame.envelope.kind != KIND_REGISTER {
             send_error_and_close(
                 sink.clone(),
                 &first_frame.envelope.msg_id,
-                "duplicate_peer_id",
-                &format!("peer_id {peer_id} is already live"),
+                "register.required",
+                "first message must be register",
             )
             .await?;
             return Ok(());
         }
-        Err(err) => return Err(err),
-    }
 
-    let peer_id = register.peer_id;
-    let peer_class = register.class;
+        let register = decode_register_body(&first_frame.body_bytes)?;
+        validate_register_envelope(&first_frame.envelope, &register)?;
 
-    while let Some(message) = source.next().await {
-        match message {
-            Ok(Message::Binary(bytes)) => {
-                let raw = bytes.to_vec();
-                let FrameParts {
-                    envelope,
-                    body_bytes,
-                } = decode_frame(&raw)?;
-                if envelope.from != peer_id {
-                    send_peer_error(
-                        sink.clone(),
-                        envelope.msg_id.as_str(),
-                        "invalid_source",
-                        "envelope.from does not match registered peer",
-                    )
-                    .await?;
-                    continue;
-                }
+        match registry
+            .insert_live_peer(
+                register.peer_id.clone(),
+                register.class.clone(),
+                sink.clone(),
+            )
+            .await
+        {
+            Ok(()) => {
+                registered_peer_id = Some(register.peer_id.clone());
+                send_register_ack(sink.clone(), &first_frame.envelope.msg_id, &register).await?;
+            }
+            Err(RouterError::DuplicatePeerId(peer_id)) => {
+                send_error_and_close(
+                    sink.clone(),
+                    &first_frame.envelope.msg_id,
+                    "duplicate_peer_id",
+                    &format!("peer_id {peer_id} is already live"),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        }
 
-                match envelope.kind.as_str() {
-                    KIND_QUERY => {
-                        handle_query(
-                            sink.clone(),
-                            registry.clone(),
-                            peer_id.as_str(),
-                            envelope,
-                            body_bytes,
-                        )
-                        .await?
-                    }
-                    KIND_CALL => {
-                        handle_call(
-                            sink.clone(),
-                            registry.clone(),
-                            peer_class.clone(),
-                            envelope,
-                            raw,
-                        )
-                        .await?
-                    }
-                    KIND_RESPONSE => {
-                        handle_response(
-                            sink.clone(),
-                            registry.clone(),
-                            peer_class.clone(),
-                            envelope,
-                            raw,
-                        )
-                        .await?
-                    }
-                    KIND_ERROR => {
-                        handle_error(
-                            sink.clone(),
-                            registry.clone(),
-                            peer_class.clone(),
-                            envelope,
-                            raw,
-                        )
-                        .await?
-                    }
-                    KIND_HEARTBEAT => {
-                        handle_heartbeat(
-                            sink.clone(),
-                            registry.clone(),
-                            peer_id.as_str(),
-                            envelope,
-                            raw,
-                        )
-                        .await?
-                    }
-                    KIND_DISCONNECT => {
-                        handle_disconnect(
-                            sink.clone(),
-                            registry.clone(),
-                            peer_id.as_str(),
-                            envelope,
-                            body_bytes,
-                        )
-                        .await?;
-                        break;
-                    }
-                    other => {
+        let peer_id = register.peer_id;
+        let peer_class = register.class;
+
+        while let Some(message) = source.next().await {
+            match message {
+                Ok(Message::Binary(bytes)) => {
+                    let raw = bytes.to_vec();
+                    let FrameParts {
+                        envelope,
+                        body_bytes,
+                    } = decode_frame(&raw)?;
+                    if envelope.from != peer_id {
                         send_peer_error(
                             sink.clone(),
                             envelope.msg_id.as_str(),
-                            "unsupported_kind",
-                            &format!("unsupported message kind: {other}"),
+                            "invalid_source",
+                            "envelope.from does not match registered peer",
                         )
                         .await?;
+                        continue;
+                    }
+
+                    match envelope.kind.as_str() {
+                        KIND_QUERY => {
+                            handle_query(
+                                sink.clone(),
+                                registry.clone(),
+                                peer_id.as_str(),
+                                envelope,
+                                body_bytes,
+                            )
+                            .await?
+                        }
+                        KIND_CALL => {
+                            handle_call(
+                                sink.clone(),
+                                registry.clone(),
+                                peer_class.clone(),
+                                envelope,
+                                raw,
+                            )
+                            .await?
+                        }
+                        KIND_RESPONSE => {
+                            handle_response(
+                                sink.clone(),
+                                registry.clone(),
+                                peer_class.clone(),
+                                envelope,
+                                raw,
+                            )
+                            .await?
+                        }
+                        KIND_ERROR => {
+                            handle_error(
+                                sink.clone(),
+                                registry.clone(),
+                                peer_class.clone(),
+                                envelope,
+                                raw,
+                            )
+                            .await?
+                        }
+                        KIND_HEARTBEAT => {
+                            handle_heartbeat(
+                                sink.clone(),
+                                registry.clone(),
+                                peer_id.as_str(),
+                                envelope,
+                                raw,
+                            )
+                            .await?
+                        }
+                        KIND_DISCONNECT => {
+                            handle_disconnect(
+                                sink.clone(),
+                                registry.clone(),
+                                peer_id.as_str(),
+                                envelope,
+                                body_bytes,
+                            )
+                            .await?;
+                            break;
+                        }
+                        other => {
+                            send_peer_error(
+                                sink.clone(),
+                                envelope.msg_id.as_str(),
+                                "unsupported_kind",
+                                &format!("unsupported message kind: {other}"),
+                            )
+                            .await?;
+                        }
                     }
                 }
-            }
-            Ok(Message::Close(_)) => break,
-            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
-            Ok(_) => {
-                send_peer_error(
-                    sink.clone(),
-                    "unknown",
-                    "non_binary_message",
-                    "router only accepts binary websocket messages",
-                )
-                .await?;
-                break;
-            }
-            Err(err) => {
-                registry.remove_by_peer_id(&peer_id).await;
-                return Err(err.into());
+                Ok(Message::Close(_)) => break,
+                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+                Ok(_) => {
+                    send_peer_error(
+                        sink.clone(),
+                        "unknown",
+                        "non_binary_message",
+                        "router only accepts binary websocket messages",
+                    )
+                    .await?;
+                    break;
+                }
+                Err(err) => return Err(err.into()),
             }
         }
+
+        Ok(())
+    }
+    .await;
+
+    if let Some(peer_id) = registered_peer_id {
+        registry.remove_by_peer_id(&peer_id).await;
     }
 
-    registry.remove_by_peer_id(&peer_id).await;
-    Ok(())
+    result
 }
 
 fn validate_register_envelope(

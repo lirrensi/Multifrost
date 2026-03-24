@@ -7,6 +7,7 @@ PURPOSE: Named v5 service example that registers as `math-service`.
 from __future__ import annotations
 
 import math
+import os
 
 from multifrost import ServiceContext, ServiceWorker, run_service_sync
 
@@ -25,4 +26,5 @@ class MathService(ServiceWorker):
 
 
 if __name__ == "__main__":
-    run_service_sync(MathService(), ServiceContext(peer_id="math-service"))
+    peer_id = os.environ.get("MULTIFROST_PEER_ID", "math-service").strip() or "math-service"
+    run_service_sync(MathService(), ServiceContext(peer_id=peer_id))
