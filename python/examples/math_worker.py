@@ -1,56 +1,39 @@
 #!/usr/bin/env python3
+"""
+FILE: python/examples/math_worker.py
+PURPOSE: Minimal v5 service example that uses the default entrypoint-based peer id.
+"""
 
-import time
-import asyncio
-import sys
-import os
+from __future__ import annotations
+
 import math
 
-sys.path.append(
-    os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python", "src"
-    )
-)
-
-from multifrost import ChildWorker
+from multifrost import ServiceContext, ServiceWorker, run_service_sync
 
 
-class MathWorker(ChildWorker):
-    def add(self, a, b):
-        """Add two numbers"""
-        result = a + b
-        print(f"Computing {a} + {b} = {result}")
-        return result
+class MathWorker(ServiceWorker):
+    def add(self, a: int, b: int) -> int:
+        return a + b
 
-    def multiply(self, a, b):
-        """Multiply two numbers"""
-        result = a * b
-        print(f"Computing {a} × {b} = {result}")
-        return result
+    def multiply(self, a: int, b: int) -> int:
+        return a * b
 
-    def factorial(self, n):
-        """Calculate factorial of n"""
+    def factorial(self, n: int) -> int:
         if n < 0:
-            raise ValueError("Factorial is not defined for negative numbers")
-        result = math.factorial(n)
-        print(f"Computing {n}! = {result}")
-        return result
+            raise ValueError("factorial is not defined for negative numbers")
+        return math.factorial(n)
 
-    async def fibonacci(self, n):
-        """Calculate nth Fibonacci number"""
+    async def fibonacci(self, n: int) -> int:
         if n <= 0:
             return 0
-        elif n == 1:
+        if n == 1:
             return 1
 
         a, b = 0, 1
         for _ in range(2, n + 1):
             a, b = b, a + b
-
-        print(f"Fibonacci({n}) = {b}")
         return b
 
 
 if __name__ == "__main__":
-    worker = MathWorker()
-    worker.run()
+    run_service_sync(MathWorker(), ServiceContext())

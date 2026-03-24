@@ -1,53 +1,7 @@
 """
-Core modules for async-first IPC implementation.
+FILE: python/src/multifrost/core/__init__.py
+PURPOSE: Keep the legacy core namespace empty while the v5 surface moves to top-level modules.
+OWNS: No public exports.
+DOCS: docs/spec.md; agent_chat/python_v5_api_surface_2026-03-25.md
 """
 
-from .message import ComlinkMessage, MessageType, APP_NAME
-from .async_worker import ParentWorker, RemoteCallError, CircuitOpenError
-from .child import ChildWorker
-from .sync_wrapper import (
-    SyncWrapper,
-    SyncProxy,
-    AsyncProxy,
-    ParentHandle,
-    ParentHandleSync,
-    SyncCallProxy,
-)
-from .metrics import Metrics, MetricsSnapshot, RequestMetrics
-from .logging import (
-    StructuredLogger,
-    LogEntry,
-    LogEvent,
-    LogLevel,
-    LogHandler,
-    default_json_handler,
-    default_pretty_handler,
-)
-
-__all__ = [
-    "ComlinkMessage",
-    "MessageType",
-    "APP_NAME",
-    "RemoteCallError",
-    "CircuitOpenError",
-    "ParentWorker",
-    "ChildWorker",
-    "SyncWrapper",
-    "SyncProxy",
-    "AsyncProxy",
-    "ParentHandle",
-    "ParentHandleSync",
-    "SyncCallProxy",
-    # Metrics
-    "Metrics",
-    "MetricsSnapshot",
-    "RequestMetrics",
-    # Logging
-    "StructuredLogger",
-    "LogEntry",
-    "LogEvent",
-    "LogLevel",
-    "LogHandler",
-    "default_json_handler",
-    "default_pretty_handler",
-]

@@ -1,154 +1,157 @@
 """
-Multifrost IPC - Inter-Process Communication Library
-
-Version 4: ROUTER/DEALER architecture with spawn/connect modes.
-
-This library provides seamless IPC between Python processes and Python-Node.js processes
-using ZeroMQ and msgpack for high-performance message passing.
-
-## Quick Start
-
-### Python Parent -> Python Child (Spawn Mode)
-```python
-from multifrost import ParentWorker, ChildWorker
-
-# Child worker implementation
-class MathWorker(ChildWorker):
-    def add(self, a, b):
-        return a + b
-
-# In child process
-if __name__ == "__main__":
-    worker = MathWorker()
-    worker.run()
-
-# In parent process
-worker = ParentWorker.spawn("math_worker.py")
-await worker.start()
-
-# Synchronous call (blocking)
-result = worker.call.add(1, 2)  # Returns 3
-
-# Asynchronous call (non-blocking)
-result = await worker.acall.add(1, 2)  # Returns 3
-
-await worker.close()
-```
-
-### Python Parent -> Python Child (Connect Mode)
-```python
-# Child (runs independently as microservice)
-from multifrost import ChildWorker
-
-class MathWorker(ChildWorker):
-    def __init__(self):
-        super().__init__(service_id="math-service")
-
-    def add(self, a, b):
-        return a + b
-
-if __name__ == "__main__":
-    MathWorker().run()
-
-# Parent (connects to running service)
-from multifrost import ParentWorker
-
-worker = await ParentWorker.connect("math-service")
-await worker.start()
-result = await worker.acall.add(1, 2)
-await worker.close()
-```
-
-### Python Parent -> Node.js Child
-```python
-worker = ParentWorker.spawn("node_worker.js", executable="node")
-await worker.start()
-
-# Synchronous call (blocking) - call property returns SyncProxy
-result = worker.call.add(1, 2)
-# Asynchronous call (non-blocking) - acall property returns AsyncProxy
-result = await worker.acall.add(1, 2)
-
-await worker.close()
-```
-
-### With Observability (Metrics & Logging)
-```python
-from multifrost import ParentWorker, default_json_handler
-
-# Enable structured logging
-worker = ParentWorker.spawn("child.py", log_handler=default_json_handler)
-await worker.start()
-
-# Make calls (automatically tracked)
-result = await worker.acall.my_function(1, 2)
-
-# Get metrics snapshot
-metrics = worker.metrics.snapshot()
-print(f"Avg latency: {metrics.latency_avg_ms}ms")
-print(f"Error rate: {metrics.requests_failed / metrics.requests_total}")
-```
-
-## Architecture
-
-The library uses ROUTER/DEALER socket pattern:
-- ChildWorker uses ROUTER socket (supports multiple parents)
-- ParentWorker uses DEALER socket
-- ServiceRegistry provides service discovery via JSON file
-
-For migration guide, see: python/REFACTOR.md
-
-## Exports
-
-- ParentWorker: Main class for creating IPC connections
-- ChildWorker: Base class for worker implementations
-- MessageType: Enum for message types
-- ComlinkMessage: Message container class
-- ServiceRegistry: Service discovery and registration
-- Metrics: Metrics collection for observability
-- StructuredLogger: Structured logging with correlation IDs
+FILE: python/src/multifrost/__init__.py
+PURPOSE: Publish the canonical v5 Python surface from the package root.
+OWNS: Top-level imports for caller helpers, service runners, protocol primitives, and error types.
+EXPORTS: connect, spawn, Connection, Handle, HandleSync, ServiceProcess, ServiceWorker, ServiceContext, run_service, run_service_sync, protocol constants, frame helpers, and v5 errors.
+DOCS: docs/spec.md; agent_chat/python_v5_api_surface_2026-03-25.md
 """
 
-from .core.async_worker import ParentWorker, RemoteCallError, CircuitOpenError
-from .core.child import ChildWorker
-from .core.message import MessageType, ComlinkMessage
-from .core.service_registry import ServiceRegistry
-from .core.sync_wrapper import ParentHandle, ParentHandleSync
-from .core.metrics import Metrics, MetricsSnapshot, RequestMetrics
-from .core.logging import (
-    StructuredLogger,
-    LogEntry,
-    LogEvent,
-    LogLevel,
-    LogHandler,
-    default_json_handler,
-    default_pretty_handler,
+from .connection import Connection, ConnectOptions, Handle, connect
+from .errors import (
+    BootstrapError,
+    ErrorOrigin,
+    MalformedFrameError,
+    MultifrostError,
+    RegistrationError,
+    RemoteCallError,
+    RouterError,
+    TransportError,
+    error_from_body,
 )
+from .frame import (
+    FrameParts,
+    decode_body,
+    decode_envelope,
+    decode_frame,
+    decode_msgpack,
+    encode_body,
+    encode_envelope,
+    encode_frame,
+    encode_msgpack,
+)
+from .process import ServiceProcess, SpawnOptions, spawn
+from .protocol import (
+    DEFAULT_ROUTER_PORT,
+    INT64_MAX,
+    INT64_MIN,
+    PROTOCOL_KEY,
+    PROTOCOL_VERSION,
+    ROUTER_BIN_ENV,
+    ROUTER_LOCK_PATH_SUFFIX,
+    ROUTER_LOG_PATH_SUFFIX,
+    ROUTER_PEER_ID,
+    ROUTER_PORT_ENV,
+    CallBody,
+    Envelope,
+    ErrorBody,
+    PeerClass,
+    QueryBody,
+    QueryExistsResponseBody,
+    QueryGetResponseBody,
+    RegisterAckBody,
+    RegisterBody,
+    ResponseBody,
+    build_call_envelope,
+    build_disconnect_envelope,
+    build_error_envelope,
+    build_heartbeat_envelope,
+    build_query_envelope,
+    build_register_envelope,
+    build_response_envelope,
+    call,
+    caller,
+    disconnect,
+    error,
+    heartbeat,
+    new_msg_id,
+    now_ts,
+    query,
+    query_peer_exists,
+    query_peer_get,
+    register,
+    register_ack,
+    response,
+    service,
+)
+from .router_bootstrap import RouterBootstrapConfig, bootstrap_router
+from .service import ServiceContext, ServiceWorker, run_service, run_service_sync
+from .sync import HandleSync
 
-__version__ = "4.0.0"
+__version__ = "5.0.0"
+
 __all__ = [
-    # Core
-    "ParentWorker",
-    "ChildWorker",
-    "MessageType",
-    "ComlinkMessage",
-    "ServiceRegistry",
-    # Handle classes (v4 API)
-    "ParentHandle",
-    "ParentHandleSync",
-    # Errors
+    "__version__",
+    "connect",
+    "spawn",
+    "Connection",
+    "Handle",
+    "HandleSync",
+    "ServiceProcess",
+    "ServiceWorker",
+    "ServiceContext",
+    "run_service",
+    "run_service_sync",
+    "ConnectOptions",
+    "SpawnOptions",
+    "RouterBootstrapConfig",
+    "bootstrap_router",
+    "PROTOCOL_KEY",
+    "PROTOCOL_VERSION",
+    "DEFAULT_ROUTER_PORT",
+    "ROUTER_BIN_ENV",
+    "ROUTER_LOG_PATH_SUFFIX",
+    "ROUTER_LOCK_PATH_SUFFIX",
+    "ROUTER_PEER_ID",
+    "ROUTER_PORT_ENV",
+    "service",
+    "caller",
+    "register",
+    "register_ack",
+    "query",
+    "query_peer_exists",
+    "query_peer_get",
+    "call",
+    "response",
+    "error",
+    "heartbeat",
+    "disconnect",
+    "INT64_MIN",
+    "INT64_MAX",
+    "PeerClass",
+    "Envelope",
+    "RegisterBody",
+    "RegisterAckBody",
+    "QueryBody",
+    "QueryExistsResponseBody",
+    "QueryGetResponseBody",
+    "CallBody",
+    "ResponseBody",
+    "ErrorBody",
+    "FrameParts",
+    "encode_msgpack",
+    "decode_msgpack",
+    "encode_envelope",
+    "decode_envelope",
+    "encode_body",
+    "decode_body",
+    "encode_frame",
+    "decode_frame",
+    "MultifrostError",
+    "TransportError",
+    "MalformedFrameError",
+    "BootstrapError",
+    "RegistrationError",
+    "RouterError",
     "RemoteCallError",
-    "CircuitOpenError",
-    # Metrics
-    "Metrics",
-    "MetricsSnapshot",
-    "RequestMetrics",
-    # Logging
-    "StructuredLogger",
-    "LogEntry",
-    "LogEvent",
-    "LogLevel",
-    "LogHandler",
-    "default_json_handler",
-    "default_pretty_handler",
+    "ErrorOrigin",
+    "error_from_body",
+    "now_ts",
+    "new_msg_id",
+    "build_register_envelope",
+    "build_query_envelope",
+    "build_call_envelope",
+    "build_response_envelope",
+    "build_error_envelope",
+    "build_disconnect_envelope",
+    "build_heartbeat_envelope",
 ]

@@ -1,33 +1,27 @@
-import time
+#!/usr/bin/env python3
+"""
+FILE: python/examples/concurrency_worker.py
+PURPOSE: Service used by the concurrent async caller example.
+"""
+
+from __future__ import annotations
+
 import asyncio
-import sys
-import os
 
-sys.path.append(
-    os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python", "src"
-    )
-)
-
-from multifrost import ChildWorker
+from multifrost import ServiceContext, ServiceWorker, run_service_sync
 
 
-class SimpleWorker(ChildWorker):
-    def slow_task(self, duration, task_id):
-        print(f"[CHILD] Starting task {task_id} for {duration}s")
-        time.sleep(duration)
-        result = f"Task {task_id} done after {duration}s"
-        print(f"[CHILD] Finished task {task_id}")
-        return result
+class ConcurrencyService(ServiceWorker):
+    def slow_task(self, duration: float, task_id: str) -> str:
+        return f"{task_id} ran for {duration:.1f}s"
 
-    async def async_task(self, duration, task_id):
-        print(f"[CHILD] Starting async task {task_id} for {duration}s")
+    async def async_task(self, duration: float, task_id: str) -> str:
         await asyncio.sleep(duration)
-        result = f"Async task {task_id} done after {duration}s"
-        print(f"[CHILD] Finished async task {task_id}")
-        return result
+        return f"{task_id} ran for {duration:.1f}s"
 
 
 if __name__ == "__main__":
-    worker = SimpleWorker()
-    worker.run()
+    run_service_sync(
+        ConcurrencyService(),
+        ServiceContext(peer_id="concurrency-service"),
+    )
