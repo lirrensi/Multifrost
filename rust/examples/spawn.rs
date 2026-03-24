@@ -1,6 +1,6 @@
 //! Spawn example - starts a service peer and talks to it through the router.
 
-use multifrost::{call, ParentWorker};
+use multifrost::{call, connect, spawn};
 use std::env;
 
 #[tokio::main]
@@ -15,12 +15,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join("examples")
         .join(format!("math_worker{}", std::env::consts::EXE_SUFFIX));
 
-    let worker = ParentWorker::spawn(
+    let service_process = spawn(
         worker_path.to_str().expect("worker path to be valid utf-8"),
         worker_path.to_str().expect("worker path to be valid utf-8"),
     )
     .await?;
-    let handle = worker.handle();
+    let connection = connect(
+        worker_path.to_str().expect("worker path to be valid utf-8"),
+        10_000,
+    )
+    .await?
+    .with_service_process(service_process);
+    let handle = connection.handle();
+    handle.start().await?;
     println!("Worker started!\n");
 
     println!("Calling remote functions...\n");

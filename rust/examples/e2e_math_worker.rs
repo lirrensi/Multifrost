@@ -1,14 +1,14 @@
 //! E2E test worker for the v5 router flow.
 
 use async_trait::async_trait;
-use multifrost::{run_worker, ChildWorker, ChildWorkerContext, MultifrostError, Result};
+use multifrost::{run_service, MultifrostError, Result, ServiceContext, ServiceWorker};
 use serde_json::Value;
 use std::env;
 
 struct MathWorker;
 
 #[async_trait]
-impl ChildWorker for MathWorker {
+impl ServiceWorker for MathWorker {
     async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value> {
         match function {
             "add" => {
@@ -92,10 +92,10 @@ async fn main() {
     let args: Vec<String> = env::args().collect();
 
     let ctx = if args.contains(&"--service".to_string()) {
-        ChildWorkerContext::new().with_service_id("math-service")
+        ServiceContext::new().with_service_id("math-service")
     } else {
-        ChildWorkerContext::new()
+        ServiceContext::new()
     };
 
-    run_worker(MathWorker, ctx).await;
+    run_service(MathWorker, ctx).await;
 }

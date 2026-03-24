@@ -1,6 +1,6 @@
 //! Connect example - connects to an existing v5 service peer.
 
-use multifrost::{call, ParentWorker};
+use multifrost::{call, connect};
 use std::env;
 
 fn flag_value(args: &[String], flag: &str) -> Option<String> {
@@ -19,18 +19,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(10_000);
 
     println!("Connecting to {target}...");
-    let worker = ParentWorker::connect(&target, timeout_ms).await?;
+    let connection = connect(&target, timeout_ms).await?;
     println!(
         "Connected as {} to default target {}\n",
-        worker.peer_id(),
+        connection.peer_id(),
         target
     );
+    let handle = connection.handle();
+    handle.start().await?;
     println!(
         "Router registry sees {target}: {}\n",
-        worker.query_peer_exists(&target).await?
+        handle.query_peer_exists(&target).await?
     );
-
-    let handle = worker.handle();
 
     println!("Calling remote functions...\n");
 

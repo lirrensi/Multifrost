@@ -1,3 +1,9 @@
+//! FILE: rust/src/lib.rs
+//! PURPOSE: Define the crate root public API and re-export the canonical v5 surface.
+//! OWNS: Root re-exports, crate documentation examples, version constant.
+//! EXPORTS: connect, spawn, Connection, Handle, ServiceProcess, ServiceWorker, ServiceContext, run_service, run_service_sync.
+//! DOCS: agent_chat/rust_v5_api_surface_2026-03-24.md
+//!
 //! Multifrost is a router-based IPC library for Rust.
 //!
 //! Service peers expose methods under a stable `peer_id`.
@@ -6,14 +12,16 @@
 //! # Caller Example
 //!
 //! ```rust,no_run
-//! use multifrost::{call, ParentWorker};
+//! use multifrost::{call, connect};
 //!
 //! # #[tokio::main]
 //! # async fn main() -> multifrost::Result<()> {
-//! let worker = ParentWorker::connect("math-service", 5_000).await?;
-//! let handle = worker.handle();
+//! let connection = connect("math-service", 5_000).await?;
+//! let handle = connection.handle();
+//! handle.start().await?;
 //! let sum: i64 = call!(handle, add(10, 20)).await?;
 //! assert_eq!(sum, 30);
+//! handle.stop().await;
 //! # Ok(())
 //! # }
 //! ```
@@ -22,13 +30,13 @@
 //!
 //! ```rust,no_run
 //! use async_trait::async_trait;
-//! use multifrost::{ChildWorker, ChildWorkerContext, MultifrostError, Result, run_worker};
+//! use multifrost::{run_service, MultifrostError, Result, ServiceContext, ServiceWorker};
 //! use serde_json::Value;
 //!
 //! struct MathWorker;
 //!
 //! #[async_trait]
-//! impl ChildWorker for MathWorker {
+//! impl ServiceWorker for MathWorker {
 //!     async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value> {
 //!         match function {
 //!             "add" => {
@@ -44,7 +52,7 @@
 //!
 //! # #[tokio::main]
 //! # async fn main() {
-//! run_worker(MathWorker, ChildWorkerContext::new().with_service_id("math-service")).await;
+//! run_service(MathWorker, ServiceContext::new().with_service_id("math-service")).await;
 //! # }
 //! ```
 
@@ -56,10 +64,11 @@ mod logging;
 mod message;
 mod metrics;
 mod parent;
+mod process;
 mod router_bootstrap;
 
 pub use call_macro::{ArgsExtractor, CallArgs, ErgonomicCall, ExtractArgs, ToJsonArg};
-pub use child::{run_worker, run_worker_sync, ChildWorker, ChildWorkerContext, SyncChildWorker};
+pub use child::{run_service, run_service_sync, ServiceContext, ServiceWorker, SyncServiceWorker};
 pub use error::{MultifrostError, Result};
 pub use logging::{
     default_json_handler, default_pretty_handler, LogEntry, LogEvent, LogHandler, LogLevel,
@@ -70,6 +79,7 @@ pub use message::{
     QueryGetResponseBody, RegisterAckBody, RegisterBody, ResponseBody, WireValue,
 };
 pub use metrics::{Metrics, MetricsSnapshot, RequestMetrics};
-pub use parent::{ConnectOptions, Handle, ParentWorker, ParentWorkerBuilder, SpawnOptions};
+pub use parent::{connect, ConnectOptions, Connection, Handle};
+pub use process::{spawn, ServiceProcess, SpawnOptions};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

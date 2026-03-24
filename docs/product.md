@@ -21,8 +21,8 @@ Both connect to the same router. The router is the shared space. Callers do not
 need a direct relationship with services, and services do not need to know who
 started them.
 
-The developer experience should still feel familiar: connect, call a method,
-get a result, handle an error.
+The developer experience should still feel familiar: connect or spawn, create a
+handle, start it, call a method, get a result, handle an error.
 
 ## Core Capabilities
 
@@ -166,6 +166,29 @@ does not gain special lifecycle authority over it.
 - Use WebSocket connection state as the primary health signal
 - Keep process management helpers outside the core network model
 - Let one process host many independent peer instances
+
+## Library Style
+
+The intended v5 library feel is still configuration-first and handle-driven,
+because that pattern stays readable across languages.
+
+The canonical caller-side shape is:
+
+- create a connection descriptor for a target service peer,
+- optionally use `spawn` as a separate process-start helper,
+- derive a runtime handle from the connection,
+- call `start()` on the handle,
+- use `handle.call.<function>(...)` as the main remote-call surface,
+- stop or drop the handle when finished.
+
+The canonical service-side shape is:
+
+- define a service implementation,
+- provide a service context with explicit or default `peer_id`,
+- run the service so it eagerly connects to the router and waits for calls.
+
+Primary v5 library naming should avoid `parent` and `child` terminology. Those
+names may remain only as temporary compatibility aliases during migration.
 
 ## Non-Goals
 

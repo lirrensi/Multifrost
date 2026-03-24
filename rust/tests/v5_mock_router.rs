@@ -5,7 +5,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use multifrost::{
-    call, CallBody, ConnectOptions, Envelope, ErrorBody, FrameParts, MultifrostError, ParentWorker,
+    call, CallBody, ConnectOptions, Connection, Envelope, ErrorBody, FrameParts, MultifrostError,
     PeerClass, QueryBody, QueryExistsResponseBody, QueryGetResponseBody, RegisterAckBody,
     RegisterBody, ResponseBody,
 };
@@ -318,9 +318,9 @@ fn decode_body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
 }
 
 #[tokio::test]
-async fn parent_connect_call_query_and_disconnect_against_mock_router() {
+async fn connection_connect_call_query_and_disconnect_against_mock_router() {
     let (port, handle, disconnect_rx) = start_caller_success_router().await;
-    let worker = ParentWorker::connect_with_options(
+    let connection = Connection::connect_with_options(
         "math-service",
         ConnectOptions {
             caller_peer_id: Some("caller-1".into()),
@@ -330,7 +330,7 @@ async fn parent_connect_call_query_and_disconnect_against_mock_router() {
     )
     .await
     .unwrap();
-    let handle_ref = worker.handle();
+    let handle_ref = connection.handle();
 
     let sum: i64 = call!(handle_ref, add(10, 20)).await.unwrap();
     assert_eq!(sum, 30);
@@ -351,9 +351,9 @@ async fn parent_connect_call_query_and_disconnect_against_mock_router() {
 }
 
 #[tokio::test]
-async fn parent_connect_surfaces_register_rejection() {
+async fn connection_connect_surfaces_register_rejection() {
     let (port, handle) = start_caller_reject_router().await;
-    let result = ParentWorker::connect_with_options(
+    let result = Connection::connect_with_options(
         "math-service",
         ConnectOptions {
             caller_peer_id: Some("caller-reject".into()),
@@ -371,9 +371,9 @@ async fn parent_connect_surfaces_register_rejection() {
 }
 
 #[tokio::test]
-async fn parent_connect_surfaces_remote_call_error() {
+async fn connection_connect_surfaces_remote_call_error() {
     let (port, handle, disconnect_rx) = start_caller_error_router().await;
-    let worker = ParentWorker::connect_with_options(
+    let connection = Connection::connect_with_options(
         "math-service",
         ConnectOptions {
             caller_peer_id: Some("caller-error".into()),
@@ -383,7 +383,7 @@ async fn parent_connect_surfaces_remote_call_error() {
     )
     .await
     .unwrap();
-    let handle_ref = worker.handle();
+    let handle_ref = connection.handle();
 
     let err = handle_ref
         .call_to::<i64>("math-service", "explode", vec![])

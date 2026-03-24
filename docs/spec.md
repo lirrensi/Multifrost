@@ -47,7 +47,8 @@ This specification does not define:
 - application-level authorization policy,
 - router-side load balancing,
 - process supervision policy outside peer bootstrap behavior,
-- the exact public API surface of every language binding.
+- the exact public API spelling of every language binding beyond the shared v5
+  library pattern defined here.
 
 ## Terminology
 
@@ -233,6 +234,38 @@ A conforming caller peer implementation MUST:
 Implementations MAY provide process startup helpers such as `spawn`, but such
 helpers are outside core conformance. A helper MUST NOT redefine the network
 roles specified here.
+
+### Canonical Library Pattern
+
+This specification does not require one exact class or function name in every
+language, but conforming language libraries SHOULD expose the same broad v5
+usage pattern.
+
+Caller-side libraries SHOULD separate configuration from live runtime use:
+
+1. create a connection descriptor for a target service peer,
+2. optionally start a service process through a separate `spawn` helper,
+3. derive a runtime handle from the connection,
+4. call `start()` on that handle,
+5. issue remote calls through `handle.call.<function>(...)`,
+6. stop or drop the handle when done.
+
+Additional rules:
+
+- `spawn` MUST remain operational helper behavior rather than a replacement for
+  router-based connect/register flow
+- libraries MAY provide a synchronous handle variant in ecosystems where that is
+  natural, but async handle flow is the primary model
+- primary v5 public naming SHOULD use service/caller/connect/handle terminology
+  rather than parent/child terminology
+- parent/child naming MAY exist only as compatibility aliases during migration
+
+Service-side libraries SHOULD expose a small runner-oriented surface:
+
+- a service implementation type or value,
+- a service context that carries explicit or default `peer_id`,
+- a runner function or method that starts the service peer and registers it with
+  the router.
 
 ## Behavioral Specification
 

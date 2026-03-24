@@ -56,7 +56,7 @@ pub struct MetricsSnapshot {
     pub timestamp: f64,
 }
 
-/// Thread-safe metrics collector for ParentWorker.
+/// Thread-safe metrics collector for Connection.
 ///
 /// # Example
 ///

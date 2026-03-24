@@ -73,6 +73,29 @@ topology.
 service peer: it resolves its `peer_id`, connects to the router, registers, and
 waits for calls.
 
+### Shared Library Surface
+
+Across languages, the intended house style is configuration-first and
+handle-driven.
+
+The shared caller-side pattern is:
+
+- create a connection descriptor for the target service peer,
+- optionally start a service process through a separate `spawn` helper,
+- derive a runtime handle from the connection,
+- call `start()` on that handle,
+- use `handle.call.<function>(...)` for remote method calls.
+
+The shared service-side pattern is:
+
+- define a service implementation,
+- create a service context with explicit or default `peer_id`,
+- run the service so it joins the router and waits for inbound calls.
+
+Exact names may differ by language, but primary v5 naming should center on
+service, caller, connect, handle, and run-service concepts. `parent` and
+`child` naming is legacy vocabulary and should not be the primary v5 style.
+
 ## Shared Data Models
 
 ### Peer Identity

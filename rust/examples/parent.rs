@@ -3,14 +3,15 @@
 //! First run: cargo run --example math_worker
 //! Then run: cargo run --example parent
 
-use multifrost::{MultifrostError, ParentWorker};
+use multifrost::{connect, MultifrostError};
 
 #[tokio::main]
 async fn main() -> Result<(), MultifrostError> {
     // Connect to running service (run math_worker first)
     println!("Connecting to math-service...");
-    let worker = ParentWorker::connect("math-service", 5000).await?;
-    let handle = worker.handle();
+    let connection = connect("math-service", 5000).await?;
+    let handle = connection.handle();
+    handle.start().await?;
 
     println!("Calling remote functions...\n");
 

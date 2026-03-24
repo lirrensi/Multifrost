@@ -1,14 +1,16 @@
 //! Ergonomic call helpers for the v5 router API.
 //!
 //! ```rust,no_run
-//! use multifrost::{call, ParentWorker};
+//! use multifrost::{call, connect};
 //!
 //! # #[tokio::main]
 //! # async fn main() -> multifrost::Result<()> {
-//! let worker = ParentWorker::connect("math-service", 5_000).await?;
-//! let handle = worker.handle();
+//! let connection = connect("math-service", 5_000).await?;
+//! let handle = connection.handle();
+//! handle.start().await?;
 //! let result: i64 = call!(handle, add(10, 20)).await?;
 //! assert_eq!(result, 30);
+//! handle.stop().await;
 //! # Ok(())
 //! # }
 //! ```
@@ -218,14 +220,16 @@ impl<T: Serialize + Clone> ToJsonArg for &[T] {
 /// Macro to create a typed remote call.
 ///
 /// ```rust,no_run
-/// use multifrost::{call, ParentWorker};
+/// use multifrost::{call, connect};
 ///
 /// # #[tokio::main]
 /// # async fn main() -> multifrost::Result<()> {
-/// let worker = ParentWorker::connect("math-service", 5_000).await?;
-/// let handle = worker.handle();
+/// let connection = connect("math-service", 5_000).await?;
+/// let handle = connection.handle();
+/// handle.start().await?;
 /// let sum: i64 = call!(handle, add(10, 20)).await?;
 /// assert_eq!(sum, 30);
+/// handle.stop().await;
 /// # Ok(())
 /// # }
 /// ```
@@ -242,14 +246,16 @@ macro_rules! call {
 /// Macro to create a typed remote call with explicit return type.
 ///
 /// ```rust,no_run
-/// use multifrost::{call_with_type, ParentWorker};
+/// use multifrost::{call_with_type, connect};
 ///
 /// # #[tokio::main]
 /// # async fn main() -> multifrost::Result<()> {
-/// let worker = ParentWorker::connect("math-service", 5_000).await?;
-/// let handle = worker.handle();
+/// let connection = connect("math-service", 5_000).await?;
+/// let handle = connection.handle();
+/// handle.start().await?;
 /// let result: i64 = call_with_type!(handle, add, (10, 20), i64).await?;
 /// assert_eq!(result, 30);
+/// handle.stop().await;
 /// # Ok(())
 /// # }
 /// ```
@@ -269,7 +275,7 @@ pub trait ErgonomicCall {
         A: CallArgs;
 }
 
-impl<'a> ErgonomicCall for &'a crate::parent::Handle {
+impl<'a> ErgonomicCall for &'a crate::Handle {
     fn call_fn<R, A>(&self, name: &str, args: A) -> impl Future<Output = Result<R>>
     where
         R: serde::de::DeserializeOwned,

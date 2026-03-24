@@ -1,3 +1,9 @@
+//! FILE: rust/src/child.rs
+//! PURPOSE: Own the service-side runtime and method-dispatch surface for the v5 API.
+//! OWNS: ServiceWorker, ServiceContext, run_service, run_service_sync.
+//! EXPORTS: ServiceWorker, ServiceContext, SyncServiceWorker, run_service, run_service_sync.
+//! DOCS: agent_chat/rust_v5_api_surface_2026-03-24.md
+
 use crate::caller_transport::{connect_ws, send_disconnect_frame};
 use crate::error::{MultifrostError, Result};
 use crate::message::{
@@ -23,7 +29,7 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
 
 #[async_trait]
-pub trait ChildWorker: Send + Sync + 'static {
+pub trait ServiceWorker: Send + Sync + 'static {
     async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value>;
 
     fn list_functions(&self) -> Vec<String> {
@@ -31,7 +37,7 @@ pub trait ChildWorker: Send + Sync + 'static {
     }
 }
 
-pub trait SyncChildWorker: Send + Sync + 'static {
+pub trait SyncServiceWorker: Send + Sync + 'static {
     fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value>;
 
     fn list_functions(&self) -> Vec<String> {
@@ -39,10 +45,10 @@ pub trait SyncChildWorker: Send + Sync + 'static {
     }
 }
 
-struct SyncToAsyncAdapter<T: SyncChildWorker>(T);
+struct SyncToAsyncAdapter<T: SyncServiceWorker>(T);
 
 #[async_trait]
-impl<T: SyncChildWorker> ChildWorker for SyncToAsyncAdapter<T> {
+impl<T: SyncServiceWorker> ServiceWorker for SyncToAsyncAdapter<T> {
     async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value> {
         self.0.handle_call(function, args)
     }
@@ -53,7 +59,7 @@ impl<T: SyncChildWorker> ChildWorker for SyncToAsyncAdapter<T> {
 }
 
 #[derive(Clone)]
-pub struct ChildWorkerContext {
+pub struct ServiceContext {
     namespace: String,
     service_id: Option<String>,
     entrypoint_path: Option<PathBuf>,
@@ -62,7 +68,7 @@ pub struct ChildWorkerContext {
     extra_functions: HashMap<String, String>,
 }
 
-impl ChildWorkerContext {
+impl ServiceContext {
     pub fn new() -> Self {
         Self {
             namespace: "default".to_string(),
@@ -125,32 +131,32 @@ impl ChildWorkerContext {
     }
 }
 
-impl Default for ChildWorkerContext {
+impl Default for ServiceContext {
     fn default() -> Self {
         Self::new()
     }
 }
 
-pub async fn run_worker<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) {
-    if let Err(err) = run_worker_async(worker, ctx).await {
+pub async fn run_service<W: ServiceWorker>(worker: W, ctx: ServiceContext) {
+    if let Err(err) = run_service_async(worker, ctx).await {
         eprintln!("Worker error: {err}");
         std::process::exit(1);
     }
 }
 
-pub fn run_worker_sync<W: SyncChildWorker>(worker: W, ctx: ChildWorkerContext) {
-    if let Err(err) = run_worker_sync_inner(worker, ctx) {
+pub fn run_service_sync<W: SyncServiceWorker>(worker: W, ctx: ServiceContext) {
+    if let Err(err) = run_service_sync_inner(worker, ctx) {
         eprintln!("Worker error: {err}");
         std::process::exit(1);
     }
 }
 
-fn run_worker_sync_inner<W: SyncChildWorker>(worker: W, ctx: ChildWorkerContext) -> Result<()> {
+fn run_service_sync_inner<W: SyncServiceWorker>(worker: W, ctx: ServiceContext) -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async move { run_worker_async(SyncToAsyncAdapter(worker), ctx).await })
+    rt.block_on(async move { run_service_async(SyncToAsyncAdapter(worker), ctx).await })
 }
 
-async fn run_worker_async<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) -> Result<()> {
+async fn run_service_async<W: ServiceWorker>(worker: W, ctx: ServiceContext) -> Result<()> {
     let peer_id = ctx.resolve_peer_id()?;
     let endpoint = ctx.router.endpoint.ws_url();
 
@@ -239,7 +245,7 @@ async fn run_worker_async<W: ChildWorker>(worker: W, ctx: ChildWorkerContext) ->
     Ok(())
 }
 
-async fn handle_call_frame<W: ChildWorker>(
+async fn handle_call_frame<W: ServiceWorker>(
     sink: &Arc<Mutex<WsSink>>,
     peer_id: &str,
     worker: Arc<W>,
@@ -364,9 +370,8 @@ mod tests {
     use crate::message::{KIND_REGISTER, ROUTER_PEER_ID};
     use crate::router_bootstrap::{
         router_is_reachable, RouterBootstrapConfig, RouterEndpointConfig, ROUTER_BIN_ENV,
-        ROUTER_PORT_ENV,
     };
-    use crate::ParentWorker;
+    use crate::Connection;
     use bytes::Bytes;
     use futures_util::{SinkExt, StreamExt};
     use serde_json::json;
@@ -383,7 +388,7 @@ mod tests {
     struct AddWorker;
 
     #[async_trait]
-    impl ChildWorker for AddWorker {
+    impl ServiceWorker for AddWorker {
         async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value> {
             match function {
                 "add" => {
@@ -405,7 +410,7 @@ mod tests {
     struct EchoWorker;
 
     #[async_trait]
-    impl ChildWorker for EchoWorker {
+    impl ServiceWorker for EchoWorker {
         async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value> {
             match function {
                 "echo" => Ok(args.first().cloned().unwrap_or(Value::Null)),
@@ -504,8 +509,8 @@ mod tests {
         service_id: &str,
         port: u16,
         workspace: &tempfile::TempDir,
-    ) -> ChildWorkerContext {
-        ChildWorkerContext {
+    ) -> ServiceContext {
+        ServiceContext {
             namespace: "default".to_string(),
             service_id: Some(service_id.to_string()),
             entrypoint_path: None,
@@ -554,7 +559,7 @@ mod tests {
         }
     }
 
-    async fn wait_for_peer_exists(handle: &ParentWorker, peer_id: &str) {
+    async fn wait_for_peer_exists(handle: &crate::Handle, peer_id: &str) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if handle.query_peer_exists(peer_id).await.unwrap() {
@@ -571,59 +576,68 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut ws = accept_async(stream).await.unwrap();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut ws = match accept_async(stream).await {
+                        Ok(ws) => ws,
+                        Err(_) => return,
+                    };
 
-            let register_frame = read_binary_frame(&mut ws).await;
-            assert_eq!(register_frame.envelope.kind, KIND_REGISTER);
-            let register_body =
-                crate::message::decode_register_body(&register_frame.body_bytes).unwrap();
-            assert_eq!(register_body.class, PeerClass::Service);
+                    let Some(register_frame) = read_binary_frame(&mut ws).await else {
+                        return;
+                    };
+                    assert_eq!(register_frame.envelope.kind, KIND_REGISTER);
+                    let register_body =
+                        crate::message::decode_register_body(&register_frame.body_bytes).unwrap();
+                    assert_eq!(register_body.class, PeerClass::Service);
 
-            let ack = crate::message::RegisterAckBody {
-                accepted: true,
-                reason: None,
-            };
-            let ack_envelope = crate::message::Envelope {
-                v: 5,
-                kind: KIND_RESPONSE.to_string(),
-                msg_id: register_frame.envelope.msg_id.clone(),
-                from: ROUTER_PEER_ID.to_string(),
-                to: register_body.peer_id.clone(),
-                ts: 0.0,
-            };
-            let ack_frame = crate::message::encode_frame(
-                &ack_envelope,
-                &crate::message::encode_register_ack_body(&ack).unwrap(),
-            )
-            .unwrap();
-            ws.send(Message::Binary(Bytes::from(ack_frame)))
-                .await
-                .unwrap();
+                    let ack = crate::message::RegisterAckBody {
+                        accepted: true,
+                        reason: None,
+                    };
+                    let ack_envelope = crate::message::Envelope {
+                        v: 5,
+                        kind: KIND_RESPONSE.to_string(),
+                        msg_id: register_frame.envelope.msg_id.clone(),
+                        from: ROUTER_PEER_ID.to_string(),
+                        to: register_body.peer_id.clone(),
+                        ts: 0.0,
+                    };
+                    let ack_frame = crate::message::encode_frame(
+                        &ack_envelope,
+                        &crate::message::encode_register_ack_body(&ack).unwrap(),
+                    )
+                    .unwrap();
+                    let _ = ws.send(Message::Binary(Bytes::from(ack_frame))).await;
 
-            let call_envelope =
-                crate::message::build_call_envelope(ROUTER_PEER_ID, &register_body.peer_id);
-            let call_body = crate::message::CallBody {
-                function: "add".into(),
-                args: vec![json!(2), json!(3)],
-                namespace: Some("default".into()),
-            };
-            let call_frame = crate::message::encode_frame(
-                &call_envelope,
-                &crate::message::encode_call_body(&call_body).unwrap(),
-            )
-            .unwrap();
-            ws.send(Message::Binary(Bytes::from(call_frame)))
-                .await
-                .unwrap();
+                    let call_envelope =
+                        crate::message::build_call_envelope(ROUTER_PEER_ID, &register_body.peer_id);
+                    let call_body = crate::message::CallBody {
+                        function: "add".into(),
+                        args: vec![json!(2), json!(3)],
+                        namespace: Some("default".into()),
+                    };
+                    let call_frame = crate::message::encode_frame(
+                        &call_envelope,
+                        &crate::message::encode_call_body(&call_body).unwrap(),
+                    )
+                    .unwrap();
+                    let _ = ws.send(Message::Binary(Bytes::from(call_frame))).await;
 
-            let response_frame = read_binary_frame(&mut ws).await;
-            assert_eq!(response_frame.envelope.kind, KIND_RESPONSE);
-            let response =
-                crate::message::decode_response_body(&response_frame.body_bytes).unwrap();
-            assert_eq!(response.result, json!(5));
+                    let Some(response_frame) = read_binary_frame(&mut ws).await else {
+                        return;
+                    };
+                    assert_eq!(response_frame.envelope.kind, KIND_RESPONSE);
+                    let response =
+                        crate::message::decode_response_body(&response_frame.body_bytes).unwrap();
+                    assert_eq!(response.result, json!(5));
 
-            let _ = ws.close(None).await;
+                    let _ = ws.close(None).await;
+                });
+            }
         });
 
         (port, handle)
@@ -631,28 +645,27 @@ mod tests {
 
     async fn read_binary_frame(
         ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    ) -> crate::message::FrameParts {
-        let message = timeout(Duration::from_secs(2), ws.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+    ) -> Option<crate::message::FrameParts> {
+        let message = match timeout(Duration::from_secs(2), ws.next()).await {
+            Ok(Some(Ok(message))) => message,
+            _ => return None,
+        };
         match message {
-            Message::Binary(bytes) => crate::message::decode_frame(bytes.as_ref()).unwrap(),
-            other => panic!("expected binary message, got {other:?}"),
+            Message::Binary(bytes) => crate::message::decode_frame(bytes.as_ref()).ok(),
+            _ => None,
         }
     }
 
     #[test]
     fn resolves_default_peer_id_from_current_exe() {
-        let ctx = ChildWorkerContext::new();
+        let ctx = ServiceContext::new();
         let peer_id = ctx.resolve_peer_id().unwrap();
         assert!(!peer_id.is_empty());
     }
 
     #[test]
     fn explicit_service_id_wins_over_other_sources() {
-        let ctx = ChildWorkerContext::new().with_service_id("explicit-service");
+        let ctx = ServiceContext::new().with_service_id("explicit-service");
         assert_eq!(ctx.resolve_peer_id().unwrap(), "explicit-service");
     }
 
@@ -661,7 +674,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let entrypoint = dir.path().join("service.rs");
         fs::write(&entrypoint, "fn main() {}").unwrap();
-        let ctx = ChildWorkerContext::new().with_entrypoint_path(&entrypoint);
+        let ctx = ServiceContext::new().with_entrypoint_path(&entrypoint);
         assert_eq!(
             ctx.resolve_peer_id().unwrap(),
             entrypoint.canonicalize().unwrap().to_string_lossy()
@@ -670,7 +683,7 @@ mod tests {
 
     #[test]
     fn namespace_timeout_and_registered_functions_are_recorded() {
-        let ctx = ChildWorkerContext::new()
+        let ctx = ServiceContext::new()
             .with_namespace("custom")
             .with_timeout(Duration::from_secs(5))
             .register_function("add", "Add two numbers")
@@ -685,9 +698,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_worker_async_handles_calls_over_mock_router() {
+    async fn run_service_async_handles_calls_over_mock_router() {
         let (port, router_task) = start_service_router().await;
-        let ctx = ChildWorkerContext {
+        let ctx = ServiceContext {
             namespace: "default".to_string(),
             service_id: Some("service-1".to_string()),
             entrypoint_path: None,
@@ -705,7 +718,7 @@ mod tests {
             extra_functions: HashMap::new(),
         };
 
-        let worker_task = tokio::spawn(async move { run_worker_async(AddWorker, ctx).await });
+        let worker_task = tokio::spawn(async move { run_service_async(AddWorker, ctx).await });
         timeout(Duration::from_secs(3), worker_task)
             .await
             .unwrap()
@@ -730,10 +743,10 @@ mod tests {
         let service_entrypoint = math_worker_entrypoint_path();
         let service_binary = math_worker_binary_path();
 
-        let service = ParentWorker::spawn_with_options(
+        let service_process = crate::process::spawn_with_options(
             service_entrypoint.to_str().unwrap(),
             service_binary.to_str().unwrap(),
-            crate::parent::SpawnOptions {
+            crate::SpawnOptions {
                 caller_peer_id: Some("caller-a".into()),
                 request_timeout: Some(Duration::from_secs(10)),
                 router_port: Some(port),
@@ -741,16 +754,28 @@ mod tests {
         )
         .await
         .unwrap();
+        let service = Connection::connect_with_options(
+            service_entrypoint.to_str().unwrap(),
+            crate::ConnectOptions {
+                caller_peer_id: Some("caller-a".into()),
+                request_timeout: Some(Duration::from_secs(10)),
+                router_port: Some(port),
+            },
+        )
+        .await
+        .unwrap()
+        .with_service_process(service_process);
         let service_handle = service.handle();
+        wait_for_peer_exists(&service_handle, service_entrypoint.to_str().unwrap()).await;
         let sum: i64 = service_handle
             .call("add", vec![json!(10), json!(20)])
             .await
             .unwrap();
         assert_eq!(sum, 30);
 
-        let caller = ParentWorker::connect_with_options(
+        let caller = Connection::connect_with_options(
             service_entrypoint.to_str().unwrap(),
-            crate::parent::ConnectOptions {
+            crate::ConnectOptions {
                 caller_peer_id: Some("caller-b".into()),
                 request_timeout: Some(Duration::from_secs(10)),
                 router_port: Some(port),

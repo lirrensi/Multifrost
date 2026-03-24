@@ -5,7 +5,7 @@
 //! Named service mode:              cargo run --example math_worker -- --service-id math-service-a
 
 use async_trait::async_trait;
-use multifrost::{run_worker, ChildWorker, ChildWorkerContext, MultifrostError, Result};
+use multifrost::{run_service, MultifrostError, Result, ServiceContext, ServiceWorker};
 use serde_json::Value;
 use std::env;
 
@@ -14,7 +14,7 @@ struct MathWorker {
 }
 
 #[async_trait]
-impl ChildWorker for MathWorker {
+impl ServiceWorker for MathWorker {
     async fn handle_call(&self, function: &str, args: Vec<Value>) -> Result<Value> {
         println!("[{}] handling {}", self.label, function);
         match function {
@@ -96,11 +96,11 @@ async fn main() {
         .unwrap_or_else(|| "spawn-mode".to_string());
     let ctx = if let Some(service_id) = service_id {
         println!("Math worker starting in service mode as {service_id}");
-        ChildWorkerContext::new().with_service_id(&service_id)
+        ServiceContext::new().with_service_id(&service_id)
     } else {
         println!("Math worker starting in spawn mode");
-        ChildWorkerContext::new()
+        ServiceContext::new()
     };
 
-    run_worker(MathWorker { label }, ctx).await;
+    run_service(MathWorker { label }, ctx).await;
 }
