@@ -211,6 +211,12 @@ export class Handle {
         if (!details.exists) {
             throw new RouterError(`target peer '${this.connection.targetPeerId}' does not exist`);
         }
+        if (!details.connected) {
+            throw new RouterError(`target peer '${this.connection.targetPeerId}' is not connected`);
+        }
+        if (details.class !== service) {
+            throw new RouterError(`target peer '${this.connection.targetPeerId}' is not a service`);
+        }
     }
 
     private async callRemote(functionName: string, args: unknown[]): Promise<unknown> {

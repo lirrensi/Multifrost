@@ -114,17 +114,25 @@ func (h *Handle) Start(ctx context.Context) error {
 			validateCtx, validateCancel = contextWithTimeoutIfNeeded(ctx, options.RequestTimeout)
 			defer validateCancel()
 		}
-		exists, err := transport.queryExists(validateCtx, target)
+		details, err := transport.queryGet(validateCtx, target)
 		if err != nil {
 			transport.closeWithError(nil)
 			return err
 		}
-		if !exists.Exists {
+		if !details.Exists || !details.Connected {
 			transport.closeWithError(nil)
 			return &RouterError{
 				Origin:  ErrorOriginRouter,
 				Code:    "peer_not_found",
 				Message: fmt.Sprintf("target peer %q not found", target),
+			}
+		}
+		if details.Class == nil || *details.Class != PeerClassService {
+			transport.closeWithError(nil)
+			return &RouterError{
+				Origin:  ErrorOriginRouter,
+				Code:    "invalid_target_class",
+				Message: fmt.Sprintf("target peer %q is not a service", target),
 			}
 		}
 	}

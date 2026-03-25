@@ -309,11 +309,22 @@ async fn handle_response(
 async fn handle_error(
     sink: PeerSender,
     registry: PeerRegistry,
-    _current_class: PeerClass,
+    current_class: PeerClass,
     envelope: Envelope,
     raw: Vec<u8>,
 ) -> Result<()> {
-    route_to_target(registry, envelope, raw, sink, "error").await
+    if !matches!(current_class, PeerClass::Service) {
+        send_peer_error(
+            sink,
+            envelope.msg_id.as_str(),
+            "invalid_source_class",
+            "error traffic must originate from a service peer",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    route_or_error(registry, envelope, raw, "error", sink).await
 }
 
 async fn handle_heartbeat(
@@ -531,6 +542,10 @@ fn decide_route_target(kind: &str, target_class: Option<PeerClass>) -> RouteTarg
         Some(PeerClass::Service) if kind == KIND_RESPONSE => RouteTargetDecision::Reject {
             code: "invalid_target_class",
             message: "responses must target a caller peer".to_string(),
+        },
+        Some(PeerClass::Service) if kind == KIND_ERROR => RouteTargetDecision::Reject {
+            code: "invalid_target_class",
+            message: "errors must target a caller peer".to_string(),
         },
         Some(_) => RouteTargetDecision::Deliver,
     }

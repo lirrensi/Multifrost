@@ -417,13 +417,13 @@ async fn connection_connect_surfaces_remote_call_error() {
 }
 
 #[tokio::test]
-async fn connection_connect_times_out_when_router_dies_mid_call() {
+async fn connection_connect_fails_pending_call_when_router_dies_mid_call() {
     let (port, handle, disconnect_rx) = start_caller_close_router().await;
     let connection = Connection::connect_with_options(
         "math-service",
         ConnectOptions {
             caller_peer_id: Some("caller-close".into()),
-            request_timeout: Some(Duration::from_millis(200)),
+            request_timeout: None,
             router_port: Some(port),
         },
     )
@@ -435,7 +435,7 @@ async fn connection_connect_times_out_when_router_dies_mid_call() {
         .call_to::<i64>("math-service", "add", vec![json!(10), json!(20)])
         .await
         .unwrap_err();
-    assert!(matches!(err, MultifrostError::TimeoutError));
+    assert!(matches!(err, MultifrostError::RouterUnavailable(_)));
 
     handle_ref.stop().await;
     let _ = timeout(Duration::from_secs(2), disconnect_rx).await;

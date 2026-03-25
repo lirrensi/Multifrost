@@ -44,6 +44,7 @@ struct CallerTransportInner {
     sink: Arc<Mutex<WsSink>>,
     pending: PendingMap,
     request_timeout: Option<Duration>,
+    closed: Arc<Mutex<bool>>,
     inbound_task: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -94,8 +95,11 @@ impl CallerTransport {
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_loop = Arc::clone(&pending);
+        let closed = Arc::new(Mutex::new(false));
+        let closed_loop = Arc::clone(&closed);
+        let inbound_router_endpoint = router_endpoint.clone();
         let inbound_task = tokio::spawn(async move {
-            inbound_loop(source, pending_loop).await;
+            inbound_loop(source, pending_loop, closed_loop, inbound_router_endpoint).await;
         });
 
         Ok(Self {
@@ -106,6 +110,7 @@ impl CallerTransport {
                 sink,
                 pending,
                 request_timeout: config.request_timeout,
+                closed,
                 inbound_task: Mutex::new(Some(inbound_task)),
             }),
         })
@@ -199,6 +204,12 @@ impl CallerTransport {
     }
 
     async fn send_and_wait(&self, frame: Vec<u8>, msg_id: &str) -> Result<FrameParts> {
+        if *self.inner.closed.lock().await {
+            return Err(MultifrostError::RouterUnavailable(
+                self.inner.router_endpoint.clone(),
+            ));
+        }
+
         let (tx, rx) = oneshot::channel();
         self.inner
             .pending
@@ -230,10 +241,15 @@ impl CallerTransport {
 async fn inbound_loop(
     mut source: futures_util::stream::SplitStream<WsStream>,
     pending: PendingMap,
+    closed: Arc<Mutex<bool>>,
+    router_endpoint: String,
 ) {
     while let Some(message) = source.next().await {
-        let Ok(Message::Binary(bytes)) = message else {
-            continue;
+        let Ok(message) = message else {
+            break;
+        };
+        let Message::Binary(bytes) = message else {
+            break;
         };
         let Ok(frame) = decode_frame(&bytes) else {
             continue;
@@ -241,6 +257,21 @@ async fn inbound_loop(
         if let Some(sender) = pending.lock().await.remove(&frame.envelope.msg_id) {
             let _ = sender.send(Ok(frame));
         }
+    }
+
+    *closed.lock().await = true;
+
+    let drained = {
+        let mut pending = pending.lock().await;
+        pending
+            .drain()
+            .map(|(_, sender)| sender)
+            .collect::<Vec<_>>()
+    };
+    for sender in drained {
+        let _ = sender.send(Err(MultifrostError::RouterUnavailable(
+            router_endpoint.clone(),
+        )));
     }
 }
 

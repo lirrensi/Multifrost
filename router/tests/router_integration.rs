@@ -9,10 +9,10 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use multifrost_router::protocol::{
-    decode_error_body, decode_frame, encode_frame, encode_query_body, encode_register_body,
-    Envelope, FrameParts, PeerClass, QueryBody, QueryGetResponseBody, RegisterBody, KIND_CALL,
-    KIND_DISCONNECT, KIND_ERROR, KIND_QUERY, KIND_REGISTER, KIND_RESPONSE, PROTOCOL_VERSION,
-    ROUTER_PEER_ID,
+    decode_error_body, decode_frame, encode_error_body, encode_frame, encode_query_body,
+    encode_register_body, Envelope, ErrorBody, FrameParts, PeerClass, QueryBody,
+    QueryGetResponseBody, RegisterBody, KIND_CALL, KIND_DISCONNECT, KIND_ERROR, KIND_QUERY,
+    KIND_REGISTER, KIND_RESPONSE, PROTOCOL_VERSION, ROUTER_PEER_ID,
 };
 use multifrost_router::registry::PeerRegistry;
 use multifrost_router::server;
@@ -514,6 +514,40 @@ async fn call_from_service_peer_gets_invalid_source_class_error() {
         .unwrap();
 
     let reply = read_binary_frame(&mut service_ws).await;
+    assert_eq!(reply.envelope.kind, KIND_ERROR);
+    let error_body = decode_error_body(&reply.body_bytes).unwrap();
+    assert_eq!(error_body.code, "invalid_source_class");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn error_from_caller_peer_gets_invalid_source_class_error() {
+    let (base_url, handle, _) = start_test_router().await;
+    let (mut caller_ws, _) = connect_peer(&base_url, "caller-src", PeerClass::Caller).await;
+    let _ = read_binary_frame(&mut caller_ws).await;
+
+    let envelope = Envelope {
+        v: PROTOCOL_VERSION,
+        kind: KIND_ERROR.to_string(),
+        msg_id: "bad-error".into(),
+        from: "caller-src".into(),
+        to: "service-target".into(),
+        ts: 1_700_000_012.0,
+    };
+    let body = ErrorBody {
+        code: "boom".into(),
+        message: "caller injected error".into(),
+        kind: "application".into(),
+        stack: None,
+        details: None,
+    };
+    let frame = encode_frame(&envelope, &encode_error_body(&body).unwrap()).unwrap();
+    caller_ws
+        .send(Message::Binary(Bytes::from(frame)))
+        .await
+        .unwrap();
+
+    let reply = read_binary_frame(&mut caller_ws).await;
     assert_eq!(reply.envelope.kind, KIND_ERROR);
     let error_body = decode_error_body(&reply.body_bytes).unwrap();
     assert_eq!(error_body.code, "invalid_source_class");

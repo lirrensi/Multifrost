@@ -389,6 +389,51 @@ async function testHandleStartRejectsMissingTargetWithEagerQuery(): Promise<void
     }
 }
 
+async function testHandleStartRejectsNonServiceTargetWithEagerQuery(): Promise<void> {
+    const fakeRouter = await startFakeRouter(true, async (socket, frame) => {
+        if (frame.envelope.kind !== KIND_QUERY) {
+            return;
+        }
+
+        const query = decodeBody<QueryBody>(frame.bodyBytes);
+        const ackEnvelope = {
+            v: PROTOCOL_VERSION,
+            kind: KIND_RESPONSE,
+            msg_id: frame.envelope.msg_id,
+            from: "router",
+            to: frame.envelope.from,
+            ts: nowSeconds(),
+        };
+
+        socket.send(
+            encodeFrame(
+                ackEnvelope,
+                encodeBody({
+                    peer_id: query.peer_id,
+                    exists: true,
+                    class: caller,
+                    connected: true,
+                })
+            )
+        );
+    });
+
+    const handle = connect("caller-target", {
+        callerPeerId: "caller-eager-class",
+        requestTimeoutMs: 200,
+        eagerTargetQuery: "get",
+        routerPort: fakeRouter.port,
+    }).handle();
+
+    try {
+        await assert.rejects(handle.start(), RouterError);
+        await assert.rejects(handle.queryPeerExists("caller-target"), TransportFailureError);
+    } finally {
+        await handle.stop().catch(() => undefined);
+        await fakeRouter.close();
+    }
+}
+
 async function testPendingRequestFailsWhenRouterCloses(): Promise<void> {
     const fakeRouter = await startFakeRouter(true, async (socket, frame) => {
         if (frame.envelope.kind !== KIND_CALL) {
@@ -505,6 +550,7 @@ async function main(): Promise<void> {
     await run("duplicate peer id rejection", testDuplicatePeerIdRejection);
     await run("request timeout cleanup", testRequestTimeoutDoesNotPoisonLaterQueries);
     await run("eager target query missing target", testHandleStartRejectsMissingTargetWithEagerQuery);
+    await run("eager target query rejects caller target", testHandleStartRejectsNonServiceTargetWithEagerQuery);
     await run("pending request fails on router close", testPendingRequestFailsWhenRouterCloses);
     await run("router bootstrap lock behavior", testBootstrapLockBehavior);
 }

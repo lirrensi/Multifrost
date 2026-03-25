@@ -25,7 +25,12 @@ from multifrost import (
     encode_frame,
     register,
 )
-from multifrost.errors import RegistrationError, RouterError, TransportError
+from multifrost.errors import (
+    BootstrapError,
+    RegistrationError,
+    RouterError,
+    TransportError,
+)
 from multifrost.protocol import ROUTER_PEER_ID
 from multifrost.router_bootstrap import RouterBootstrapConfig
 
@@ -275,3 +280,30 @@ async def test_bootstrap_router_lock_spawns_once(
 
     assert spawn_calls == [config.port]
     assert not config.lock_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_router_lock_uses_configured_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = RouterBootstrapConfig(
+        port=54321,
+        lock_path=tmp_path / "router.lock",
+        log_path=tmp_path / "router.log",
+        readiness_timeout=0.05,
+        poll_interval=0.01,
+        lock_stale_after=60.0,
+    )
+    config.lock_path.write_text("held\n")
+
+    async def fake_reachable(endpoint: str) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        "multifrost.router_bootstrap.router_is_reachable", fake_reachable
+    )
+
+    with pytest.raises(
+        BootstrapError, match="timed out waiting for router bootstrap lock"
+    ):
+        await asyncio.wait_for(bootstrap_router(config), timeout=0.5)

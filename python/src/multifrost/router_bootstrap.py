@@ -104,7 +104,12 @@ async def bootstrap_router(
     if await router_is_reachable(config.endpoint):
         return config
 
-    async with _StartupLock(config.lock_path, config.lock_stale_after):
+    async with _StartupLock(
+        config.lock_path,
+        config.lock_stale_after,
+        timeout=config.readiness_timeout,
+        poll_interval=config.poll_interval,
+    ):
         if await router_is_reachable(config.endpoint):
             return config
 
@@ -138,7 +143,9 @@ async def _wait_for_router_ready(
     )
 
 
-async def _spawn_router_process(config: RouterBootstrapConfig) -> asyncio.subprocess.Process:
+async def _spawn_router_process(
+    config: RouterBootstrapConfig,
+) -> asyncio.subprocess.Process:
     config.lock_path.parent.mkdir(parents=True, exist_ok=True)
     config.log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = config.log_path.open("ab", buffering=0)
@@ -153,7 +160,9 @@ async def _spawn_router_process(config: RouterBootstrapConfig) -> asyncio.subpro
             env=env,
         )
     except FileNotFoundError as err:
-        raise BootstrapError(f"router binary not found: {config.router_bin}", cause=err) from err
+        raise BootstrapError(
+            f"router binary not found: {config.router_bin}", cause=err
+        ) from err
     except Exception as err:  # pragma: no cover - defensive
         raise BootstrapError(f"failed to start router: {err}", cause=err) from err
     finally:
@@ -174,11 +183,13 @@ async def _terminate_router_process(process: asyncio.subprocess.Process) -> None
 class _StartupLock:
     path: Path
     stale_after: float
+    timeout: float = _DEFAULT_READINESS_TIMEOUT
+    poll_interval: float = _DEFAULT_POLL_INTERVAL
     _fd: int | None = field(init=False, default=None)
 
     async def __aenter__(self) -> _StartupLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        deadline = time.monotonic() + _DEFAULT_READINESS_TIMEOUT
+        deadline = time.monotonic() + self.timeout
         while True:
             try:
                 self._fd = os.open(
@@ -193,7 +204,7 @@ class _StartupLock:
                     raise BootstrapError(
                         "timed out waiting for router bootstrap lock"
                     ) from None
-                await asyncio.sleep(_DEFAULT_POLL_INTERVAL)
+                await asyncio.sleep(self.poll_interval)
                 continue
 
             os.write(

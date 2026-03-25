@@ -117,6 +117,40 @@ func TestGoCallerToGoServiceRoundTripQueriesAndDisconnectInvalidation(t *testing
 	waitForPeerAbsent(t, handle, "math-service", 20*time.Second)
 }
 
+func TestHandleStartValidateTargetRejectsCallerPeer(t *testing.T) {
+	env := sharedTestEnv(t)
+	ensureRouterBinaryExists(t, env)
+
+	targetPeerID := uniquePeerID(t, "target-caller")
+	targetHandle := Connect("unused-target", ConnectOptions{
+		PeerID:           targetPeerID,
+		RouterPort:       env.routerPort,
+		RequestTimeout:   5 * time.Second,
+		BootstrapTimeout: 5 * time.Second,
+	}).Handle()
+	if err := targetHandle.Start(context.Background()); err != nil {
+		t.Fatalf("target caller start failed: %v", err)
+	}
+	t.Cleanup(func() { _ = targetHandle.Stop(context.Background()) })
+
+	handle := Connect(targetPeerID, ConnectOptions{
+		PeerID:           uniquePeerID(t, "caller"),
+		RouterPort:       env.routerPort,
+		RequestTimeout:   5 * time.Second,
+		BootstrapTimeout: 5 * time.Second,
+		ValidateTarget:   true,
+	}).Handle()
+
+	err := handle.Start(context.Background())
+	var routerErr *RouterError
+	if !errors.As(err, &routerErr) {
+		t.Fatalf("expected router error, got %T: %v", err, err)
+	}
+	if routerErr.Code != "invalid_target_class" {
+		t.Fatalf("unexpected router error code: %s", routerErr.Code)
+	}
+}
+
 func TestGoCallerSurfacesTransportErrorWhenRouterDies(t *testing.T) {
 	tempHome := t.TempDir()
 	routerPort := freeTCPPort()
