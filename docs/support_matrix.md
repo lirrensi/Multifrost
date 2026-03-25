@@ -1,311 +1,77 @@
-TODO: REWRITE TO NEW FORMATS AFTER ALL DONE
+# Multifrost v5 Support Matrix
 
-# Multifrost Support Matrix
+Status: Informational
+Scope: Cross-language v5 surface snapshot
 
-**Version**: 1.0
-**Last Updated**: 2026-03-13
-**Status**: ⚠️ Broad feature coverage; parity alignment in progress
+This document is a quick reference for what the current v5 bindings support.
+It is not the behavioral canon. For exact behavior, see `docs/spec.md` and the
+language-specific architecture docs.
 
-This document provides a comprehensive overview of feature support across all Multifrost language implementations (Python, JavaScript, Go, Rust).
+## Shared V5 Surface
 
-> WARNING: This matrix describes the intended supported surface area, not a guarantee that every edge case is perfectly aligned today. For portable numeric payloads, number gotchas, and current guidance on precision-sensitive values, treat `docs/msgpack_interop.md` as the source of truth.
+All four language bindings support the same router-based model:
 
----
+| V5 Surface | Python | JavaScript | Go | Rust | Notes |
+|---|---|---|---|---|---|
+| Caller configuration + live handle | ✅ | ✅ | ✅ | ✅ | Configuration is separate from the live runtime in every binding |
+| Service runtime | ✅ | ✅ | ✅ | ✅ | Each binding exposes a way to run a service peer on the router |
+| Separate service process launcher | ✅ | ✅ | ✅ | ✅ | `spawn` is a helper, not the core network model |
+| Router bootstrap | ✅ | ✅ | ✅ | ✅ | Bootstrap is peer-driven and uses the shared lock path |
+| Binary WebSocket transport | ✅ | ✅ | ✅ | ✅ | WebSocket is the only live transport |
+| Msgpack payloads | ✅ | ✅ | ✅ | ✅ | The body is msgpack-encoded and forwarded unchanged by the router |
+| Framed messages | ✅ | ✅ | ✅ | ✅ | The shared layout is `[ u32 envelope_len ][ envelope_bytes ][ body_bytes ]` |
+| `register` handshake | ✅ | ✅ | ✅ | ✅ | Peers register before normal traffic becomes active |
+| `query_peer_exists` / `peer.exists` | ✅ | ✅ | ✅ | ✅ | Supported for live presence checks |
+| `query_peer_get` / `peer.get` | ✅ | ✅ | ✅ | ✅ | Supported for peer class and connection state lookup |
+| `call` routing | ✅ | ✅ | ✅ | ✅ | Calls originate from callers and target service peers |
+| `response` routing | ✅ | ✅ | ✅ | ✅ | Responses return from services to callers |
+| `error` routing | ✅ | ✅ | ✅ | ✅ | Router and service peers can emit error traffic |
+| Default service identity from entrypoint path | ✅ | ✅ | ✅ | ✅ | Explicit `peer_id` overrides the default when provided |
 
-## Quick Reference
-
-| Feature Category | Python | JavaScript | Go | Rust | Notes |
-|------------------|--------|------------|-----|------|-------|
-| ZeroMQ DEALER/ROUTER | ✅ | ✅ | ✅ | ✅ | Core communication |
-| msgpack Serialization | ✅ | ✅ | ✅ | ✅ | Message encoding; portable numeric subset defined in `docs/msgpack_interop.md` |
-| Spawn Mode | ✅ | ✅ | ✅ | ✅ | Child process spawning |
-| Connect Mode | ✅ | ✅ | ✅ | ✅ | Remote connection |
-| Circuit Breaker | ✅ | ✅ | ✅ | ✅ | Fault tolerance |
-| Heartbeat | ✅ | ✅ | ✅ | ✅ | Health monitoring |
-| Metrics | ✅ | ✅ | ✅ | ✅ | Performance tracking |
-| Structured Logging | ✅ | ✅ | ✅ | ✅ | JSON logging |
-| Service Registry | ✅ | ✅ | ✅ | ✅ | File-based storage |
-
----
-
-## 1. Core Communication
-
-| Feature | Description | Python | JavaScript | Go | Rust |
-|---------|-------------|--------|------------|-----|------|
-| **ZeroMQ DEALER/ROUTER Sockets** | Bidirectional communication using ZeroMQ DEALER (parent) and ROUTER (child) sockets | ✅ | ✅ | ✅ | ✅ |
-| **msgpack Serialization** | Binary serialization using MessagePack for efficient message encoding | ✅ | ✅ | ✅ | ✅ |
-| **Spawn Mode** | Spawn child processes locally for local IPC communication | ✅ | ✅ | ✅ | ✅ |
-| **Connect Mode** | Connect to remote child processes over network for cross-machine IPC | ✅ | ✅ | ✅ | ✅ |
-| **Message Framing** | Protocol message framing and parsing | ✅ | ✅ | ✅ | ✅ |
-
-**Implementation Notes**:
-- All implementations use consistent message framing format
-- msgpack ensures binary compatibility across languages
-- DEALER/ROUTER pattern enables request/response semantics
-- Numeric edge-case portability is limited to the documented safe subset in `docs/msgpack_interop.md`
-
----
-
-## 2. Lifecycle Management
-
-| Feature | Description | Python | JavaScript | Go | Rust |
-|---------|-------------|--------|------------|-----|------|
-| **Start/Stop/Close** | API for controlling child process lifecycle | ✅ | ✅ | ✅ | ✅ |
-| **Process Management** | Spawn, kill, and monitor child processes | ✅ | ✅ | ✅ | ✅ |
-| **Signal Handling** | Graceful shutdown on signals (SIGTERM, SIGINT) | ✅ | ✅ | ✅ | ✅ |
-| **Daemon Thread** | Background thread for async operations | ✅ | N/A | N/A | N/A |
-
-**Implementation Notes**:
-- Python and Go provide explicit stop/close methods
-- JavaScript uses async/await with proper cleanup
-- Rust uses tokio runtime for async operations
-- All implementations support graceful shutdown
-
----
-
-## 3. Remote Calls
-
-| Feature | Description | Python | JavaScript | Go | Rust |
-|---------|-------------|--------|------------|-----|------|
-| **Method Invocation** | Call remote methods on child processes | ✅ | ✅ | ✅ | ✅ |
-| **Namespace Support** | Organize methods into namespaces/objects | ✅ | ✅ | ✅ | ✅ |
-| **Timeouts** | Configurable timeout for method calls | ✅ | ✅ | ✅ | ✅ |
-| **Error Handling** | Remote error propagation and handling | ✅ | ✅ | ✅ | ✅ |
-| **Response Type Safety** | Type-safe response handling where applicable | ⚠️ | ⚠️ | ✅ | ✅ |
-
-**Implementation Notes**:
-- All implementations support method namespaced with dots (e.g., `math.add`)
-- Python and JavaScript use type hints/interfaces where available
-- Go and Rust have stronger type safety guarantees
-- Error responses include error codes and messages
-
----
-
-## 4. Reliability Features
-
-| Feature | Description | Python | JavaScript | Go | Rust |
-|---------|-------------|--------|------------|-----|------|
-| **Circuit Breaker** | Fail-fast pattern to prevent cascading failures | ✅ | ✅ | ✅ | ✅ |
-| **Heartbeat** | Periodic health checks and connection monitoring | ✅ | ✅ | ✅ | ✅ |
-| **Auto-Restart** | Automatic restart on child process failure | ✅ | ✅ | ✅ | ✅ |
-| **Retries** | Configurable retry strategy for transient failures | ✅ | ✅ | ✅ | ✅ |
-| **Connection Pooling** | Connection reuse for multiple calls | ✅ | ✅ | ✅ | ✅ |
-
-**Implementation Notes**:
-- All implementations have configurable circuit breaker thresholds
-- Heartbeat intervals are configurable (default: 5 seconds)
-- Auto-restart with configurable backoff strategy
-- Python uses atomic file locking for metrics
-
----
-
-## 5. Output Handling
-
-| Feature | Description | Python | JavaScript | Go | Rust |
-|---------|-------------|--------|------------|-----|------|
-| **STDOUT Forwarding** | Forward child process stdout to parent | ✅ | ✅ | ✅ | ✅ |
-| **STDERR Forwarding** | Forward child process stderr to parent | ✅ | ✅ | ✅ | ✅ |
-| **Output Buffering** | Configurable buffering for output | ✅ | ✅ | ✅ | ✅ |
-| **Output Retry** | Retry on output write failures | ✅ | ✅ | ✅ | ✅ |
-
-**Implementation Notes**:
-- All implementations support real-time output streaming
-- Python: 2 retries on output failures
-- JavaScript: Overrides console.log/error for proper output capture
-- Go and Rust use buffered writes with retry logic
-
----
-
-## 6. Monitoring
-
-| Feature | Description | Python | JavaScript | Go | Rust |
-|---------|-------------|--------|------------|-----|------|
-| **Metrics** | Performance and usage metrics collection | ✅ | ✅ | ✅ | ✅ |
-| **Structured Logging** | JSON-structured logging with context | ✅ | ✅ | ✅ | ✅ |
-| **Service Registry** | File-based service discovery and registration | ✅ | ✅ | ✅ | ✅ |
-| **Health Checks** | Built-in health check endpoints | ✅ | ✅ | ✅ | ✅ |
-| **Tracing** | Distributed tracing support | ✅ | ✅ | ✅ | ✅ |
-
-**Implementation Notes**:
-- All implementations collect metrics (latency, errors, throughput)
-- Structured logging includes timestamps, levels, and context
-- Service registry uses file-based storage with atomic writes
-- Health checks are exposed via HTTP endpoint
-
----
-
-## 7. Language-Specific Features
+## Binding Shapes
 
 ### Python
 
-| Feature | Description | Implementation Details |
-|---------|-------------|------------------------|
-| **Async API** | Native asyncio support for async operations | Uses `asyncio` for all async operations |
-| **Sync Wrapper** | Synchronous API wrapper for async code | Provides `SyncWrapper` class for blocking calls |
-| **Threading Lock** | Thread-safe metrics collection | Uses `threading.Lock` for shared state |
-| **Daemon Thread** | Dedicated event loop in background thread | Runs async event loop in daemon thread |
-| **Type Hints** | Full type hints for better IDE support | Uses `typing` module extensively |
-| **Atomic File Locking** | Thread-safe service registry updates | Uses `fcntl`/`portalocker` for file locking |
-
-**Key Features**:
-- Async-first design with explicit sync wrapper
-- Robust error handling with custom exception classes
-- Comprehensive type hints for code maintainability
+- Async caller core with a sync convenience layer
+- Public caller surface: `connect`, `Connection`, `Handle`, `HandleSync`
+- Public service surface: `spawn`, `ServiceProcess`, `ServiceWorker`, `ServiceContext`, `run_service`, `run_service_sync`
 
 ### JavaScript
 
-| Feature | Description | Implementation Details |
-|---------|-------------|------------------------|
-| **Async-Only API** | No synchronous API (Node.js limitation) | All methods are async/await |
-| **Proxy Objects** | Fluent API using JavaScript Proxies | Method chaining with `new Proxy()` |
-| **Console Override** | Override console.log/error for output | Captures child process output |
-| **Deep Sanitize** | Input sanitization for msgpack | Uses `msgpack` with deep sanitization |
-| **Node.js Event Loop** | Leverages Node.js async capabilities | Uses built-in async primitives |
-| **TypeScript Support** | Full TypeScript support with types | Provides TypeScript definitions |
-
-**Key Features**:
-- Proxy-based fluent API for method invocation
-- Comprehensive TypeScript type definitions
-- Node.js event loop integration for async operations
+- Async-only public API
+- Public caller surface: `connect`, `Connection`, `Handle`
+- Public service surface: `spawn`, `ServiceProcess`, `ServiceWorker`, `ServiceContext`, `runService`
 
 ### Go
 
-| Feature | Description | Implementation Details |
-|---------|-------------|------------------------|
-| **Synchronous API** | Synchronous API with goroutines | All methods are synchronous with goroutine support |
-| **Goroutines** | Concurrent operations via goroutines | Uses `go` keyword for concurrent execution |
-| **Reflection** | Dynamic method dispatch via reflection | Uses `reflect` package for method lookup |
-| **Error Wrapping** | Explicit error handling with `%w` | Uses `fmt.Errorf` with `%w` for error wrapping |
-| **Result Types** | Explicit Result<T, E> error handling | Uses `Result` type for errors |
-| **Interface-Based** | Trait-based method registration | Uses Go interfaces for method registration |
-
-**Key Features**:
-- Explicit error handling with `Result` types
-- Reflection-based method dispatch for flexibility
-- Goroutine-based concurrency for parallel operations
+- Synchronous, context-driven public API
+- Public caller surface: `Connect`, `Connection`, `Handle`
+- Public service surface: `Spawn`, `ServiceProcess`, `ServiceContext`, `RunService`
 
 ### Rust
 
-| Feature | Description | Implementation Details |
-|---------|-------------|------------------------|
-| **Async-Native** | Native async support with tokio | Uses `tokio` runtime for async operations |
-| **Trait-Based** | Trait-based method registration | Uses Rust traits for method registration |
-| **Arc<RwLock<>>** | Thread-safe shared state | Uses `Arc<RwLock<T>>` for shared state |
-| **Result<T, E>** | Explicit error handling | Uses `Result<T, E>` for error propagation |
-| **Zero Unsafe** | No unsafe code in core logic | All core logic is safe Rust |
-| **Type Safety** | Strong compile-time type checking | Leverages Rust's type system |
+- Async caller surface with sync service convenience support
+- Public caller surface: `connect`, `Connection`, `Handle`
+- Public service surface: `spawn`, `ServiceProcess`, `ServiceWorker`, `SyncServiceWorker`, `ServiceContext`, `run_service`, `run_service_sync`
 
-**Key Features**:
-- Strong type safety with compile-time guarantees
-- Zero unsafe code in core logic
-- Async-native with tokio runtime
-- Trait-based method registration for extensibility
+## What This Matrix Leaves Out
 
----
+This document does not try to compare:
 
-## Feature Parity Summary
+- ZeroMQ-era behavior
+- file-backed service registries
+- metrics and logging internals
+- retry and circuit-breaker implementation details
+- per-language performance differences
+- legacy parent/child naming
 
-### Common Features (All Implementations)
-- ✅ ZeroMQ DEALER/ROUTER sockets
-- ✅ msgpack serialization
-- ✅ Spawn mode
-- ✅ Connect mode
-- ✅ Circuit breaker
-- ✅ Heartbeat monitoring
-- ✅ Metrics collection
-- ✅ Structured logging
-- ✅ Service registry
-- ✅ STDOUT/STDERR forwarding
-- ✅ Auto-restart on failure
-- ✅ Retry logic
-- ✅ Health checks
+Those details belong in the per-language architecture docs and the code itself.
 
-### Language-Specific Differences
+## Related Docs
 
-| Category | Python | JavaScript | Go | Rust |
-|----------|--------|------------|-----|------|
-| **Async Support** | Async-first with sync wrapper | Async-only (no sync API) | Synchronous with goroutines | Async-native with tokio |
-| **Method Dispatch** | Standard function calls | Proxy-based fluent API | Reflection-based | Trait-based |
-| **Error Handling** | Exceptions | Promises/rejections | Result<T, E> with %w | Result<T, E> |
-| **Shared State** | Threading.Lock | Async closures | Goroutines | Arc<RwLock<T>> |
-| **Type Safety** | Type hints | TypeScript types | Interfaces | Strong compile-time |
-
----
-
-## Migration Guide
-
-### Python to JavaScript
-- Use `await` for all method calls (no sync API)
-- Use fluent API with `new Proxy()` for method chaining
-- Override `console.log` and `console.error` for output capture
-
-### Python to Go
-- All methods are synchronous; use goroutines for concurrency
-- Use `Result<T, E>` for error handling
-- Use reflection for dynamic method dispatch
-
-### Python to Rust
-- Use `await` for async operations
-- Use `Result<T, E>` for error propagation
-- Use traits for method registration
-
-### JavaScript to Python
-- Use `await` for all method calls
-- Use `SyncWrapper` for synchronous blocking calls
-- Handle exceptions with try/catch
-
-### JavaScript to Go
-- All methods are synchronous; use goroutines for concurrency
-- Use `Result<T, E>` for error handling
-- Use reflection for dynamic method dispatch
-
-### JavaScript to Rust
-- Use `await` for async operations
-- Use `Result<T, E>` for error propagation
-- Use traits for method registration
-
-### Go to Python
-- Wrap synchronous calls in `await` or use `SyncWrapper`
-- Handle exceptions with try/catch
-- Use type hints for better IDE support
-
-### Go to JavaScript
-- All methods are async; use `await` for all calls
-- Use fluent API with `new Proxy()` for method chaining
-
-### Go to Rust
-- Wrap synchronous calls in `await` or use tokio runtime
-- Use `Result<T, E>` for error propagation
-- Use traits for method registration
-
-### Rust to Python
-- Use `await` for async operations
-- Use `SyncWrapper` for synchronous blocking calls
-- Handle exceptions with try/catch
-
-### Rust to JavaScript
-- Use `await` for all method calls (no sync API)
-- Use fluent API with `new Proxy()` for method chaining
-
-### Rust to Go
-- All methods are synchronous; use goroutines for concurrency
-- Use `Result<T, E>` for error handling
-- Use reflection for dynamic method dispatch
-
----
-
-## Conclusion
-
-Multifrost language implementations target the same language-agnostic specification, but parity alignment is still in progress for some numeric edge cases and operational details. Each implementation leverages language-specific features to provide the best developer experience:
-
-- **Python**: Async-first with robust type hints and sync wrapper
-- **JavaScript**: Fluent API with Proxy-based method chaining
-- **Go**: Explicit error handling with goroutine concurrency
-- **Rust**: Strong type safety with async-native design
-
-The core communication features (ZeroMQ, msgpack, spawn/connect modes) are shared across implementations, and the portable data subset is defined in `docs/msgpack_interop.md`.
-
----
-
-**Document Maintained By**: Multifrost Team
-**Feedback**: Please open an issue or PR with any corrections or additions.
+- `docs/spec.md`
+- `docs/arch.md`
+- `javascript/docs/arch.md`
+- `python/docs/arch.md`
+- `golang/docs/arch.md`
+- `rust/docs/arch.md`
