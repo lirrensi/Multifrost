@@ -11,6 +11,13 @@ It accepts WebSocket peer connections, performs synchronous registration,
 maintains the live in-memory peer registry, answers router-level queries, and
 routes traffic by `peer_id`.
 
+The router enforces the v5 source-class rules at the ingress boundary:
+
+- callers originate `call` traffic
+- services originate `response` and `error` traffic
+- both peer classes may send router `query`, `heartbeat`, and `disconnect`
+  traffic
+
 The router is intentionally narrow. It is not an application runtime, load
 balancer, persistence layer, or schema validator.
 
@@ -48,6 +55,7 @@ Owns runtime constant loading, port resolution, and operational path handling.
 Owns:
 
 - envelope definitions
+- register/query/call/response/error body definitions
 - router-owned body definitions
 - frame encoding and decoding
 - protocol constants
@@ -68,6 +76,7 @@ Owns:
 - connection acceptance
 - synchronous `register` handshake
 - per-connection message loop
+- source-class validation for `call`, `response`, and `error`
 - `query`, `call`, `response`, `error`, `heartbeat`, and `disconnect` routing
 - live-entry invalidation on disconnect or transport close
 
@@ -101,17 +110,20 @@ These are operational support artifacts, not the active routing database.
 
 1. A peer opens a WebSocket connection.
 2. The first binary frame must be `register`.
-3. The router validates envelope and register body alignment.
-4. The router rejects malformed or duplicate live identities.
+3. The router validates envelope and register body alignment, including router
+   targeting and matching `peer_id` values.
+4. The router rejects malformed, duplicate, or source-invalid live identities.
 5. The router inserts the peer only after validation succeeds.
-6. The router replies explicitly with accept or reject.
+6. The router replies explicitly with a `response` accept or an `error`
+   rejection.
 7. Only after acceptance does the connection enter the normal message loop.
 
 ### Query Flow
 
 1. A caller or service peer sends router-owned `query` traffic.
 2. The router looks up the requested `peer_id` in the live registry.
-3. The router responds with existence and peer class information.
+3. The router responds with `peer.exists` or `peer.get` data, including
+   existence, peer class, and connected state.
 
 ### Call Routing Flow
 
@@ -119,13 +131,17 @@ These are operational support artifacts, not the active routing database.
 2. The router reads the envelope.
 3. The router confirms that the `to` target exists and is a `service` peer.
 4. The router forwards the frame to the destination peer.
-5. The destination peer later returns a `response` or `error`.
+5. The destination service peer later returns a `response` or `error`.
 6. The router routes that return traffic back to the caller peer.
+7. If a service peer sends `call`, or a caller peer sends `response` or
+   `error`, the router rejects the frame.
 
 ### Disconnect Flow
 
 If a peer sends `disconnect` or the WebSocket closes, the router removes the
-live routing entry immediately.
+live routing entry immediately. A graceful `disconnect` is acknowledged with a
+`response` frame when delivery succeeds, but the router does not keep the peer
+live after removal.
 
 ## Contracts / Invariants
 
@@ -136,6 +152,7 @@ live routing entry immediately.
 | Envelope-only routing | Router routing decisions do not depend on application body semantics |
 | Body preservation | Routed body bytes are forwarded unchanged |
 | Service-only call target | `call` traffic cannot target a `caller` entry |
+| Source-class enforcement | `call` comes from callers; `response` and `error` come from services |
 | Immediate disconnect eviction | Closed connections stop being live routing targets immediately |
 | In-memory live state | Active peer routing state is not persisted to disk |
 
@@ -165,9 +182,11 @@ Current router-focused coverage lives in:
 The router should be validated with tests for:
 
 - register accept and reject
+- register-first connection rejection
 - duplicate live `peer_id` rejection
 - query behavior
 - call routing
+- source-class rejection for invalid `call`/`response`/`error` origins
 - invalid target class handling
 - disconnect eviction
 - body preservation

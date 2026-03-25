@@ -52,6 +52,8 @@ This specification does not define:
 
 ## Terminology
 
+Shared terms are defined here and, where useful, in [`docs/glossary.md`](glossary.md).
+
 ### Router
 
 The shared runtime component that accepts peer connections, tracks presence,
@@ -203,7 +205,11 @@ A conforming router implementation MUST:
 - maintain a registry keyed by `peer_id`,
 - record peer class for each live registry entry,
 - reject duplicate live `peer_id` registration,
+- accept only binary WebSocket protocol messages for v5 traffic, while ping/pong
+  control frames MAY be ignored,
+- require `register` as the first binary frame on a new connection,
 - route `call`, `response`, and `error` messages by envelope identity,
+- enforce source-class routing rules for `call`, `response`, and `error`,
 - answer `query` messages against current registry state,
 - use transport connection state as the main liveness signal,
 - use WebSocket as the transport,
@@ -305,6 +311,8 @@ performs its own connection/bootstrap flow.
 After router connection is established, a peer MUST register before issuing or
 receiving normal traffic.
 
+The first binary frame on a new connection MUST be `register`.
+
 Registration is synchronous. A peer sends `register` and the router responds
 with acceptance or rejection before the peer is considered active.
 
@@ -313,14 +321,19 @@ The `register` message MUST identify:
 - the registering `peer_id`
 - the peer `class`
 
+The register envelope MUST target the router and the envelope `from` field MUST
+match the register body `peer_id`.
+
+The router MUST acknowledge successful registration with a `response` frame.
+The response body MUST indicate acceptance. The router MUST return an explicit
+`error` frame for failed registration and MAY close the connection immediately
+after doing so.
+
 The router MUST reject registration when:
 
 - the `peer_id` is already live,
 - the peer class is missing or invalid,
 - the envelope is malformed.
-
-The router MUST acknowledge successful registration explicitly.
-The router MUST also return an explicit rejection for failed registration.
 
 Peer startup or connect flow MUST succeed only when registration is accepted.
 
@@ -328,15 +341,22 @@ Peer startup or connect flow MUST succeed only when registration is accepted.
 
 `query` is router-only control traffic.
 
-The minimum conforming query capability is `peer.exists` by `peer_id`.
+A conforming router MUST answer `peer.exists` by `peer_id` and MUST answer
+`peer.get` by `peer_id`.
 
-A conforming router MUST be able to answer:
+The router MUST be able to answer:
 
 - whether a given `peer_id` currently exists,
 - whether that entry is a `service` or `caller`.
 
-The router SHOULD support richer queries such as `peer.get`. The router MAY
-support `peer.list`.
+The `peer.get` response MUST include:
+
+- `peer_id`
+- `exists`
+- `class`
+- `connected`
+
+The router MAY support richer queries such as `peer.list`.
 
 Default discovery behavior SHOULD focus on service peers. Caller peers MAY be
 returned when explicitly requested.
@@ -345,6 +365,8 @@ returned when explicitly requested.
 
 `call` is normal application request traffic sent from a caller peer to a
 service peer.
+
+Only caller peers MAY originate `call` traffic.
 
 For a valid call:
 
@@ -371,6 +393,8 @@ delivery.
 `response` is successful return traffic from a service peer to the originating
 caller peer.
 
+Only service peers MAY originate `response` traffic.
+
 For a valid response:
 
 - `from` MUST identify the responding service peer,
@@ -381,6 +405,8 @@ For a valid response:
 ### Error Routing
 
 `error` may originate from the router or a service peer.
+
+Only the router and service peers MAY originate `error` traffic.
 
 Router-generated errors cover conditions such as:
 
@@ -522,6 +548,12 @@ The router MUST reject registration when:
 - the peer class is neither `service` nor `caller`,
 - required routing fields are missing,
 - the transport is not in a valid registered state.
+- the first binary frame is not `register`.
+- the register envelope does not target the router.
+- the register envelope `from` does not match the register body `peer_id`.
+
+If a connection begins with any non-`register` frame, the router MUST reject it
+and close the connection.
 
 ### Query Errors
 
@@ -538,6 +570,8 @@ The router MUST return an error when:
 - the target exists but is class `caller`,
 - the caller is not registered,
 - the envelope is malformed.
+- a caller peer sends `response` or `error`.
+- a service peer sends `call`.
 
 The receiving service peer MUST return an error when:
 

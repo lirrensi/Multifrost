@@ -1,6 +1,6 @@
 [package]
 name = "multifrost-router"
-version = "0.1.0"
+version = "5.0.0"
 edition = "2021"
 description = "Standalone Multifrost v5 WebSocket router"
 license = "MIT"

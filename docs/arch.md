@@ -15,7 +15,8 @@ internally as long as they preserve the behavioral contract in `docs/spec.md`.
 
 The router is part of the core framework and has a concrete implementation in
 this repository. That implementation is described separately in
-`docs/arch_router.md`.
+`docs/arch_router.md`. The split architecture map lives in
+`docs/arch_index.md`.
 
 ## Scope Boundary
 
@@ -63,6 +64,11 @@ At the architecture level:
 - service peers expose callable functions and receive `call` traffic
 - caller peers issue `call` traffic and receive `response` or `error` traffic
 - both classes use the same routing fields: `from` and `to`
+- only caller peers originate `call` traffic
+- only service peers originate `response` or `error` traffic
+- both classes may originate router `query`, `heartbeat`, and `disconnect`
+  traffic
+- the router enforces these source-class rules at the ingress boundary
 
 ### Optional Spawn Helper
 
@@ -119,6 +125,8 @@ At minimum, each live entry contains:
 - connected state
 
 The router is the source of truth for what is currently reachable.
+Router-owned query responses expose `peer.exists` and `peer.get` views over
+that live registry.
 
 ### Binary Frame Model
 
@@ -156,8 +164,9 @@ At the architecture level, the important constraints are:
 3. The service peer attempts router connection.
 4. If the router is absent, the service peer may participate in router
    bootstrap coordination.
-5. The service peer registers synchronously as class `service`.
-6. After acceptance, the service peer begins receiving calls addressed to its
+5. The first binary frame on the connection is `register`.
+6. The service peer registers synchronously as class `service`.
+7. After acceptance, the service peer begins receiving calls addressed to its
    own `peer_id`.
 
 ### Caller Flow
@@ -166,10 +175,11 @@ At the architecture level, the important constraints are:
 2. The caller peer gets or generates a `peer_id`.
 3. The caller peer attempts router connection.
 4. If needed, the caller peer may participate in router bootstrap coordination.
-5. The caller peer registers synchronously as class `caller`.
-6. The caller peer may issue router `query` traffic.
-7. The caller peer sends `call` traffic to a target service `peer_id`.
-8. The caller peer receives a routed `response` or `error`.
+5. The first binary frame on the connection is `register`.
+6. The caller peer registers synchronously as class `caller`.
+7. The caller peer may issue router `query` traffic.
+8. The caller peer sends `call` traffic to a target service `peer_id`.
+9. The caller peer receives a routed `response` or `error`.
 
 ### Disconnect Flow
 
@@ -187,6 +197,8 @@ presence as the shared liveness truth.
 | Envelope-only routing | The router makes routing decisions from envelope metadata only |
 | Body preservation | The router forwards body bytes unchanged except for transport delivery framing |
 | Service-only call targets | Only `service` peers are valid `call` destinations |
+| Source-class routing | Callers originate `call`; services originate `response` and `error` |
+| Register-first connections | New connections do not become active until `register` succeeds |
 | Immediate disconnect invalidation | Closed WebSocket connections stop being live routing targets immediately |
 | Synchronous registration | A peer is not active until `register` has been explicitly accepted |
 | Bootstrap without ownership | The peer that started the router does not own router lifetime |
@@ -215,6 +227,7 @@ Operationally:
 
 ## Architecture Map
 
+- `docs/arch_index.md`: map of the split architecture docs
 - `docs/arch.md`: shared v5 system architecture
 - `docs/arch_router.md`: concrete router implementation architecture
 - `router/`: router implementation
