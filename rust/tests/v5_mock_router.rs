@@ -38,6 +38,7 @@ struct CallerRouterConfig {
 enum CallMode {
     Success,
     RemoteError,
+    CloseOnCall,
 }
 
 async fn start_caller_router(
@@ -167,7 +168,7 @@ async fn handle_caller_connection(
                                     frame.envelope.from.as_str(),
                                     frame.envelope.msg_id.as_str(),
                                 );
-                                encode_frame(&envelope, &encode_body(&body))
+                                Some(encode_frame(&envelope, &encode_body(&body)))
                             }
                             CallMode::RemoteError => {
                                 let body = ErrorBody {
@@ -183,12 +184,20 @@ async fn handle_caller_connection(
                                     frame.envelope.from.as_str(),
                                     frame.envelope.msg_id.as_str(),
                                 );
-                                encode_frame(&envelope, &encode_body(&body))
+                                Some(encode_frame(&envelope, &encode_body(&body)))
+                            }
+                            CallMode::CloseOnCall => {
+                                let _ = ws.close(None).await;
+                                None
                             }
                         };
-                        ws.send(Message::Binary(Bytes::from(response)))
-                            .await
-                            .unwrap();
+                        if let Some(response) = response {
+                            ws.send(Message::Binary(Bytes::from(response)))
+                                .await
+                                .unwrap();
+                        } else {
+                            break;
+                        }
                     }
                     KIND_DISCONNECT => {
                         if let Some(tx) = disconnect_tx {
@@ -222,6 +231,14 @@ async fn start_caller_error_router() -> (u16, tokio::task::JoinHandle<()>, onesh
     start_caller_router(CallerRouterConfig {
         register_accepted: true,
         call_mode: CallMode::RemoteError,
+    })
+    .await
+}
+
+async fn start_caller_close_router() -> (u16, tokio::task::JoinHandle<()>, oneshot::Receiver<()>) {
+    start_caller_router(CallerRouterConfig {
+        register_accepted: true,
+        call_mode: CallMode::CloseOnCall,
     })
     .await
 }
@@ -396,5 +413,31 @@ async fn connection_connect_surfaces_remote_call_error() {
         .await
         .unwrap()
         .unwrap();
+    handle.abort();
+}
+
+#[tokio::test]
+async fn connection_connect_times_out_when_router_dies_mid_call() {
+    let (port, handle, disconnect_rx) = start_caller_close_router().await;
+    let connection = Connection::connect_with_options(
+        "math-service",
+        ConnectOptions {
+            caller_peer_id: Some("caller-close".into()),
+            request_timeout: Some(Duration::from_millis(200)),
+            router_port: Some(port),
+        },
+    )
+    .await
+    .unwrap();
+    let handle_ref = connection.handle();
+
+    let err = handle_ref
+        .call_to::<i64>("math-service", "add", vec![json!(10), json!(20)])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MultifrostError::TimeoutError));
+
+    handle_ref.stop().await;
+    let _ = timeout(Duration::from_secs(2), disconnect_rx).await;
     handle.abort();
 }

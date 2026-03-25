@@ -10,16 +10,18 @@ import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { WebSocketServer } from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 import { connect } from "../src/connection.js";
 import { decodeBody, decodeEnvelope, decodeFrame, encodeBody, encodeFrame } from "../src/frame.js";
-import { RegistrationFailureError } from "../src/errors.js";
+import { RegistrationFailureError, RouterError, TransportFailureError } from "../src/errors.js";
 import { bootstrapRouter } from "../src/router_bootstrap.js";
 import { WebSocketTransport } from "../src/transport.js";
 import {
     KIND_CALL,
+    KIND_QUERY,
     KIND_RESPONSE,
     PROTOCOL_VERSION,
+    QueryBody,
     RegisterAckBody,
     RegisterBody,
     caller,
@@ -81,8 +83,9 @@ function toBuffer(raw: unknown): Buffer {
 }
 
 async function startFakeRouter(
-    accept: boolean
-): Promise<{ endpoint: string; close: () => Promise<void> }> {
+    accept: boolean,
+    onRuntimeMessage?: (socket: WebSocket, frame: { envelope: ReturnType<typeof decodeEnvelope>; bodyBytes: Uint8Array }) => void | Promise<void>
+): Promise<{ endpoint: string; port: number; close: () => Promise<void> }> {
     const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
     await new Promise<void>((resolve, reject) => {
         server.once("listening", () => resolve());
@@ -118,11 +121,26 @@ async function startFakeRouter(
             };
 
             socket.send(encodeFrame(ackEnvelope, encodeBody(ackBody)));
+
+            if (!accept || !onRuntimeMessage) {
+                return;
+            }
+
+            socket.on("message", runtimeRaw => {
+                const runtimeFrame = decodeFrame(toBuffer(runtimeRaw));
+                void Promise.resolve(
+                    onRuntimeMessage(socket, {
+                        envelope: decodeEnvelope(runtimeFrame.envelopeBytes),
+                        bodyBytes: runtimeFrame.bodyBytes,
+                    })
+                ).catch(() => undefined);
+            });
         });
     });
 
     return {
         endpoint: `ws://127.0.0.1:${address.port}`,
+        port: address.port,
         close: async () => {
             for (const client of server.clients) {
                 try {
@@ -274,7 +292,133 @@ async function testDuplicatePeerIdRejection(): Promise<void> {
     }
 }
 
+async function testRequestTimeoutDoesNotPoisonLaterQueries(): Promise<void> {
+    let queryCount = 0;
+    const fakeRouter = await startFakeRouter(true, async (socket, frame) => {
+        if (frame.envelope.kind !== KIND_QUERY) {
+            return;
+        }
+
+        queryCount += 1;
+        if (queryCount === 1) {
+            return;
+        }
+
+        const query = decodeBody<QueryBody>(frame.bodyBytes);
+        const queryPeerId = query.peer_id;
+        const ackEnvelope = {
+            v: PROTOCOL_VERSION,
+            kind: KIND_RESPONSE,
+            msg_id: frame.envelope.msg_id,
+            from: "router",
+            to: frame.envelope.from,
+            ts: nowSeconds(),
+        };
+
+        socket.send(
+            encodeFrame(
+                ackEnvelope,
+                encodeBody({
+                    peer_id: queryPeerId,
+                    exists: false,
+                    class: null,
+                    connected: false,
+                })
+            )
+        );
+    });
+
+    const handle = connect("math-service", {
+        callerPeerId: "caller-timeout",
+        requestTimeoutMs: 100,
+        routerPort: fakeRouter.port,
+    }).handle();
+
+    try {
+        await handle.start();
+        await assert.rejects(handle.queryPeerExists("slow-peer"), TransportFailureError);
+        assert.equal(await handle.queryPeerExists("slow-peer"), false);
+    } finally {
+        await handle.stop().catch(() => undefined);
+        await fakeRouter.close();
+    }
+}
+
+async function testHandleStartRejectsMissingTargetWithEagerQuery(): Promise<void> {
+    const fakeRouter = await startFakeRouter(true, async (socket, frame) => {
+        if (frame.envelope.kind !== KIND_QUERY) {
+            return;
+        }
+
+        const query = decodeBody<QueryBody>(frame.bodyBytes);
+        const ackEnvelope = {
+            v: PROTOCOL_VERSION,
+            kind: KIND_RESPONSE,
+            msg_id: frame.envelope.msg_id,
+            from: "router",
+            to: frame.envelope.from,
+            ts: nowSeconds(),
+        };
+
+        socket.send(
+            encodeFrame(
+                ackEnvelope,
+                encodeBody({
+                    peer_id: query.peer_id,
+                    exists: false,
+                    class: null,
+                    connected: false,
+                })
+            )
+        );
+    });
+
+    const handle = connect("missing-service", {
+        callerPeerId: "caller-eager",
+        requestTimeoutMs: 200,
+        eagerTargetQuery: "get",
+        routerPort: fakeRouter.port,
+    }).handle();
+
+    try {
+        await assert.rejects(handle.start(), RouterError);
+        await assert.rejects(handle.queryPeerExists("missing-service"), TransportFailureError);
+    } finally {
+        await handle.stop().catch(() => undefined);
+        await fakeRouter.close();
+    }
+}
+
+async function testPendingRequestFailsWhenRouterCloses(): Promise<void> {
+    const fakeRouter = await startFakeRouter(true, async (socket, frame) => {
+        if (frame.envelope.kind !== KIND_CALL) {
+            return;
+        }
+
+        socket.close();
+    });
+
+    const handle = connect("math-service", {
+        callerPeerId: "caller-close",
+        requestTimeoutMs: 500,
+        routerPort: fakeRouter.port,
+    }).handle();
+
+    try {
+        await handle.start();
+        await assert.rejects(handle.call.add(1, 2), TransportFailureError);
+        await assert.rejects(handle.queryPeerExists("math-service"), TransportFailureError);
+    } finally {
+        await handle.stop().catch(() => undefined);
+        await fakeRouter.close();
+    }
+}
+
 async function testBootstrapLockBehavior(): Promise<void> {
+    if (process.platform === "win32") {
+        return;
+    }
+
     const tempDir = await mkdtemp(path.join(os.tmpdir(), "mf-lock-"));
     const counterFile = path.join(tempDir, "counter.txt");
     const pidFile = path.join(tempDir, "pid.txt");
@@ -359,6 +503,9 @@ async function main(): Promise<void> {
     await run("query and round trip", testQueryAndRoundTrip);
     await run("disconnect invalidation", testDisconnectInvalidation);
     await run("duplicate peer id rejection", testDuplicatePeerIdRejection);
+    await run("request timeout cleanup", testRequestTimeoutDoesNotPoisonLaterQueries);
+    await run("eager target query missing target", testHandleStartRejectsMissingTargetWithEagerQuery);
+    await run("pending request fails on router close", testPendingRequestFailsWhenRouterCloses);
     await run("router bootstrap lock behavior", testBootstrapLockBehavior);
 }
 

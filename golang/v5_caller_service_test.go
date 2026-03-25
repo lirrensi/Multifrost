@@ -4,6 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -111,4 +115,91 @@ func TestGoCallerToGoServiceRoundTripQueriesAndDisconnectInvalidation(t *testing
 		t.Fatalf("stop go service: %v", err)
 	}
 	waitForPeerAbsent(t, handle, "math-service", 20*time.Second)
+}
+
+func TestGoCallerSurfacesTransportErrorWhenRouterDies(t *testing.T) {
+	tempHome := t.TempDir()
+	routerPort := freeTCPPort()
+	routerBin := filepath.Join(repoRoot(), "router", "target", "debug", "multifrost-router")
+	goServiceEntry := filepath.Join(repoRoot(), "golang", "examples", "e2e_math_worker", "main.go")
+
+	if _, err := os.Stat(routerBin); err != nil {
+		t.Fatalf("router binary missing at %s: %v", routerBin, err)
+	}
+
+	t.Setenv("HOME", tempHome)
+	t.Setenv(RouterPortEnv, fmt.Sprintf("%d", routerPort))
+	t.Setenv(RouterBinEnv, routerBin)
+
+	routerCmd := exec.Command(routerBin)
+	routerCmd.Env = append(os.Environ(),
+		fmt.Sprintf("%s=%d", RouterPortEnv, routerPort),
+		fmt.Sprintf("HOME=%s", tempHome),
+	)
+	if err := routerCmd.Start(); err != nil {
+		t.Fatalf("start router: %v", err)
+	}
+	t.Cleanup(func() {
+		if routerCmd.Process != nil {
+			_ = routerCmd.Process.Kill()
+			_, _ = routerCmd.Process.Wait()
+		}
+	})
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		connection := Connect("math-service", ConnectOptions{RouterPort: routerPort})
+		handle := connection.Handle()
+		err := handle.Start(context.Background())
+		if err == nil {
+			_ = handle.Stop(context.Background())
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	process, err := Spawn(goServiceEntry)
+	if err != nil {
+		t.Fatalf("spawn go service: %v", err)
+	}
+	defer func() {
+		_ = process.Stop(context.Background())
+	}()
+
+	connection := Connect("math-service", ConnectOptions{
+		PeerID:         uniquePeerID(t, "caller"),
+		RouterPort:     routerPort,
+		RequestTimeout: 2 * time.Second,
+	})
+	handle := connection.Handle()
+	if err := handle.Start(context.Background()); err != nil {
+		t.Fatalf("caller start failed: %v", err)
+	}
+	defer func() {
+		_ = handle.Stop(context.Background())
+	}()
+
+	waitForPeer(t, handle, "math-service", 20*time.Second)
+
+	if err := routerCmd.Process.Kill(); err != nil {
+		t.Fatalf("kill router: %v", err)
+	}
+	_, _ = routerCmd.Process.Wait()
+
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		_, err := handle.QueryPeerExists(context.Background(), "math-service")
+		if err == nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		var transportErr *TransportError
+		if !errors.As(err, &transportErr) {
+			t.Fatalf("expected transport error after router death, got %T: %v", err, err)
+		}
+		return
+	}
+
+	t.Fatal("router death did not surface a transport error in time")
 }

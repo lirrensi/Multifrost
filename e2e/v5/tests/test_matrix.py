@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import os
-import pwd
 import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+try:
+    import pwd
+except ModuleNotFoundError:  # pragma: no cover - Windows
+    pwd = None
 
 try:
     import pytest
@@ -29,9 +33,12 @@ if str(PYTHON_SRC) not in sys.path:
 
 try:  # noqa: E402
     from multifrost import PeerClass, connect
+    from multifrost.errors import RouterError, TransportError
 except ModuleNotFoundError:  # pragma: no cover - direct smoke fallback
     PeerClass = None
     connect = None
+    RouterError = None
+    TransportError = None
 
 SERVICE_PEERS = {
     "rust": "math-rust",
@@ -61,7 +68,15 @@ def _node_service_entrypoint() -> Path:
 
 
 def _rust_service_command() -> list[str]:
-    return ["cargo", "run", "--quiet", "--example", "e2e_math_worker", "--", "--service"]
+    return [
+        "cargo",
+        "run",
+        "--quiet",
+        "--example",
+        "e2e_math_worker",
+        "--",
+        "--service",
+    ]
 
 
 def _go_service_command() -> list[str]:
@@ -160,7 +175,10 @@ def _wait_for_tcp_listener(port: int, timeout: float = 15.0) -> None:
 
 def _base_env(port: int, python_deps_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
-    env["HOME"] = pwd.getpwuid(os.getuid()).pw_dir
+    if pwd is not None and hasattr(os, "getuid"):
+        env["HOME"] = pwd.getpwuid(os.getuid()).pw_dir  # type: ignore[attr-defined]
+    else:
+        env["HOME"] = str(Path.home())
     env["PYTHONNOUSERSITE"] = "1"
     env["MULTIFROST_ROUTER_PORT"] = str(port)
     env["MULTIFROST_ROUTER_BIN"] = str(_router_binary())
@@ -173,7 +191,9 @@ def _base_env(port: int, python_deps_dir: Path) -> dict[str, str]:
     return env
 
 
-def _start_process(command: list[str], cwd: Path, env: dict[str, str]) -> subprocess.Popen[str]:
+def _start_process(
+    command: list[str], cwd: Path, env: dict[str, str]
+) -> subprocess.Popen[str]:
     return subprocess.Popen(
         command,
         cwd=str(cwd),
@@ -237,6 +257,88 @@ async def _wait_for_peer(handle: object, peer_id: str, timeout: float = 20.0) ->
         await asyncio.sleep(0.05)
 
 
+async def _expect_router_error(operation, code: str) -> None:
+    try:
+        await operation()
+    except RouterError as err:  # type: ignore[misc]
+        assert err.code == code
+    else:
+        raise AssertionError(f"expected RouterError with code={code!r}")
+
+
+async def _wait_for_transport_failure(operation, timeout: float = 10.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        try:
+            await operation()
+        except TransportError:  # type: ignore[misc]
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(
+                "router death did not surface as a transport failure in time"
+            )
+        await asyncio.sleep(0.05)
+
+
+async def _assert_missing_target_error(port: int) -> None:
+    assert connect is not None
+    handle = connect(
+        "missing-matrix-service",
+        router_port=port,
+        caller_peer_id="matrix-missing-caller",
+    ).handle()
+    try:
+        await handle.start()
+        await _expect_router_error(lambda: handle.call.add(1, 2), "peer_not_found")
+    finally:
+        await handle.stop()
+
+
+async def _assert_invalid_target_class_error(port: int) -> None:
+    assert connect is not None
+    target_handle = connect(
+        "math-rust",
+        router_port=port,
+        caller_peer_id="matrix-caller-target",
+    ).handle()
+    invalid_handle = connect(
+        "matrix-caller-target",
+        router_port=port,
+        caller_peer_id="matrix-invalid-caller",
+    ).handle()
+    try:
+        await target_handle.start()
+        await invalid_handle.start()
+        await _expect_router_error(
+            lambda: invalid_handle.call.add(1, 2), "invalid_target_class"
+        )
+    finally:
+        await invalid_handle.stop()
+        await target_handle.stop()
+
+
+async def _assert_router_death_surfaces_transport_failure(
+    port: int, router: subprocess.Popen[str]
+) -> None:
+    assert connect is not None
+    handle = connect(
+        SERVICE_PEERS["rust"],
+        router_port=port,
+        caller_peer_id="matrix-router-death-caller",
+    ).handle()
+    try:
+        await handle.start()
+        await _wait_for_peer(handle, SERVICE_PEERS["rust"])
+        assert await handle.call.add(2, 3) == 5
+
+        _stop_process(router)
+        await _wait_for_transport_failure(
+            lambda: handle.query_peer_exists(SERVICE_PEERS["rust"])
+        )
+    finally:
+        await handle.stop()
+
+
 async def _run_four_service_matrix(tmp_path: Path) -> None:
     port = _free_tcp_port()
     home_dir = tmp_path / "home"
@@ -258,12 +360,23 @@ async def _run_four_service_matrix(tmp_path: Path) -> None:
 
         service_specs = [
             ("rust", _rust_service_command(), REPO_ROOT / "rust"),
-            ("python", [sys.executable, str(_python_service_entrypoint())], REPO_ROOT / "python"),
+            (
+                "python",
+                [sys.executable, str(_python_service_entrypoint())],
+                REPO_ROOT / "python",
+            ),
             (
                 "node",
                 [
                     "node",
-                    str(REPO_ROOT / "javascript" / "node_modules" / "tsx" / "dist" / "cli.mjs"),
+                    str(
+                        REPO_ROOT
+                        / "javascript"
+                        / "node_modules"
+                        / "tsx"
+                        / "dist"
+                        / "cli.mjs"
+                    ),
                     str(_node_service_entrypoint()),
                 ],
                 REPO_ROOT / "javascript",
@@ -279,7 +392,9 @@ async def _run_four_service_matrix(tmp_path: Path) -> None:
 
         if connect is not None and PeerClass is not None:
             _log("waiting for all four services to appear in router presence")
-            probe = connect("math-rust", router_port=port, caller_peer_id="matrix-probe")
+            probe = connect(
+                "math-rust", router_port=port, caller_peer_id="matrix-probe"
+            )
             handle = probe.handle()
             try:
                 await handle.start()
@@ -309,7 +424,24 @@ async def _run_four_service_matrix(tmp_path: Path) -> None:
             for service_name, target_peer_id in SERVICE_PEERS.items():
                 command, cwd = command_factory(target_peer_id)
                 _log(f"{caller_name} caller -> {service_name} service")
-                _run_caller(command, cwd, env, f"{caller_name} caller -> {service_name} service")
+                _run_caller(
+                    command, cwd, env, f"{caller_name} caller -> {service_name} service"
+                )
+
+        if (
+            connect is not None
+            and RouterError is not None
+            and TransportError is not None
+        ):
+            _log("verifying missing-target router error")
+            await _assert_missing_target_error(port)
+
+            _log("verifying invalid-target-class router error")
+            await _assert_invalid_target_class_error(port)
+
+            _log("verifying router death surfaces transport failure")
+            await _assert_router_death_surfaces_transport_failure(port, router)
+
         _log("matrix complete")
     finally:
         for process in reversed(services):

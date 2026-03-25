@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from multifrost import connect, spawn
+from multifrost.errors import TransportError
 from multifrost.protocol import PeerClass
 
 
@@ -45,7 +46,9 @@ def wait_for_peer_exists_sync(handle, peer_id: str, timeout: float = 15.0) -> No
         time.sleep(0.05)
 
 
-async def wait_for_peer_exists_async(handle, peer_id: str, timeout: float = 15.0) -> None:
+async def wait_for_peer_exists_async(
+    handle, peer_id: str, timeout: float = 15.0
+) -> None:
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
         if await handle.query_peer_exists(peer_id):
@@ -56,7 +59,9 @@ async def wait_for_peer_exists_async(handle, peer_id: str, timeout: float = 15.0
 
 
 @pytest.mark.asyncio
-async def test_async_handle_roundtrip_and_queries(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_async_handle_roundtrip_and_queries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     port = free_port()
     monkeypatch.setenv("MULTIFROST_ROUTER_PORT", str(port))
     monkeypatch.setenv("MULTIFROST_ROUTER_BIN", str(router_binary()))
@@ -107,6 +112,20 @@ def test_sync_handle_roundtrip(monkeypatch: pytest.MonkeyPatch) -> None:
         handle.stop()
         service.stop()
         service.wait()
+
+
+def test_sync_handle_stop_prevents_future_use() -> None:
+    connection = connect("math-service")
+    handle = connection.handle_sync()
+
+    handle.stop()
+    coro = handle._handle.query_peer_exists("math-service")
+
+    try:
+        with pytest.raises(TransportError, match="HandleSync has been stopped"):
+            handle._run(coro)
+    finally:
+        coro.close()
 
 
 @pytest.mark.asyncio

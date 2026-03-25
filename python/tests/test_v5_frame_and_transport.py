@@ -25,7 +25,7 @@ from multifrost import (
     encode_frame,
     register,
 )
-from multifrost.errors import RegistrationError, TransportError
+from multifrost.errors import RegistrationError, RouterError, TransportError
 from multifrost.protocol import ROUTER_PEER_ID
 from multifrost.router_bootstrap import RouterBootstrapConfig
 
@@ -150,7 +150,100 @@ async def test_disconnect_invalidates_handle_after_websocket_close() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_router_lock_spawns_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_pending_request_fails_when_router_closes_mid_call() -> None:
+    async def handler(websocket) -> None:
+        raw = await websocket.recv()
+        frame = decode_frame(raw)
+        ack = RegisterAckBody(accepted=True, reason=None)
+        await websocket.send(
+            encode_frame(
+                build_response_envelope(
+                    ROUTER_PEER_ID,
+                    frame.envelope.from_peer,
+                    frame.envelope.msg_id,
+                ),
+                encode_body(ack),
+            )
+        )
+
+        raw = await websocket.recv()
+        frame = decode_frame(raw)
+        assert frame.envelope.kind == "call"
+        await websocket.close()
+
+    async with fake_router(handler) as port:
+        connection = connect("math-service", router_port=port, request_timeout=1.0)
+        handle = connection.handle()
+        await handle.start()
+
+        with pytest.raises(TransportError, match="transport closed"):
+            await handle.call.add(1, 2)
+
+        with pytest.raises(TransportError):
+            await handle.query_peer_exists("math-service")
+
+        await handle.stop()
+
+
+@pytest.mark.asyncio
+async def test_eager_validate_target_rejects_missing_peer_and_stops_handle() -> None:
+    async def handler(websocket) -> None:
+        raw = await websocket.recv()
+        frame = decode_frame(raw)
+        ack = RegisterAckBody(accepted=True, reason=None)
+        await websocket.send(
+            encode_frame(
+                build_response_envelope(
+                    ROUTER_PEER_ID,
+                    frame.envelope.from_peer,
+                    frame.envelope.msg_id,
+                ),
+                encode_body(ack),
+            )
+        )
+
+        raw = await websocket.recv()
+        frame = decode_frame(raw)
+        assert frame.envelope.kind == "query"
+        await websocket.send(
+            encode_frame(
+                build_response_envelope(
+                    ROUTER_PEER_ID,
+                    frame.envelope.from_peer,
+                    frame.envelope.msg_id,
+                ),
+                encode_body(
+                    {
+                        "peer_id": "missing-service",
+                        "exists": False,
+                        "class": None,
+                        "connected": False,
+                    }
+                ),
+            )
+        )
+
+    async with fake_router(handler) as port:
+        handle = connect(
+            "missing-service",
+            router_port=port,
+            eager_validate_target=True,
+            caller_peer_id="python-eager-validate",
+        ).handle()
+
+        with pytest.raises(RouterError) as excinfo:
+            await handle.start()
+
+        assert excinfo.value.code == "peer_not_found"
+
+        with pytest.raises(TransportError, match="caller handle has not been started"):
+            await handle.call.add(1, 2)
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_router_lock_spawns_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config = RouterBootstrapConfig(
         port=54321,
         lock_path=tmp_path / "router.lock",
@@ -173,7 +266,9 @@ async def test_bootstrap_router_lock_spawns_once(tmp_path: Path, monkeypatch: py
         reachability["ready"] = True
         return DummyProcess()
 
-    monkeypatch.setattr("multifrost.router_bootstrap.router_is_reachable", fake_reachable)
+    monkeypatch.setattr(
+        "multifrost.router_bootstrap.router_is_reachable", fake_reachable
+    )
     monkeypatch.setattr("multifrost.router_bootstrap._spawn_router_process", fake_spawn)
 
     await asyncio.gather(bootstrap_router(config), bootstrap_router(config))
