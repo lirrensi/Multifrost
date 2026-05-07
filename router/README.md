@@ -34,12 +34,35 @@ distributed and launched directly.
 
 ## Get the binary
 
-Typical usage is to ship or download the router binary rather than building it
-inside every application repository clone.
+**One-line install:**
 
-When working in this repo, you can build it locally.
+```sh
+# Linux / macOS / WSL
+curl -fsSL https://raw.githubusercontent.com/lirrensi/Multifrost/main/scripts/install.sh | sh
 
-## Local development commands
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/lirrensi/Multifrost/main/scripts/install.ps1 | iex
+```
+
+This downloads the correct binary for your platform from GitHub Releases
+and places it in `~/.local/bin`.
+
+To pin a specific version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/lirrensi/Multifrost/main/scripts/install.sh | sh -s -- --version v5.0.0
+```
+
+After install, run the router directly:
+
+```bash
+multifrost-router
+```
+
+The router starts on port `9981` by default. Use `MULTIFROST_ROUTER_PORT` to
+change it.
+
+## Local development (building from source)
 
 Build the router:
 

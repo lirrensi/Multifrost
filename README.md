@@ -120,18 +120,30 @@ One process may host many caller peers, many service peers, or both.
 
 ## Router
 
-The router is a small shared runtime dependency.
+The router is a small shared runtime dependency. Get it with one line:
+
+```sh
+# Linux / macOS / WSL
+curl -fsSL https://raw.githubusercontent.com/lirrensi/Multifrost/main/scripts/install.sh | sh
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/lirrensi/Multifrost/main/scripts/install.ps1 | iex
+```
+
+Pin a version:
+
+```sh
+curl -fsSL ... | sh -s -- --version v5.0.0
+```
+
+Runtime defaults:
 
 - default port: `9981`
 - port override: `MULTIFROST_ROUTER_PORT`
 - default log path: `~/.multifrost/router.log`
 - default bootstrap lock: `~/.multifrost/router.lock`
 
-In normal usage you usually do not build it manually unless you are developing
-the repo or packaging the router yourself. Language runtimes can bootstrap it
-when needed, and production setups can ship the router binary directly.
-
-See `router/README.md` for operator notes.
+See `router/README.md` for operator notes and local development commands.
 
 ## Why this model is useful
 

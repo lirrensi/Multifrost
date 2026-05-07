@@ -340,3 +340,6 @@ private/
 .tmp
 plans/
 docs/CODEMAP.*.md
+
+
+agent_chat/
