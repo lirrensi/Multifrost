@@ -9,7 +9,6 @@
 import { spawn, ChildProcess } from "child_process";
 import { closeSync, openSync } from "fs";
 import * as fs from "fs/promises";
-import lockfile from "proper-lockfile";
 import * as path from "path";
 import * as os from "os";
 import WebSocket from "ws";
@@ -24,7 +23,6 @@ import { BootstrapFailureError, BootstrapTimeoutError } from "./errors.js";
 const DEFAULT_READY_TIMEOUT_MS = 10_000;
 const DEFAULT_POLL_INTERVAL_MS = 100;
 const DEFAULT_REACHABILITY_TIMEOUT_MS = 250;
-const LOCK_STALE_MS = 15_000;
 
 export interface RouterBootstrapOptions {
     port?: number;
@@ -43,6 +41,24 @@ export interface RouterBootstrapResult {
     logPath: string;
     routerBin: string;
     started: boolean;
+}
+
+interface LockFileData {
+    format: string;
+    pid: number;
+    router_pid: number | null;
+    port: number;
+    created_at_unix: number;
+    expires_at_unix: number;
+    status: string;
+    language: string;
+}
+
+interface AcquiredLock {
+    path: string;
+    data: LockFileData;
+    update(fields: Partial<LockFileData>): Promise<void>;
+    release(): Promise<void>;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -109,37 +125,141 @@ export async function routerIsReachable(
     });
 }
 
-async function ensureLockFile(lockPath: string): Promise<void> {
-    await fs.mkdir(path.dirname(lockPath), { recursive: true });
-    await fs.writeFile(lockPath, "", { flag: "a" });
+async function isProcessAlive(pid: number): Promise<boolean> {
+    if (pid <= 0) return false;
+    try {
+        if (process.platform === "win32") {
+            const { execFile } = await import("child_process");
+            const { promisify } = await import("util");
+            const execFileAsync = promisify(execFile);
+            const { stdout } = await execFileAsync("tasklist", [
+                "/FI",
+                `PID eq ${pid}`,
+                "/FO",
+                "csv",
+                "/NH",
+            ]);
+            return stdout.includes(`"${pid}"`);
+        } else {
+            return process.kill(pid, 0);
+        }
+    } catch {
+        return false;
+    }
+}
+
+async function evaluateExistingLock(lockPath: string): Promise<string> {
+    let raw: string;
+    try {
+        raw = await fs.readFile(lockPath, "utf-8");
+    } catch {
+        return "reclaim";
+    }
+
+    let data: any;
+    try {
+        data = JSON.parse(raw);
+    } catch {
+        return "reclaim";
+    }
+
+    if (typeof data !== "object" || data.format !== "v1") {
+        return "reclaim";
+    }
+
+    const now = Date.now() / 1000;
+    if (data.expires_at_unix < now) {
+        return "reclaim";
+    }
+
+    if (!(await isProcessAlive(data.pid))) {
+        return "reclaim";
+    }
+
+    if (data.status === "failed") {
+        return "reclaim";
+    }
+
+    if (data.router_pid != null && (await isProcessAlive(data.router_pid))) {
+        return "skip_spawn";
+    }
+
+    return "wait";
 }
 
 async function acquireStartupLock(
     lockPath: string,
+    port: number,
     timeoutMs: number
-): Promise<() => Promise<void>> {
+): Promise<AcquiredLock | null> {
+    await fs.mkdir(path.dirname(lockPath), { recursive: true });
+
     const deadline = Date.now() + timeoutMs;
 
     while (true) {
         try {
-            return await lockfile.lock(lockPath, {
-                stale: LOCK_STALE_MS,
-                realpath: false,
-                retries: 0,
-            });
-        } catch (error) {
-            const code = typeof error === "object" && error !== null ? (error as { code?: string }).code : undefined;
-            if (code !== "ELOCKED") {
-                throw error;
+            const lockData: LockFileData = {
+                format: "v1",
+                pid: process.pid,
+                router_pid: null,
+                port: port,
+                created_at_unix: Date.now() / 1000,
+                expires_at_unix: (Date.now() + timeoutMs) / 1000,
+                status: "starting",
+                language: "javascript",
+            };
+
+            // Atomic exclusive-create
+            await fs.writeFile(lockPath, JSON.stringify(lockData, null, 2), { flag: "wx" });
+
+            return {
+                path: lockPath,
+                data: lockData,
+                update: async (fields: Partial<LockFileData>) => {
+                    Object.assign(lockData, fields);
+                    try {
+                        await fs.writeFile(lockPath, JSON.stringify(lockData, null, 2));
+                    } catch {
+                        // best-effort
+                    }
+                },
+                release: async () => {
+                    try {
+                        await fs.unlink(lockPath);
+                    } catch {
+                        // best-effort
+                    }
+                },
+            };
+        } catch (error: any) {
+            if (error?.code !== "EEXIST" && error?.code !== "EACCES") {
+                throw new BootstrapFailureError(`unexpected lock error: ${error.message}`, {
+                    cause: error,
+                });
             }
 
-            if (Date.now() >= deadline) {
-                throw new BootstrapTimeoutError(
-                    `timed out waiting for router bootstrap lock at ${lockPath}`
-                );
-            }
+            // Evaluate existing lock
+            const result = await evaluateExistingLock(lockPath);
 
-            await sleep(DEFAULT_POLL_INTERVAL_MS);
+            switch (result) {
+                case "reclaim":
+                    try {
+                        await fs.unlink(lockPath);
+                    } catch {
+                        /* race, someone else got it */
+                    }
+                    continue;
+                case "skip_spawn":
+                    return null; // signal: don't spawn, wait for router
+                case "wait":
+                    if (Date.now() >= deadline) {
+                        throw new BootstrapTimeoutError(
+                            `timed out waiting for router bootstrap lock at ${lockPath}`
+                        );
+                    }
+                    await sleep(DEFAULT_POLL_INTERVAL_MS);
+                    continue;
+            }
         }
     }
 }
@@ -191,25 +311,43 @@ export async function bootstrapRouter(
         return { endpoint, port, lockPath, logPath, routerBin, started: false };
     }
 
-    await ensureLockFile(lockPath);
-    const release = await acquireStartupLock(lockPath, readinessTimeoutMs);
+    const lock = await acquireStartupLock(lockPath, port, readinessTimeoutMs);
+
+    // skip_spawn: someone else has an alive router, wait for it
+    if (lock === null) {
+        const deadline = Date.now() + readinessTimeoutMs;
+        while (Date.now() < deadline) {
+            if (await routerIsReachable(endpoint, reachabilityTimeoutMs)) {
+                return { endpoint, port, lockPath, logPath, routerBin, started: false };
+            }
+            await sleep(readinessPollIntervalMs);
+        }
+        throw new BootstrapTimeoutError(
+            `router did not become reachable at ${endpoint} within ${readinessTimeoutMs}ms`
+        );
+    }
 
     let child: ChildProcess | undefined;
-    let spawnError: Error | undefined;
 
     try {
         if (await routerIsReachable(endpoint, reachabilityTimeoutMs)) {
+            await lock.update({ status: "ready" });
             return { endpoint, port, lockPath, logPath, routerBin, started: false };
         }
 
         child = spawnRouterProcess(routerBin, port, logPath);
-        child.once("error", error => {
+        await lock.update({ router_pid: child.pid ?? null });
+
+        const deadline = Date.now() + readinessTimeoutMs;
+        let spawnError: Error | undefined;
+
+        child.once("error", (error) => {
             spawnError = error instanceof Error ? error : new Error(String(error));
         });
 
-        const deadline = Date.now() + readinessTimeoutMs;
         while (Date.now() < deadline) {
             if (spawnError) {
+                await lock.update({ status: "failed" });
                 throw new BootstrapFailureError(
                     `router process failed to start: ${spawnError.message}`,
                     { cause: spawnError }
@@ -217,18 +355,22 @@ export async function bootstrapRouter(
             }
 
             if (child.exitCode !== null) {
+                await lock.update({ status: "failed" });
                 throw new BootstrapFailureError(
                     `router process exited before readiness (code=${child.exitCode}, signal=${child.signalCode ?? "null"})`
                 );
             }
 
             if (await routerIsReachable(endpoint, reachabilityTimeoutMs)) {
+                await lock.update({ status: "ready" });
                 return { endpoint, port, lockPath, logPath, routerBin, started: true };
             }
 
             await sleep(readinessPollIntervalMs);
         }
 
+        // Timeout — router did not become reachable within the deadline
+        await lock.update({ status: "failed" });
         try {
             child.kill();
         } catch {
@@ -239,6 +381,9 @@ export async function bootstrapRouter(
             `router did not become reachable at ${endpoint} within ${readinessTimeoutMs}ms`
         );
     } catch (error) {
+        if (lock !== null) {
+            await lock.update({ status: "failed" }).catch(() => {});
+        }
         if (error instanceof BootstrapTimeoutError || error instanceof BootstrapFailureError) {
             throw error;
         }
@@ -248,6 +393,6 @@ export async function bootstrapRouter(
             { cause: error }
         );
     } finally {
-        await release().catch(() => undefined);
+        await lock.release().catch(() => undefined);
     }
 }

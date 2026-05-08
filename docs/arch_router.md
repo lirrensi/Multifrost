@@ -99,10 +99,14 @@ No file-backed service registry is used for live routing.
 
 The router uses operational paths such as:
 
-- `~/.multifrost/router.log`
-- `~/.multifrost/router.lock`
+- `~/.multifrost/router.log` — router stdout/stderr capture
+- `~/.multifrost/router.lock` — JSON bootstrap lock file (see Lock File Format in `spec.md`)
 
 These are operational support artifacts, not the active routing database.
+
+The lock file is short-lived: it exists only during router bootstrap and is
+deleted on success or failure. Its JSON format enables dead-holder detection
+via OS process lookup rather than filesystem mtime alone.
 
 ## Relationships and Flow
 
@@ -165,6 +169,7 @@ Current runtime constants:
 - env override: `MULTIFROST_ROUTER_PORT`
 - log path: `~/.multifrost/router.log`
 - lock path: `~/.multifrost/router.lock`
+- lock format: JSON v1 (see Lock File Format in `spec.md`)
 
 Operational posture:
 

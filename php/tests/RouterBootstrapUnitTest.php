@@ -141,6 +141,99 @@ final class RouterBootstrapUnitTest extends TestCase
         $this->assertFalse($reachable);
     }
 
+    // ── isProcessAlive ─────────────────────────────────────────────
+
+    public function testIsProcessAliveReturnsTrueForCurrentProcess(): void
+    {
+        $pid = \getmypid();
+        $this->assertTrue(RouterBootstrap::isProcessAlive($pid));
+    }
+
+    public function testIsProcessAliveReturnsFalseForNonExistentPid(): void
+    {
+        // Use a PID that is extremely unlikely to exist on any system
+        $this->assertFalse(RouterBootstrap::isProcessAlive(999999999));
+    }
+
+    // ── evaluateExistingLock ────────────────────────────────────────
+
+    public function testEvaluateExistingLockValidLockReturnsWait(): void
+    {
+        $pid = \getmypid();
+        $data = [
+            'format' => 'v1',
+            'pid' => $pid,
+            'router_pid' => null,
+            'port' => 9981,
+            'created_at_unix' => \microtime(true),
+            'expires_at_unix' => \microtime(true) + 3600.0, // 1 hour from now
+            'status' => 'starting',
+            'language' => 'php',
+        ];
+        $path = \tempnam(\sys_get_temp_dir(), 'mf_lock_test_');
+        \file_put_contents($path, \json_encode($data, \JSON_UNESCAPED_SLASHES));
+
+        $result = RouterBootstrap::evaluateExistingLock($path, 9981);
+        $this->assertSame('wait', $result);
+
+        @\unlink($path);
+    }
+
+    public function testEvaluateExistingLockExpiredReturnsReclaim(): void
+    {
+        $pid = \getmypid();
+        $data = [
+            'format' => 'v1',
+            'pid' => $pid,
+            'router_pid' => null,
+            'port' => 9981,
+            'created_at_unix' => \microtime(true) - 3600.0,
+            'expires_at_unix' => \microtime(true) - 1800.0, // 30 minutes ago
+            'status' => 'starting',
+            'language' => 'php',
+        ];
+        $path = \tempnam(\sys_get_temp_dir(), 'mf_lock_test_');
+        \file_put_contents($path, \json_encode($data, \JSON_UNESCAPED_SLASHES));
+
+        $result = RouterBootstrap::evaluateExistingLock($path, 9981);
+        $this->assertSame('reclaim', $result);
+
+        @\unlink($path);
+    }
+
+    public function testEvaluateExistingLockGarbageContentReturnsReclaim(): void
+    {
+        $path = \tempnam(\sys_get_temp_dir(), 'mf_lock_test_');
+        \file_put_contents($path, 'this is not valid json at all');
+
+        $result = RouterBootstrap::evaluateExistingLock($path, 9981);
+        $this->assertSame('reclaim', $result);
+
+        @\unlink($path);
+    }
+
+    public function testEvaluateExistingLockFailedStatusReturnsReclaim(): void
+    {
+        $pid = \getmypid();
+        $data = [
+            'format' => 'v1',
+            'pid' => $pid,
+            'router_pid' => null,
+            'port' => 9981,
+            'created_at_unix' => \microtime(true),
+            'expires_at_unix' => \microtime(true) + 3600.0,
+            'status' => 'failed',
+            'language' => 'php',
+        ];
+        $path = \tempnam(\sys_get_temp_dir(), 'mf_lock_test_');
+        \file_put_contents($path, \json_encode($data, \JSON_UNESCAPED_SLASHES));
+
+        $result = RouterBootstrap::evaluateExistingLock($path, 9981);
+        $this->assertSame('reclaim', $result);
+
+        @\unlink($path);
+    }
+
     // ── ensureRouter (with real router binary) ─────────────────────
     // This is covered in BootstrapIntegrationTest.php
 }

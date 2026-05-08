@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import time
 from dataclasses import dataclass, field
@@ -32,6 +33,18 @@ _DEFAULT_READINESS_TIMEOUT = 10.0
 _DEFAULT_POLL_INTERVAL = 0.1
 _DEFAULT_LOCK_STALE_AFTER = 10.0
 _ROUTER_HOST = "127.0.0.1"
+
+# Fields present in every JSON lock file (for reference, not consumed by code).
+LOCK_FILE_FIELDS = [
+    "format",
+    "pid",
+    "router_pid",
+    "port",
+    "created_at_unix",
+    "expires_at_unix",
+    "status",
+    "language",
+]
 
 
 def router_port_from_env() -> int:
@@ -109,14 +122,32 @@ async def bootstrap_router(
         config.lock_stale_after,
         timeout=config.readiness_timeout,
         poll_interval=config.poll_interval,
-    ):
+        port=config.port,
+    ) as lock:
+        if lock._skip_spawn:
+            deadline = time.monotonic() + config.readiness_timeout
+            while time.monotonic() < deadline:
+                if await router_is_reachable(config.endpoint):
+                    return config
+                await asyncio.sleep(config.poll_interval)
+            raise BootstrapError(
+                f"router did not become reachable at {config.endpoint} within "
+                f"{config.readiness_timeout:.1f}s",
+                timed_out=True,
+            )
+
         if await router_is_reachable(config.endpoint):
+            lock.update(status="ready")
             return config
 
         process = await _spawn_router_process(config)
+        lock.update(router_pid=process.pid)
+
         try:
             await _wait_for_router_ready(config, process)
+            lock.update(status="ready")
         except Exception:
+            lock.update(status="failed")
             await _terminate_router_process(process)
             raise
 
@@ -185,7 +216,9 @@ class _StartupLock:
     stale_after: float
     timeout: float = _DEFAULT_READINESS_TIMEOUT
     poll_interval: float = _DEFAULT_POLL_INTERVAL
+    port: int = DEFAULT_ROUTER_PORT
     _fd: int | None = field(init=False, default=None)
+    _skip_spawn: bool = field(init=False, default=False)
 
     async def __aenter__(self) -> _StartupLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -198,36 +231,113 @@ class _StartupLock:
                     0o644,
                 )
             except FileExistsError:
-                if await self._remove_if_stale():
-                    continue
                 if time.monotonic() >= deadline:
                     raise BootstrapError(
                         "timed out waiting for router bootstrap lock"
                     ) from None
-                await asyncio.sleep(self.poll_interval)
-                continue
 
-            os.write(
-                self._fd,
-                f"pid={os.getpid()} ts={time.time():.6f}\n".encode(),
-            )
+                match self._evaluate_existing_lock():
+                    case "reclaim":
+                        with contextlib.suppress(FileNotFoundError):
+                            self.path.unlink()
+                        continue
+                    case "skip_spawn":
+                        self._skip_spawn = True
+                        return self
+                    case "wait":
+                        await asyncio.sleep(self.poll_interval)
+                        continue
+                    case _:
+                        await asyncio.sleep(self.poll_interval)
+                        continue
+
+            lock_data = {
+                "format": "v1",
+                "pid": os.getpid(),
+                "router_pid": None,
+                "port": self.port,
+                "created_at_unix": time.time(),
+                "expires_at_unix": time.time() + self.timeout,
+                "status": "starting",
+                "language": "python",
+            }
+            os.write(self._fd, json.dumps(lock_data).encode())
             os.close(self._fd)
             self._fd = None
             return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        self.release()
+        if not self._skip_spawn:
+            if exc_type is not None:
+                self.update(status="failed")
+            self.release()
 
-    async def _remove_if_stale(self) -> bool:
+    def _evaluate_existing_lock(self) -> str:
+        """Apply the 6 stale-detection rules from the Lock File Format spec.
+
+        Returns one of:
+        - "reclaim"    — lock is stale/expired/we can take it
+        - "skip_spawn" — holder has a live router, try connecting first
+        - "wait"       — lock is valid, holder is alive, retry later
+        """
         try:
-            age = time.time() - self.path.stat().st_mtime
-        except FileNotFoundError:
-            return True
-        if age > self.stale_after:
-            with contextlib.suppress(FileNotFoundError):
-                self.path.unlink()
-            return True
-        return False
+            raw = self.path.read_text()
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError, ValueError):
+            return "reclaim"
+
+        if not isinstance(data, dict) or data.get("format") != "v1":
+            return "reclaim"
+
+        if data.get("expires_at_unix", 0) < time.time():
+            return "reclaim"
+
+        if not self._is_process_alive(data.get("pid", 0)):
+            return "reclaim"
+
+        if data.get("status") == "failed":
+            return "reclaim"
+
+        router_pid = data.get("router_pid")
+        if router_pid is not None and self._is_process_alive(router_pid):
+            return "skip_spawn"
+
+        return "wait"
+
+    @staticmethod
+    def _is_process_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        if os.name == "nt":  # Windows
+            try:
+                import subprocess
+
+                result = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/FO", "csv", "/NH"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                return str(pid) in result.stdout
+            except Exception:
+                return False
+        else:  # Unix
+            try:
+                os.kill(pid, 0)
+                return True
+            except OSError:
+                return False
+
+    def update(self, **fields: Any) -> None:
+        """Update lock file fields in-place (best-effort, no throw)."""
+        try:
+            raw = self.path.read_text()
+            data = json.loads(raw)
+        except Exception:
+            return
+        data.update(fields)
+        with contextlib.suppress(Exception):
+            self.path.write_text(json.dumps(data))
 
     def release(self) -> None:
         if self._fd is not None:

@@ -18,13 +18,11 @@
     },
     "dependencies": {
         "msgpackr": "^1.11.9",
-        "proper-lockfile": "^4.1.2",
         "ws": "^8.20.0"
     },
     "devDependencies": {
         "@types/node": "^25.5.0",
         "@types/ws": "^8.18.1",
-        "@types/proper-lockfile": "^4.1.4",
         "eslint": "^10.1.0",
         "prettier": "^3.8.1",
         "tsx": "^4.21.0",

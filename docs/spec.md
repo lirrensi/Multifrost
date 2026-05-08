@@ -191,9 +191,61 @@ The v5 router implementation MUST use these exact runtime constants:
 - port override env var: `MULTIFROST_ROUTER_PORT`
 - log file path: `~/.multifrost/router.log`
 - bootstrap lock path: `~/.multifrost/router.lock`
+- lock file format: JSON, see Lock File Format section below
 
 The router process is long-lived, keeps live routing state only in memory, and
 is not shut down automatically when the bootstrapper exits.
+
+### Lock File Format
+
+The bootstrap lock file MUST use JSON. This format enables dead-holder
+detection via OS process lookup instead of relying solely on filesystem mtime.
+
+A conforming lock file MUST contain:
+
+```json
+{
+  "format": "v1",
+  "pid": 12345,
+  "router_pid": 67890,
+  "port": 9981,
+  "created_at_unix": 1715169600.123,
+  "expires_at_unix": 1715169610.123,
+  "status": "starting",
+  "language": "php"
+}
+```
+
+Field definitions:
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `format` | string | Yes | Schema version identifier. Current: `"v1"`. |
+| `pid` | integer | Yes | OS process ID of the lock holder. |
+| `router_pid` | integer or null | No | OS process ID of the spawned router, if known. |
+| `port` | integer | Yes | Port the lock holder is bootstrapping the router on. |
+| `created_at_unix` | number | Yes | UNIX timestamp (with fractional seconds) when the lock was acquired. |
+| `expires_at_unix` | number | Yes | UNIX timestamp when the lock holder declares itself dead. After this time, any peer may reclaim the lock regardless of process liveness. |
+| `status` | string | Yes | One of: `"starting"` (router spawned, polling for readiness), `"ready"` (router reachable, about to release), `"failed"` (startup failed, about to release). |
+| `language` | string | No | Identifier for the language binding that wrote the lock. Diagnostic only. |
+
+A peer evaluating an existing lock file MUST apply these rules in order:
+
+1. If the file cannot be parsed as valid JSON with `"format": "v1"`, the lock
+   is in a legacy format and MUST be reclaimed immediately.
+2. If `expires_at_unix` is in the past, the lock is self-declared dead and
+   MUST be reclaimed immediately.
+3. If `pid` does not correspond to an alive OS process, the lock holder is
+   dead and the lock MUST be reclaimed immediately.
+4. If `status` is `"failed"`, the lock MUST be reclaimed immediately.
+5. If `router_pid` is set and corresponds to an alive OS process, the peer
+   SHOULD attempt to connect to the router before spawning a new one.
+6. Otherwise, the lock is valid and the peer MUST retry after a delay.
+
+The `expires_at_unix` value MUST be set to the lock acquisition time plus the
+implementation's bootstrap timeout. This ensures that even if process-liveness
+checks are unreliable on a given platform, the lock has a deterministic upper
+bound.
 
 ## Conformance
 
@@ -288,19 +340,24 @@ Bootstrap behavior MUST follow this sequence:
 2. The peer attempts to connect.
 3. If connection succeeds, bootstrap ends.
 4. If connection fails, the peer attempts to acquire the shared router startup
-   lock.
+   lock by writing the JSON lock file (see Lock File Format).
 5. After acquiring the lock, the peer MUST retry router reachability.
-6. If the router is now reachable, the peer MUST release the lock and continue.
+6. If the router is now reachable, the peer MUST update the lock status to
+   `"ready"` (optional), release the lock by deleting the file, and continue.
 7. If the router is still unreachable, the peer MAY start the router process.
 8. The peer MUST wait for router readiness up to an implementation-defined
    timeout.
-9. The peer MUST release the lock once the router is reachable or startup has
-   failed.
+9. The peer MUST release the lock by deleting the file once the router is
+   reachable or startup has failed. On failure, the peer SHOULD update the
+   lock status to `"failed"` before releasing.
 
-Peers that do not hold the lock MUST wait, retry reachability, and only attempt
-bootstrap after lock release if the router is still unreachable.
+Peers that do not hold the lock MUST evaluate the existing lock file using the
+rules defined in the Lock File Format section. If the lock is valid (holder
+alive, not expired, not failed), the peer MUST retry reachability and only
+attempt acquisition after the lock is released or reclaimed.
 
-Stale lock handling MUST exist.
+Stale lock handling MUST use the Lock File Format evaluation rules (process
+liveness, expiry, and status) rather than filesystem mtime alone.
 
 `spawn` MUST NOT be treated as the owner of router bootstrap. If `spawn` starts a
 service process, that service process behaves like any other service peer and

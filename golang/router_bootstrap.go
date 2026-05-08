@@ -7,6 +7,7 @@ package multifrost
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -23,8 +24,21 @@ const (
 	routerBootstrapPollDelay = 100 * time.Millisecond
 	routerReachabilityProbe  = 250 * time.Millisecond
 	routerLockRetryDelay     = 100 * time.Millisecond
-	routerLockMaxAge         = 2 * time.Minute
 )
+
+// routerLockData is the JSON schema for the bootstrap lock file.
+// See docs/spec.md (Lock File Format section) for field definitions and
+// evaluation rules.
+type routerLockData struct {
+	Format        string  `json:"format"`
+	Pid           int     `json:"pid"`
+	RouterPid     *int    `json:"router_pid"`
+	Port          int     `json:"port"`
+	CreatedAtUnix float64 `json:"created_at_unix"`
+	ExpiresAtUnix float64 `json:"expires_at_unix"`
+	Status        string  `json:"status"`
+	Language      string  `json:"language"`
+}
 
 func routerPortFromEnv() int {
 	if value := os.Getenv(RouterPortEnv); value != "" {
@@ -67,26 +81,56 @@ func ensureRouter(ctx context.Context, port int) error {
 		return nil
 	}
 
-	lock, err := acquireRouterLock(ctx)
+	lock, err := acquireRouterLock(ctx, port)
 	if err != nil {
 		return &BootstrapError{Origin: ErrorOriginBootstrap, Err: err}
 	}
+
+	// skip_spawn: another process has a live router (router_pid alive).
+	// Do not hold the lock; just poll for reachability.
+	if lock == nil {
+		deadline := time.Now().Add(routerBootstrapTimeout)
+		for time.Now().Before(deadline) {
+			if routerReachable(ctx, endpoint) {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				return &BootstrapError{Origin: ErrorOriginBootstrap, Err: ctx.Err()}
+			case <-time.After(routerBootstrapPollDelay):
+			}
+		}
+		return &BootstrapError{
+			Origin: ErrorOriginBootstrap,
+			Err:    fmt.Errorf("router did not become reachable at %s within %s", endpoint, routerBootstrapTimeout),
+		}
+	}
+
 	defer lock.release()
 
+	// Double-check reachability now that we hold the lock.
 	if routerReachable(ctx, endpoint) {
+		lock.updateFields(map[string]any{"status": "ready"})
 		return nil
 	}
 
-	if err := spawnRouterProcess(port); err != nil {
+	// Spawn the router process and capture its PID.
+	routerPid, err := spawnRouterProcess(port)
+	if err != nil {
+		lock.updateFields(map[string]any{"status": "failed"})
 		return &BootstrapError{Origin: ErrorOriginBootstrap, Err: err}
 	}
+	lock.updateFields(map[string]any{"router_pid": &routerPid})
 
+	// Poll for router readiness.
 	deadline := time.Now().Add(routerBootstrapTimeout)
 	for {
 		if routerReachable(ctx, endpoint) {
+			lock.updateFields(map[string]any{"status": "ready"})
 			return nil
 		}
 		if time.Now().After(deadline) {
+			lock.updateFields(map[string]any{"status": "failed"})
 			return &BootstrapError{
 				Origin: ErrorOriginBootstrap,
 				Err:    fmt.Errorf("router did not become reachable at %s within %s", endpoint, routerBootstrapTimeout),
@@ -95,6 +139,7 @@ func ensureRouter(ctx context.Context, port int) error {
 
 		select {
 		case <-ctx.Done():
+			lock.updateFields(map[string]any{"status": "failed"})
 			return &BootstrapError{Origin: ErrorOriginBootstrap, Err: ctx.Err()}
 		case <-time.After(routerBootstrapPollDelay):
 		}
@@ -117,8 +162,11 @@ func routerReachable(ctx context.Context, endpoint string) bool {
 	return true
 }
 
+// routerLockGuard holds the lock file path and the in-memory lock data.
+// Callers should call updateFields before release() to persist status changes.
 type routerLockGuard struct {
 	path string
+	data *routerLockData
 }
 
 func (g *routerLockGuard) release() {
@@ -128,7 +176,38 @@ func (g *routerLockGuard) release() {
 	_ = os.Remove(g.path)
 }
 
-func acquireRouterLock(ctx context.Context) (*routerLockGuard, error) {
+// updateFields updates in-memory lock data fields and atomically rewrites the
+// lock file. This is a best-effort operation; errors are silently discarded
+// since the lock file is advisory state.
+func (g *routerLockGuard) updateFields(fields map[string]any) {
+	if g == nil || g.path == "" || g.data == nil {
+		return
+	}
+	if v, ok := fields["status"]; ok {
+		if s, ok := v.(string); ok {
+			g.data.Status = s
+		}
+	}
+	if v, ok := fields["router_pid"]; ok {
+		if p, ok := v.(*int); ok {
+			g.data.RouterPid = p
+		}
+	}
+	bytes, err := json.Marshal(g.data)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(g.path, bytes, 0o600)
+}
+
+// acquireRouterLock attempts to acquire the shared router startup lock by
+// atomically creating the lock file. Returns:
+//   - (*routerLockGuard, nil) on successful lock acquisition
+//   - (nil, nil) when "skip_spawn" is detected — another process has a
+//     live router process, so the caller should poll for reachability
+//     rather than spawning a new one
+//   - (nil, error) on timeout or filesystem error
+func acquireRouterLock(ctx context.Context, port int) (*routerLockGuard, error) {
 	lockPath := defaultRouterLockPath()
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		return nil, err
@@ -138,18 +217,35 @@ func acquireRouterLock(ctx context.Context) (*routerLockGuard, error) {
 	for {
 		file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
-			_, _ = fmt.Fprintf(file, "%d\n", os.Getpid())
+			now := float64(time.Now().UnixNano()) / 1e9
+			data := routerLockData{
+				Format:        "v1",
+				Pid:           os.Getpid(),
+				Port:          port,
+				CreatedAtUnix: now,
+				ExpiresAtUnix: now + routerBootstrapTimeout.Seconds(),
+				Status:        "starting",
+				Language:      "go",
+			}
+			bytes, _ := json.Marshal(data)
+			_, _ = file.Write(bytes)
 			_ = file.Close()
-			return &routerLockGuard{path: lockPath}, nil
+			return &routerLockGuard{path: lockPath, data: &data}, nil
 		}
 		if !errors.Is(err, os.ErrExist) {
 			return nil, err
 		}
 
-		if isStaleLock(lockPath) {
+		switch evaluateExistingLock(lockPath) {
+		case "reclaim":
 			_ = os.Remove(lockPath)
 			continue
+		case "skip_spawn":
+			return nil, nil
+		case "wait":
+			// fall through to timeout/retry
 		}
+
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("timed out waiting for router startup lock")
 		}
@@ -162,15 +258,58 @@ func acquireRouterLock(ctx context.Context) (*routerLockGuard, error) {
 	}
 }
 
-func isStaleLock(path string) bool {
-	info, err := os.Stat(path)
+// evaluateExistingLock reads and evaluates an existing lock file against the
+// six stale-detection rules defined in docs/spec.md (Lock File Format section).
+//
+// Returns one of:
+//   - "reclaim"    — lock is stale/dead, caller should remove and retry
+//   - "skip_spawn" — lock holder has a live router process, caller should
+//     attempt to connect before spawning
+//   - "wait"       — lock is valid, caller should retry after a delay
+func evaluateExistingLock(path string) string {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return false
+		return "reclaim"
 	}
-	return time.Since(info.ModTime()) > routerLockMaxAge
+
+	var lock routerLockData
+	if err := json.Unmarshal(data, &lock); err != nil {
+		return "reclaim"
+	}
+
+	// Rule 1: format must be "v1"
+	if lock.Format != "v1" {
+		return "reclaim"
+	}
+
+	// Rule 2: self-declared expiry
+	now := float64(time.Now().UnixNano()) / 1e9
+	if now > lock.ExpiresAtUnix {
+		return "reclaim"
+	}
+
+	// Rule 3: lock holder (pid) must be alive
+	if !isProcessAlive(lock.Pid) {
+		return "reclaim"
+	}
+
+	// Rule 4: status "failed" means holder gave up
+	if lock.Status == "failed" {
+		return "reclaim"
+	}
+
+	// Rule 5: router_pid set and alive → skip spawn, try connecting
+	if lock.RouterPid != nil && isProcessAlive(*lock.RouterPid) {
+		return "skip_spawn"
+	}
+
+	// Rule 6: otherwise, lock is valid — wait and retry
+	return "wait"
 }
 
-func spawnRouterProcess(port int) error {
+// spawnRouterProcess starts the router binary in the background.
+// Returns the router process PID on success.
+func spawnRouterProcess(port int) (int, error) {
 	binary := os.Getenv(RouterBinEnv)
 	if binary == "" {
 		binary = "multifrost-router"
@@ -178,12 +317,12 @@ func spawnRouterProcess(port int) error {
 
 	logPath := defaultRouterLogPath()
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
-		return err
+		return 0, err
 	}
 
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer logFile.Close()
 
@@ -193,7 +332,7 @@ func spawnRouterProcess(port int) error {
 	cmd.Stderr = logFile
 
 	if err := cmd.Start(); err != nil {
-		return err
+		return 0, err
 	}
-	return nil
+	return cmd.Process.Pid, nil
 }

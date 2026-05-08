@@ -6,6 +6,9 @@ PURPOSE: Exercise frame encoding, register handling, disconnect invalidation, an
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -265,6 +268,7 @@ async def test_bootstrap_router_lock_spawns_once(
 
     class DummyProcess:
         returncode = None
+        pid = 99999
 
     async def fake_spawn(cfg: RouterBootstrapConfig) -> DummyProcess:
         spawn_calls.append(cfg.port)
@@ -294,7 +298,22 @@ async def test_bootstrap_router_lock_uses_configured_timeout(
         poll_interval=0.01,
         lock_stale_after=60.0,
     )
-    config.lock_path.write_text("held\n")
+    # Write a valid JSON lock file that will evaluate to "wait"
+    # (alive holder PID, non-expired, no router_pid set).
+    config.lock_path.write_text(
+        json.dumps(
+            {
+                "format": "v1",
+                "pid": os.getpid(),
+                "router_pid": None,
+                "port": config.port,
+                "created_at_unix": time.time() - 1,
+                "expires_at_unix": time.time() + 60,
+                "status": "starting",
+                "language": "python",
+            }
+        )
+    )
 
     async def fake_reachable(endpoint: str) -> bool:
         return False

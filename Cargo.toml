@@ -1,5 +1,5 @@
 [workspace]
-members = ["router"]
+members = ["router", "rust"]
 resolver = "2"
 
 # The profile that 'dist' will build with
