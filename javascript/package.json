@@ -1,6 +1,6 @@
 {
     "name": "multifrost",
-    "version": "5.0.0",
+    "version": "5.1.0",
     "description": "Router-based v5 RPC library for Python, Node.js, Go, and Rust",
     "license": "MIT",
     "author": "lirrensi",

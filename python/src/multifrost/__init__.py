@@ -77,7 +77,7 @@ from .router_bootstrap import RouterBootstrapConfig, bootstrap_router
 from .service import ServiceContext, ServiceWorker, run_service, run_service_sync
 from .sync import HandleSync
 
-__version__ = "5.0.0"
+__version__ = "5.1.0"
 
 __all__ = [
     "__version__",

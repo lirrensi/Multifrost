@@ -14,6 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **Repository docs**: Updated README, architecture docs, and support matrix to include PHP as a first-class binding.
+- **Router bootstrap lock (all bindings)**: Replaced legacy mtime-based stale-lock detection with a structured JSON lock file format (`v1`) across all five language bindings (Rust, PHP, Python, Go, JavaScript). The lock file now carries PID, router PID, port, timestamps, status, and language fields, enabling dead-holder detection via OS process lookup rather than filesystem mtime alone.
+- **Router bootstrap lock evaluation (all bindings)**: Added a deterministic six-rule evaluation pipeline for existing lock files — unparseable content → reclaim, expired → reclaim, dead holder PID → reclaim, `"failed"` status → reclaim, alive `router_pid` → skip_spawn (optimization), otherwise → wait with retry. Cross-platform process liveness checks use `kill -0` on Unix and `tasklist` on Windows.
+- **Router bootstrap skip-spawn optimization (all bindings)**: When a peer finds a valid lock file with a live `router_pid` from another process, it skips spawning a new router entirely and simply polls for reachability. This prevents duplicate router processes and race conditions when multiple peers start concurrently.
+- **JavaScript binding — removed `proper-lockfile` dependency**: Replaced the third-party `proper-lockfile` module with atomic `wx` flag file creation (`fs.writeFile` with exclusive create), matching the approach used by all other bindings. Removed `proper-lockfile`, `@types/proper-lockfile`, and transitive dependencies (`graceful-fs`, `retry`, `signal-exit`).
+- **PHP docs — Windows Router Bootstrap documented**: Added full documentation of the PowerShell `Start-Process` workaround for Windows in `php/docs/arch.md` and `php/docs/faq.md`, including the root cause (Winsock error 10106 from PHP's `proc_open` on some Windows builds).
+
+### Fixed
+- **PHP tests — external router support**: Both `BootstrapIntegrationTest` and `RouterIntegrationTest` now accept a pre-existing router via the `MULTIFROST_ROUTER_PORT` environment variable, avoiding redundant process spawning when a router is already running externally.
+- **PHP `InteropTest` — Windows skip with clear explanation**: Interop tests are now skipped on Windows with a documented reason (phrity/websocket Client initialization quirk in `proc_open` child processes). All routing, query, and error paths remain covered by `RouterIntegrationTest`.
+- **PHP `TransportTest` — caller-to-service rejection**: Replaced the incomplete `testCallerCannotBeCalled` test with a proper cross-peer call attempt that verifies the router rejects calls directed at caller peers.
+- **PHP `RouterBootstrap` — PID tracking and lock lifecycle**: `spawnRouterProcess` now returns the router PID. The lock file records `router_pid` on spawn and transitions through `starting` → `ready`/`failed` status, which is persisted to the file for other peers to observe.
+- **PHP `RouterBootstrap` — `updateLock` helper**: Added a best-effort JSON field updater for the lock file, used to persist status transitions and router PID without requiring a full lock release/re-acquire cycle.
 
 ## [5.0.0] - 2026-03-25
 

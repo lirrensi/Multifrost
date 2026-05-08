@@ -1,6 +1,6 @@
 [package]
 name = "multifrost"
-version = "5.0.0"
+version = "5.1.0"
 edition = "2021"
 description = "Router-based v5 RPC library for Rust"
 license = "MIT"

@@ -2,6 +2,7 @@
     "name": "multifrost/php",
     "description": "Multifrost v5 PHP binding — blocking synchronous caller and service peers over WebSocket",
     "type": "library",
+    "version": "5.1.0",
     "license": "MIT",
     "require": {
         "php": "^8.2",
@@ -13,8 +14,12 @@
         "phpstan/phpstan": "^2.0"
     },
     "autoload": {
-        "classmap": ["src/"],
-        "files": ["src/functions.php"]
+        "classmap": [
+            "src/"
+        ],
+        "files": [
+            "src/functions.php"
+        ]
     },
     "autoload-dev": {
         "psr-4": {
