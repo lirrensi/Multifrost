@@ -13,7 +13,7 @@ declare(strict_types=1);
 
 require __DIR__ . '/../vendor/autoload.php';
 
-use Multifrost\connect;
+use function Multifrost\connect;
 
 $serviceId = $argv[1] ?? 'math-service';
 

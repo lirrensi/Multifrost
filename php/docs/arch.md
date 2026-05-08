@@ -58,6 +58,31 @@ concurrent access to shared state.
 All errors are typed exceptions extending `MultifrostException`. Wire errors
 decode into `RouterError` or `RemoteCallError` via the `errorFromWire()` function.
 
+### Windows Router Bootstrap
+
+On Windows, the PHP binding uses **PowerShell's `Start-Process`** to launch the
+router instead of PHP's `proc_open`. This is documented in the code as
+`RouterBootstrap::spawnRouterViaPowerShell()`.
+
+**Why not `proc_open` on Windows?** PHP's `proc_open` on some Windows builds
+creates child processes where the Winsock service provider fails to initialise
+(error 10106: `WSAEPROVIDERFAILEDINIT`). This is a known interaction between
+PHP's process creation flags and the Windows Layered Service Provider (LSP)
+chain. The router, being a Rust binary that calls `TcpListener::bind()` on
+startup, crashes immediately when this happens.
+
+**Why PowerShell?** `Start-Process` delegates to .NET's `Process.Start`, which
+uses `CreateProcess` with flags that correctly initialise Winsock in the child.
+PowerShell 5.1+ is a Windows component, present on all supported Windows
+versions (10+, Server 2016+, including Server Core). The overhead (~500ms) is
+a one-time cost during router bootstrap.
+
+**If PowerShell is unavailable** (Nano Server, IoT Core, or broken installation),
+the error message tells the user exactly how to start the router manually:
+```
+set MULTIFROST_ROUTER_PORT=9981 && start /B "" "C:\path\to\multifrost-router.exe"
+```
+
 ## Deviations from Other Bindings
 
 - No async layer (PHP's paradigm doesn't need one)

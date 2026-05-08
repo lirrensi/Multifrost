@@ -36,3 +36,17 @@ support bin/ext types well.
 
 `textalk/websocket` was archived. `phrity/websocket` is the maintained successor
 by the same developer, with the same blocking API.
+
+## Does the router auto-start work on Windows?
+
+Yes, but through PowerShell rather than PHP's `proc_open`. PHP's `proc_open` on
+some Windows builds creates child processes where Winsock fails to initialise
+(error 10106), causing the Rust router binary to crash immediately on socket
+bind.
+
+The binding detects Windows and uses PowerShell's `Start-Process` (which
+delegates to .NET's `Process.Start`) to launch the router correctly. If
+PowerShell is unavailable, the error message tells you how to start the router
+manually.
+
+See `docs/arch.md` (Windows Router Bootstrap section) for the full story.

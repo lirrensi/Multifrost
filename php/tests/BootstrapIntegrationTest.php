@@ -17,11 +17,25 @@ use Multifrost\Protocol;
 final class BootstrapIntegrationTest extends TestCase
 {
     private static ?int $routerPort = null;
-    /** @var resource|null */
+    /** @var resource|string|null */
     private static $routerProcess = null;
 
     public static function setUpBeforeClass(): void
     {
+        // Check if a router is already running externally
+        $externalPort = \getenv('MULTIFROST_ROUTER_PORT');
+        if ($externalPort !== false && $externalPort !== '') {
+            $port = (int) $externalPort;
+            if ($port > 0 && $port <= 65535) {
+                $endpoint = RouterBootstrap::routerEndpoint($port);
+                if (RouterBootstrap::routerReachable($endpoint)) {
+                    self::$routerPort = $port;
+                    self::$routerProcess = 'external';
+                    return;
+                }
+            }
+        }
+
         $bin = self::findRouterBinary();
         if ($bin === null) {
             return;
@@ -86,7 +100,18 @@ final class BootstrapIntegrationTest extends TestCase
         if (\is_resource(self::$routerProcess)) {
             @\proc_terminate(self::$routerProcess);
             @\proc_close(self::$routerProcess);
-            self::$routerProcess = null;
+        }
+        self::$routerProcess = null;
+    }
+
+    protected function setUp(): void
+    {
+        if (self::$routerPort === null) {
+            $this->markTestSkipped('Router not available — start one externally and set MULTIFROST_ROUTER_PORT');
+        }
+        $endpoint = RouterBootstrap::routerEndpoint(self::$routerPort);
+        if (!RouterBootstrap::routerReachable($endpoint)) {
+            $this->markTestSkipped('Router not reachable');
         }
     }
 
@@ -119,13 +144,6 @@ final class BootstrapIntegrationTest extends TestCase
         }
 
         return null;
-    }
-
-    protected function setUp(): void
-    {
-        if (self::$routerProcess === null) {
-            $this->markTestSkipped('Router binary not available or could not start on this system');
-        }
     }
 
     public function testEnsureRouterWithAlreadyRunningRouter(): void

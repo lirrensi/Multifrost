@@ -92,17 +92,20 @@ final class TransportTest extends TestCase
     public function testCallerCannotBeCalled(): void
     {
         $endpoint = RouterBootstrap::routerEndpoint($this->routerPort);
-        $caller = PeerTransport::dial($endpoint, 'test-caller-2', PeerClass::Caller);
+
+        // Register a caller
+        $targetCaller = PeerTransport::dial($endpoint, 'test-target-caller', PeerClass::Caller);
+
+        // Register another caller to attempt the call
+        $attacker = PeerTransport::dial($endpoint, 'test-attacker', PeerClass::Caller);
 
         // Try to call the caller peer (should fail — not a service)
         $this->expectException(RouterError::class);
-        // We need another peer to make the call
-        // For now, we can at least verify the transport works
-        $result = $caller->queryGet('test-caller-2');
-        $this->assertTrue($result->exists);
-        $this->assertSame(PeerClass::Caller, $result->class);
+        $attacker->call('test-target-caller', 'echo', ['should fail']);
 
-        $caller->disconnect();
-        $caller->close();
+        $targetCaller->disconnect();
+        $targetCaller->close();
+        $attacker->disconnect();
+        $attacker->close();
     }
 }

@@ -27,13 +27,28 @@ final class RouterIntegrationTest extends TestCase
 {
     private const ROUTER_READY_TIMEOUT = 10.0;
 
-    /** @var resource|null */
+    /** @var resource|string|null */
     private static $routerProcess = null;
     private static ?int $routerPort = null;
     private static ?string $routerBin = null;
 
     public static function setUpBeforeClass(): void
     {
+        // Check if a router is already running externally
+        $externalPort = \getenv('MULTIFROST_ROUTER_PORT');
+        if ($externalPort !== false && $externalPort !== '') {
+            $port = (int) $externalPort;
+            if ($port > 0 && $port <= 65535) {
+                $endpoint = RouterBootstrap::routerEndpoint($port);
+                if (RouterBootstrap::routerReachable($endpoint)) {
+                    self::$routerPort = $port;
+                    self::$routerProcess = 'external';
+                    return;
+                }
+            }
+        }
+
+        // Try to find and start the router binary
         self::$routerBin = self::findRouterBinary();
         if (self::$routerBin === null) {
             return;
@@ -51,7 +66,6 @@ final class RouterIntegrationTest extends TestCase
         $ready = self::waitForRouter($endpoint, self::ROUTER_READY_TIMEOUT);
 
         if (!$ready) {
-            // Router binary exists but didn't become reachable
             @\proc_terminate(self::$routerProcess);
             @\proc_close(self::$routerProcess);
             self::$routerProcess = null;
@@ -60,11 +74,12 @@ final class RouterIntegrationTest extends TestCase
 
     public static function tearDownAfterClass(): void
     {
+        // Only terminate if we started the router (not externally managed)
         if (\is_resource(self::$routerProcess)) {
             @\proc_terminate(self::$routerProcess);
             @\proc_close(self::$routerProcess);
-            self::$routerProcess = null;
         }
+        self::$routerProcess = null;
     }
 
     protected function setUp(): void
@@ -72,8 +87,8 @@ final class RouterIntegrationTest extends TestCase
         if (self::$routerProcess === null) {
             $this->markTestSkipped(
                 self::$routerBin === null
-                    ? 'Router binary not found — build the router first (cargo build in router/)'
-                    : 'Router binary started but did not become reachable on this system'
+                    ? 'Router binary not found — build the router or start it externally and set MULTIFROST_ROUTER_PORT'
+                    : 'Router binary started but did not become reachable on this system. Try starting it externally and set MULTIFROST_ROUTER_PORT'
             );
         }
 

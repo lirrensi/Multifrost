@@ -14,7 +14,7 @@ require __DIR__ . '/../vendor/autoload.php';
 
 use Multifrost\ServiceContext;
 use Multifrost\ServiceWorker;
-use Multifrost\runService;
+use function Multifrost\runService;
 
 $mathWorker = new class implements ServiceWorker {
     public function handleCall(string $function, array $args): mixed
