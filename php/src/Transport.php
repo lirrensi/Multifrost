@@ -18,7 +18,7 @@ use WebSocket\Exception\ExceptionInterface as WebSocketException;
  * For callers: send a request, then read responses until msg_id matches.
  * For services: the read loop dispatches incoming calls to a handler.
  */
-final class PeerTransport
+class PeerTransport
 {
     private Client $client;
     private FrameCodec $codec;
