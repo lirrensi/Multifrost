@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.1.0] - 2026-05-08
+
+### Added
+- **PHP binding**: synchronous, blocking caller and service peer for PHP 8.2+ using `rybakit/msgpack` and `phrity/websocket`. Supports `connect`, `Handle`, `runService`, `spawn`, and the full v5 wire protocol.
+- **Cross-language matrix harness expanded**: Extended the matrix harness to five-caller by five-service coverage including PHP callers and PHP services under `e2e/v5/tests/`.
+- **E2E PHP worker**: Added `e2e/workers/math_worker.php` for cross-language testing with PHP service peers.
+
+### Changed
+- **Repository docs**: Updated README, architecture docs, and support matrix to include PHP as a first-class binding.
+
 ## [5.0.0] - 2026-03-25
 
 Version 5 is the largest rewrite in the project so far. Multifrost is no longer

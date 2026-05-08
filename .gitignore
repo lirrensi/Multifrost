@@ -343,3 +343,6 @@ docs/CODEMAP.*.md
 
 
 agent_chat/
+
+# PHP
+vendor/

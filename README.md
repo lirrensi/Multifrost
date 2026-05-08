@@ -15,13 +15,13 @@ runtime.
 
 At a high level, Multifrost is awesome because it gives you:
 
-- one shared way for Python, JavaScript, Go, and Rust to talk
+- one shared way for Python, JavaScript, Go, PHP, and Rust to talk
 - local-feeling remote calls instead of bespoke transport code
 - explicit service identity through stable `peer_id` values
 - one small router that wires peers together without becoming your app runtime
 - a design that works well for local orchestration, tools, agents, and trusted internal systems
 
-Multifrost v5 is a router-based system. Python, JavaScript, Go, and Rust peers
+Multifrost v5 is a router-based system. Python, JavaScript, Go, PHP, and Rust peers
 connect to the same shared router and call named services as if they were local
 functions.
 
@@ -41,7 +41,7 @@ balancer.
 - WebSocket transport with binary framing
 - MessagePack payloads with a portable cross-language subset
 - Optional `spawn(...)` helpers without making process ownership the core model
-- One shared protocol shape across Python, JavaScript, Go, and Rust
+- One shared protocol shape across Python, JavaScript, Go, PHP, and Rust
 
 ## What changed in v5
 
@@ -158,6 +158,7 @@ See `router/README.md` for operator notes and local development commands.
 - `python/` - Python v5 binding
 - `javascript/` - Node.js / TypeScript v5 binding
 - `golang/` - Go v5 binding
+- `php/` - PHP v5 binding
 - `rust/` - Rust v5 binding
 - `router/` - standalone v5 router binary
 
@@ -209,6 +210,7 @@ For language-specific examples, see:
 - `python/docs/quick-examples.md`
 - `javascript/docs/quick-examples.md`
 - `golang/docs/quick-examples.md`
+- `php/docs/quick-examples.md`
 - `rust/docs/quick-examples.md`
 
 ## Canon docs

@@ -232,6 +232,7 @@ Operationally:
 - `docs/arch_router.md`: concrete router implementation architecture
 - `router/`: router implementation
 - `rust/`: first v5 language implementation
+- `php/`: PHP v5 binding (blocking synchronous)
 - other language implementations are expected to follow the same shared v5
   architecture as they are ported
 

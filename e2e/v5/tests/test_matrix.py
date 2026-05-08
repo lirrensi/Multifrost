@@ -2,14 +2,15 @@
 """
 Matrix harness for the v5 router-based caller/service topology.
 
-This suite starts one router, keeps four service peers online, and exercises the
-16 caller/service combinations across Rust, Python, Node.js, and Go callers.
+This suite starts one router, keeps five service peers online, and exercises the
+25 caller/service combinations across Rust, Python, Node.js, Go, and PHP callers.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -45,6 +46,7 @@ SERVICE_PEERS = {
     "python": "math-python",
     "node": "math-node",
     "go": "math-go",
+    "php": "math-php",
 }
 
 
@@ -130,6 +132,25 @@ def _go_caller_command(target_peer_id: str) -> tuple[list[str], Path]:
     return (
         ["go", "run", "./examples/go_calls_rust", "--target", target_peer_id],
         REPO_ROOT / "golang",
+    )
+
+
+def _php_service_command() -> list[str]:
+    """Return argv list to start a PHP math worker service process."""
+    php_binary = shutil.which("php") or "php"
+    worker_path = os.path.join(
+        os.path.dirname(__file__), "..", "..", "workers", "math_worker.php"
+    )
+    return [php_binary, worker_path]
+
+
+def _php_caller_command(target_peer_id: str) -> tuple[list[str], Path]:
+    """Return argv list to run a PHP caller that calls the target and prints results."""
+    php_binary = shutil.which("php") or "php"
+    caller_script = REPO_ROOT / "php" / "examples" / "math_caller.php"
+    return (
+        [php_binary, str(caller_script), target_peer_id],
+        REPO_ROOT / "php",
     )
 
 
@@ -382,6 +403,7 @@ async def _run_four_service_matrix(tmp_path: Path) -> None:
                 REPO_ROOT / "javascript",
             ),
             ("go", _go_service_command(), REPO_ROOT / "golang"),
+            ("php", _php_service_command(), REPO_ROOT),
         ]
 
         for name, command, cwd in service_specs:
@@ -391,7 +413,7 @@ async def _run_four_service_matrix(tmp_path: Path) -> None:
             services.append(_start_process(command, cwd, service_env))
 
         if connect is not None and PeerClass is not None:
-            _log("waiting for all four services to appear in router presence")
+            _log("waiting for all five services to appear in router presence")
             probe = connect(
                 "math-rust", router_port=port, caller_peer_id="matrix-probe"
             )
@@ -412,12 +434,13 @@ async def _run_four_service_matrix(tmp_path: Path) -> None:
         else:
             await asyncio.sleep(2.0)
 
-        _log("running 16 caller/service combinations")
+        _log("running 25 caller/service combinations")
         caller_specs = [
             ("rust", _rust_caller_command),
             ("python", _python_caller_command),
             ("node", _node_caller_command),
             ("go", _go_caller_command),
+            ("php", _php_caller_command),
         ]
 
         for caller_name, command_factory in caller_specs:
