@@ -124,16 +124,16 @@ The router is a small shared runtime dependency. Get it with one line:
 
 ```sh
 # Linux / macOS / WSL
-curl -fsSL https://raw.githubusercontent.com/lirrensi/Multifrost/main/scripts/install.sh | sh
+curl -fsSL https://github.com/lirrensi/Multifrost/releases/latest/download/multifrost-router-installer.sh | sh
 
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/lirrensi/Multifrost/main/scripts/install.ps1 | iex
+irm https://github.com/lirrensi/Multifrost/releases/latest/download/multifrost-router-installer.ps1 | iex
 ```
 
 Pin a version:
 
 ```sh
-curl -fsSL ... | sh -s -- --version v5.0.0
+curl -fsSL https://github.com/lirrensi/Multifrost/releases/download/v5.0.3/multifrost-router-installer.sh | sh
 ```
 
 Runtime defaults:

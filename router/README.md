@@ -38,19 +38,19 @@ distributed and launched directly.
 
 ```sh
 # Linux / macOS / WSL
-curl -fsSL https://raw.githubusercontent.com/lirrensi/Multifrost/main/scripts/install.sh | sh
+curl -fsSL https://github.com/lirrensi/Multifrost/releases/latest/download/multifrost-router-installer.sh | sh
 
 # Windows (PowerShell)
-irm https://raw.githubusercontent.com/lirrensi/Multifrost/main/scripts/install.ps1 | iex
+irm https://github.com/lirrensi/Multifrost/releases/latest/download/multifrost-router-installer.ps1 | iex
 ```
 
 This downloads the correct binary for your platform from GitHub Releases
-and places it in `~/.local/bin`.
+and places it in `~/.cargo/bin`.
 
 To pin a specific version:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/lirrensi/Multifrost/main/scripts/install.sh | sh -s -- --version v5.0.0
+curl -fsSL https://github.com/lirrensi/Multifrost/releases/download/v5.0.3/multifrost-router-installer.sh | sh
 ```
 
 After install, run the router directly:
